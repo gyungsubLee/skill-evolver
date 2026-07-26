@@ -62,7 +62,7 @@ def validate_private_directory(path: Path) -> Path:
         raise ValueError("data_root_not_directory")
     if info.st_uid != os.getuid():
         raise ValueError("data_root_owner")
-    if stat.S_IMODE(info.st_mode) & 0o077:
+    if stat.S_IMODE(info.st_mode) != 0o700:
         raise ValueError("data_root_permissions")
     return resolved
 
@@ -75,7 +75,7 @@ def validate_private_child_directory(path: Path) -> Path:
     if (
         not stat.S_ISDIR(info.st_mode)
         or info.st_uid != os.getuid()
-        or stat.S_IMODE(info.st_mode) & 0o077
+        or stat.S_IMODE(info.st_mode) != 0o700
     ):
         raise ValueError("data_child_permissions")
     return resolved
@@ -89,7 +89,7 @@ def validate_private_nonce(path: Path) -> Path:
     if (
         not stat.S_ISREG(info.st_mode)
         or info.st_uid != os.getuid()
-        or stat.S_IMODE(info.st_mode) & 0o077
+        or stat.S_IMODE(info.st_mode) != 0o600
     ):
         raise ValueError("nonce_permissions")
     return resolved
@@ -111,6 +111,10 @@ def initialize_probe(
     else:
         root.mkdir(mode=0o700)
         root = validate_private_directory(root)
+    installation_path = root / "installation.json"
+    nonce_path = root / "nonce.json"
+    if any(path.exists() or path.is_symlink() for path in (installation_path, nonce_path)):
+        raise ValueError("existing_installation")
     for child in ("incoming", "reports"):
         directory = root / child
         if directory.is_symlink():
@@ -120,7 +124,6 @@ def initialize_probe(
         validate_private_child_directory(directory)
     canonical_transcripts = tuple(item.expanduser().resolve(strict=True) for item in transcript_roots)
     nonce = secrets.token_hex(32)
-    installation_path = root / "installation.json"
     atomic_write_json(
         installation_path,
         {
@@ -130,7 +133,7 @@ def initialize_probe(
             "python": "/usr/bin/python3",
         },
     )
-    atomic_write_json(root / "nonce.json", {"schema_version": 1, "nonce": nonce})
+    atomic_write_json(nonce_path, {"schema_version": 1, "nonce": nonce})
     return installation_path
 
 
@@ -141,7 +144,7 @@ def load_installation(path: Path) -> Installation:
     info = canonical.stat()
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
         raise ValueError("installation_owner_or_type")
-    if stat.S_IMODE(info.st_mode) & 0o077:
+    if stat.S_IMODE(info.st_mode) != 0o600:
         raise ValueError("installation_permissions")
     payload = json.loads(canonical.read_text(encoding="utf-8"))
     if payload.get("schema_version") != INSTALLATION_SCHEMA:
@@ -222,8 +225,22 @@ def cmd_probe_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def validate_observation(path: Path) -> Path:
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode):
+        raise ValueError("observation_symlink")
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("observation_not_regular")
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+        raise ValueError("observation_permissions")
+    return path
+
+
 def observation_paths(installation: Installation) -> list[Path]:
-    return sorted((installation.data_root / "incoming").glob("*.json"))
+    return [
+        validate_observation(path)
+        for path in sorted((installation.data_root / "incoming").glob("*.json"))
+    ]
 
 
 def cmd_probe_status(args: argparse.Namespace) -> int:

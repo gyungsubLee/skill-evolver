@@ -35,6 +35,20 @@ class InstallationTests(unittest.TestCase):
         self.assertTrue((self.root / "incoming").is_dir())
         self.assertTrue((self.root / "reports").is_dir())
 
+    def test_initialize_rejects_existing_state_without_replacing_nonce(self) -> None:
+        self.runtime.initialize_probe(
+            self.root, (self.transcripts,), Path("/usr/bin/python3")
+        )
+        nonce_path = self.root / "nonce.json"
+        original_nonce = nonce_path.read_bytes()
+
+        with self.assertRaisesRegex(ValueError, "existing_installation"):
+            self.runtime.initialize_probe(
+                self.root, (self.transcripts,), Path("/usr/bin/python3")
+            )
+
+        self.assertEqual(nonce_path.read_bytes(), original_nonce)
+
     def test_load_ignores_environment_overrides(self) -> None:
         installation_path = self.runtime.initialize_probe(
             self.root, (self.transcripts,), Path("/usr/bin/python3")
@@ -138,6 +152,35 @@ class InstallationTests(unittest.TestCase):
         reports.symlink_to(external, target_is_directory=True)
         with self.assertRaisesRegex(ValueError, "data_child_symlink"):
             self.runtime.load_installation(installation_path)
+
+    def test_read_only_private_child_is_rejected_on_load(self) -> None:
+        installation_path = self.runtime.initialize_probe(
+            self.root, (self.transcripts,), Path("/usr/bin/python3")
+        )
+        (self.root / "incoming").chmod(0o500)
+        with self.assertRaisesRegex(ValueError, "data_child_permissions"):
+            self.runtime.load_installation(installation_path)
+
+    def test_symlinked_observation_is_rejected(self) -> None:
+        installation_path = self.runtime.initialize_probe(
+            self.root, (self.transcripts,), Path("/usr/bin/python3")
+        )
+        external = Path(self.temp.name) / "external.json"
+        external.write_text("{}", encoding="utf-8")
+        external.chmod(0o600)
+        (self.root / "incoming" / "observation.json").symlink_to(external)
+        installation = self.runtime.load_installation(installation_path)
+        with self.assertRaisesRegex(ValueError, "observation_symlink"):
+            self.runtime.observation_paths(installation)
+
+    def test_directory_observation_is_rejected(self) -> None:
+        installation_path = self.runtime.initialize_probe(
+            self.root, (self.transcripts,), Path("/usr/bin/python3")
+        )
+        (self.root / "incoming" / "directory.json").mkdir(mode=0o700)
+        installation = self.runtime.load_installation(installation_path)
+        with self.assertRaisesRegex(ValueError, "observation_not_regular"):
+            self.runtime.observation_paths(installation)
 
     def test_tampered_nonce_value_is_rejected(self) -> None:
         installation_path = self.runtime.initialize_probe(
