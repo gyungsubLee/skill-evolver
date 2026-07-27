@@ -18,7 +18,16 @@ class InstallationTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / "probe"
         self.transcripts = Path(self.temp.name) / "sessions"
-        self.transcripts.mkdir(mode=0o700)
+        self.transcripts.mkdir(mode=0o755)
+        self.transcripts.chmod(0o755)
+
+    def replace_transcript_roots(
+        self, installation_path: Path, transcript_roots: tuple[Path, ...]
+    ) -> None:
+        payload = json.loads(installation_path.read_text(encoding="utf-8"))
+        payload["transcript_roots"] = [str(path) for path in transcript_roots]
+        installation_path.write_text(json.dumps(payload), encoding="utf-8")
+        installation_path.chmod(0o600)
 
     def test_initialize_creates_private_canonical_installation(self) -> None:
         installation_path = self.runtime.initialize_probe(
@@ -30,6 +39,7 @@ class InstallationTests(unittest.TestCase):
         self.assertEqual(installation.transcript_roots, (self.transcripts.resolve(),))
         self.assertEqual(installation.python, Path("/usr/bin/python3"))
         self.assertEqual(stat.S_IMODE(self.root.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(self.transcripts.stat().st_mode), 0o755)
         self.assertEqual(stat.S_IMODE(installation_path.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE((self.root / "nonce.json").stat().st_mode), 0o600)
         self.assertTrue((self.root / "incoming").is_dir())
@@ -72,6 +82,236 @@ class InstallationTests(unittest.TestCase):
         link.symlink_to(installation_path)
         with self.assertRaisesRegex(ValueError, "installation_symlink"):
             self.runtime.load_installation(link)
+
+    def test_copied_or_hardlinked_installation_locator_is_rejected(self) -> None:
+        for kind in ("copy", "hardlink"):
+            with self.subTest(kind=kind):
+                root = Path(self.temp.name) / f"probe-{kind}"
+                installation_path = self.runtime.initialize_probe(
+                    root, (self.transcripts,), Path("/usr/bin/python3")
+                )
+                alternate = Path(self.temp.name) / f"{kind}-installation.json"
+                if kind == "copy":
+                    alternate.write_bytes(installation_path.read_bytes())
+                    alternate.chmod(0o600)
+                else:
+                    os.link(installation_path, alternate)
+
+                with self.assertRaisesRegex(ValueError, "installation_location"):
+                    self.runtime.load_installation(alternate)
+
+    def test_initialize_rejects_unsafe_transcript_roots_before_writes(self) -> None:
+        target = Path(self.temp.name) / "transcript-target"
+        target.mkdir(mode=0o700)
+        symlink = Path(self.temp.name) / "transcript-link"
+        symlink.symlink_to(target, target_is_directory=True)
+        regular_file = Path(self.temp.name) / "transcript.jsonl"
+        regular_file.write_text("{}\n", encoding="utf-8")
+        world_writable = Path(self.temp.name) / "world-writable"
+        world_writable.mkdir(mode=0o700)
+        world_writable.chmod(0o777)
+        cases = (
+            ("symlink", symlink, "transcript_root_symlink"),
+            ("file", regular_file, "transcript_root_not_directory"),
+            ("world_writable", world_writable, "transcript_root_permissions"),
+        )
+
+        for name, transcript_root, error in cases:
+            with self.subTest(name=name):
+                root = Path(self.temp.name) / f"probe-{name}"
+                with self.assertRaisesRegex(ValueError, error):
+                    self.runtime.initialize_probe(
+                        root, (transcript_root,), Path("/usr/bin/python3")
+                    )
+                self.assertFalse(root.exists())
+
+    def test_initialize_rejects_wrong_owner_transcript_root_before_writes(self) -> None:
+        transcript_root = Path(self.temp.name) / "foreign-sessions"
+        transcript_root.mkdir(mode=0o700)
+        canonical_transcript = transcript_root.resolve()
+        real_stat = Path.stat
+
+        def stat_with_wrong_owner(path: Path, *args: object, **kwargs: object):
+            info = real_stat(path, *args, **kwargs)
+            if path == canonical_transcript:
+                return mock.Mock(st_mode=info.st_mode, st_uid=info.st_uid + 1)
+            return info
+
+        with mock.patch.object(Path, "stat", stat_with_wrong_owner):
+            with self.assertRaisesRegex(ValueError, "transcript_root_owner"):
+                self.runtime.initialize_probe(
+                    self.root, (transcript_root,), Path("/usr/bin/python3")
+                )
+        self.assertFalse(self.root.exists())
+
+    def test_load_rejects_unsafe_fixed_transcript_roots(self) -> None:
+        target = Path(self.temp.name) / "fixed-transcript-target"
+        target.mkdir(mode=0o700)
+        symlink = Path(self.temp.name) / "fixed-transcript-link"
+        symlink.symlink_to(target, target_is_directory=True)
+        regular_file = Path(self.temp.name) / "fixed-transcript.jsonl"
+        regular_file.write_text("{}\n", encoding="utf-8")
+        world_writable = Path(self.temp.name) / "fixed-world-writable"
+        world_writable.mkdir(mode=0o700)
+        world_writable.chmod(0o777)
+        cases = (
+            ("symlink", symlink, "transcript_root_symlink"),
+            ("file", regular_file, "transcript_root_not_directory"),
+            ("world_writable", world_writable, "transcript_root_permissions"),
+        )
+
+        for name, transcript_root, error in cases:
+            with self.subTest(name=name):
+                root = Path(self.temp.name) / f"load-probe-{name}"
+                installation_path = self.runtime.initialize_probe(
+                    root, (self.transcripts,), Path("/usr/bin/python3")
+                )
+                self.replace_transcript_roots(
+                    installation_path, (transcript_root,)
+                )
+                with self.assertRaisesRegex(ValueError, error):
+                    self.runtime.load_installation(installation_path)
+
+    def test_load_rejects_wrong_owner_fixed_transcript_root(self) -> None:
+        transcript_root = Path(self.temp.name) / "fixed-foreign-sessions"
+        transcript_root.mkdir(mode=0o700)
+        installation_path = self.runtime.initialize_probe(
+            self.root, (self.transcripts,), Path("/usr/bin/python3")
+        )
+        self.replace_transcript_roots(installation_path, (transcript_root,))
+        canonical_transcript = transcript_root.resolve()
+        real_stat = Path.stat
+
+        def stat_with_wrong_owner(path: Path, *args: object, **kwargs: object):
+            info = real_stat(path, *args, **kwargs)
+            if path == canonical_transcript:
+                return mock.Mock(st_mode=info.st_mode, st_uid=info.st_uid + 1)
+            return info
+
+        with mock.patch.object(Path, "stat", stat_with_wrong_owner):
+            with self.assertRaisesRegex(ValueError, "transcript_root_owner"):
+                self.runtime.load_installation(installation_path)
+
+    def test_load_rejects_invalid_transcript_roots_schema(self) -> None:
+        canonical_parent = Path(self.temp.name) / "canonical-parent"
+        canonical_parent.mkdir(mode=0o700)
+        canonical_transcript = canonical_parent / "sessions"
+        canonical_transcript.mkdir(mode=0o755)
+        alias_parent = Path(self.temp.name) / "alias-parent"
+        alias_parent.symlink_to(canonical_parent, target_is_directory=True)
+        cases = (
+            ("empty", []),
+            ("not_sequence", str(self.transcripts)),
+            ("non_string", [7]),
+            ("relative", ["."]),
+            ("tilde", ["~"]),
+            (
+                "symlinked_ancestor",
+                [str(alias_parent / canonical_transcript.name)],
+            ),
+        )
+        for name, transcript_roots in cases:
+            with self.subTest(name=name):
+                root = Path(self.temp.name) / f"schema-probe-{name}"
+                installation_path = self.runtime.initialize_probe(
+                    root, (self.transcripts,), Path("/usr/bin/python3")
+                )
+                payload = json.loads(
+                    installation_path.read_text(encoding="utf-8")
+                )
+                payload["transcript_roots"] = transcript_roots
+                installation_path.write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+                installation_path.chmod(0o600)
+
+                with self.assertRaises(Exception) as raised:
+                    self.runtime.load_installation(installation_path)
+                self.assertIsInstance(raised.exception, ValueError)
+                self.assertEqual(
+                    str(raised.exception), "invalid_transcript_roots"
+                )
+
+    def test_load_rejects_noncanonical_fixed_data_root(self) -> None:
+        installation_path = self.runtime.initialize_probe(
+            self.root, (self.transcripts,), Path("/usr/bin/python3")
+        )
+        original_payload = json.loads(
+            installation_path.read_text(encoding="utf-8")
+        )
+        alias_parent = Path(self.temp.name) / "data-root-alias"
+        alias_parent.symlink_to(Path(self.temp.name), target_is_directory=True)
+        cases = (
+            ("relative", "."),
+            ("symlinked_ancestor", str(alias_parent / self.root.name)),
+        )
+
+        for name, data_root in cases:
+            with self.subTest(name=name):
+                payload = {**original_payload, "data_root": data_root}
+                installation_path.write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+                installation_path.chmod(0o600)
+                previous_cwd = Path.cwd()
+                try:
+                    if name == "relative":
+                        os.chdir(self.root)
+                    with self.assertRaisesRegex(ValueError, "invalid_data_root"):
+                        self.runtime.load_installation(installation_path)
+                finally:
+                    os.chdir(previous_cwd)
+
+    def test_initialize_rejects_transcript_data_root_overlap_before_writes(
+        self,
+    ) -> None:
+        parent_transcript = Path(self.temp.name) / "parent-transcript"
+        parent_transcript.mkdir(mode=0o700)
+        parent_root = parent_transcript / "probe"
+        equal_root = Path(self.temp.name) / "equal-root"
+        equal_root.mkdir(mode=0o700)
+        child_root = Path(self.temp.name) / "child-root"
+        child_root.mkdir(mode=0o700)
+        child_transcript = child_root / "sessions"
+        child_transcript.mkdir(mode=0o700)
+        cases = (
+            ("data_inside_transcript", parent_root, parent_transcript),
+            ("equal", equal_root, equal_root),
+            ("transcript_inside_data", child_root, child_transcript),
+        )
+
+        for name, root, transcript_root in cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, "data_transcript_overlap"):
+                    self.runtime.initialize_probe(
+                        root, (transcript_root,), Path("/usr/bin/python3")
+                    )
+                for child in (
+                    "installation.json",
+                    "nonce.json",
+                    "incoming",
+                    "reports",
+                ):
+                    self.assertFalse((root / child).exists())
+
+    def test_load_rejects_transcript_data_root_overlap(self) -> None:
+        for relation in ("parent", "equal", "child"):
+            with self.subTest(relation=relation):
+                root = Path(self.temp.name) / f"overlap-probe-{relation}"
+                installation_path = self.runtime.initialize_probe(
+                    root, (self.transcripts,), Path("/usr/bin/python3")
+                )
+                canonical_root = installation_path.parent
+                transcript_root = {
+                    "parent": canonical_root.parent,
+                    "equal": canonical_root,
+                    "child": canonical_root / "incoming",
+                }[relation]
+                self.replace_transcript_roots(
+                    installation_path, (transcript_root,)
+                )
+                with self.assertRaisesRegex(ValueError, "data_transcript_overlap"):
+                    self.runtime.load_installation(installation_path)
 
     def test_symlink_data_root_is_rejected_before_initialization(self) -> None:
         target = Path(self.temp.name) / "target"

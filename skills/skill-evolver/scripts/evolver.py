@@ -209,6 +209,36 @@ def validate_private_nonce(path: Path) -> Path:
     return resolved
 
 
+def validate_transcript_root(path: Path) -> Path:
+    requested = path.expanduser()
+    if requested.is_symlink():
+        raise ValueError("transcript_root_symlink")
+    try:
+        resolved = requested.resolve(strict=True)
+    except (FileNotFoundError, NotADirectoryError):
+        raise ValueError("transcript_root_not_directory") from None
+    info = resolved.stat()
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError("transcript_root_not_directory")
+    if info.st_uid != os.getuid():
+        raise ValueError("transcript_root_owner")
+    if stat.S_IMODE(info.st_mode) & stat.S_IWOTH:
+        raise ValueError("transcript_root_permissions")
+    return resolved
+
+
+def validate_transcript_separation(
+    data_root: Path, transcript_roots: tuple[Path, ...]
+) -> None:
+    if any(
+        data_root == transcript_root
+        or data_root in transcript_root.parents
+        or transcript_root in data_root.parents
+        for transcript_root in transcript_roots
+    ):
+        raise ValueError("data_transcript_overlap")
+
+
 def initialize_probe(
     data_root: Path,
     transcript_roots: tuple[Path, ...],
@@ -220,6 +250,13 @@ def initialize_probe(
     if requested.is_symlink():
         raise ValueError("data_root_symlink")
     root = requested.parent.resolve(strict=True) / requested.name
+    if not transcript_roots:
+        raise ValueError("invalid_transcript_roots")
+    canonical_transcripts = tuple(
+        validate_transcript_root(item) for item in transcript_roots
+    )
+    # ponytail: The production installer owns workspace and mutable-skill separation.
+    validate_transcript_separation(root, canonical_transcripts)
     if root.exists():
         root = validate_private_directory(root)
     else:
@@ -236,7 +273,6 @@ def initialize_probe(
         if not directory.exists():
             directory.mkdir(mode=0o700)
         validate_private_child_directory(directory)
-    canonical_transcripts = tuple(item.expanduser().resolve(strict=True) for item in transcript_roots)
     nonce = secrets.token_hex(32)
     atomic_write_json(
         installation_path,
@@ -263,10 +299,40 @@ def load_installation(path: Path) -> Installation:
     payload = json.loads(canonical.read_text(encoding="utf-8"))
     if payload.get("schema_version") != INSTALLATION_SCHEMA:
         raise ValueError("unsupported_installation_schema")
-    root = validate_private_directory(Path(str(payload["data_root"])))
-    transcript_roots = tuple(
-        Path(str(item)).resolve(strict=True) for item in payload["transcript_roots"]
+    fixed_data_root = payload.get("data_root")
+    if (
+        not isinstance(fixed_data_root, str)
+        or not fixed_data_root
+        or not Path(fixed_data_root).is_absolute()
+    ):
+        raise ValueError("invalid_data_root")
+    requested_root = Path(fixed_data_root)
+    root = validate_private_directory(requested_root)
+    if requested_root != root:
+        raise ValueError("invalid_data_root")
+    if canonical != root / "installation.json":
+        raise ValueError("installation_location")
+    fixed_transcript_roots = payload.get("transcript_roots")
+    if (
+        not isinstance(fixed_transcript_roots, list)
+        or not fixed_transcript_roots
+        or any(
+            not isinstance(item, str)
+            or not item
+            or not Path(item).is_absolute()
+            for item in fixed_transcript_roots
+        )
+    ):
+        raise ValueError("invalid_transcript_roots")
+    requested_transcript_roots = tuple(
+        Path(item) for item in fixed_transcript_roots
     )
+    transcript_roots = tuple(
+        validate_transcript_root(item) for item in requested_transcript_roots
+    )
+    if requested_transcript_roots != transcript_roots:
+        raise ValueError("invalid_transcript_roots")
+    validate_transcript_separation(root, transcript_roots)
     if payload.get("python") != "/usr/bin/python3":
         raise ValueError("unsupported_python")
     for child in ("incoming", "reports"):
