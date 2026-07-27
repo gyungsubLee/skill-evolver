@@ -247,7 +247,7 @@ def parse_stop_envelope(raw: bytes, installation: Installation) -> StopEnvelope:
 
 
 def stat_transcript(path: Path) -> dict[str, object]:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(str(path), flags)
     try:
         info = os.fstat(descriptor)
@@ -441,10 +441,18 @@ def promote_skill_preflight(
             (reports / f"{surface}-skill-response.json").read_text(encoding="utf-8")
         )
         passed = (
-            challenge.get("surface") == surface
+            isinstance(challenge, dict)
+            and isinstance(response, dict)
+            and challenge.get("schema_version") == 1
+            and response.get("schema_version") == 1
+            and challenge.get("surface") == surface
             and response.get("surface") == surface
             and challenge.get("installation_nonce") == installation.nonce
             and response.get("installation_nonce") == installation.nonce
+            and isinstance(challenge.get("challenge"), str)
+            and bool(challenge["challenge"])
+            and isinstance(response.get("challenge"), str)
+            and bool(response["challenge"])
             and response.get("challenge") == challenge.get("challenge")
         )
     except (KeyError, OSError, json.JSONDecodeError):
@@ -570,6 +578,96 @@ def promote_surface_stop(
         ]
         if not all(isinstance(item, dict) for item in observations):
             raise ValueError("invalid_stop_observation")
+        nonce_matches = all(
+            item.get("installation_nonce") == installation.nonce
+            for item in observations
+        )
+        shapes = [item["shape"] for item in observations]
+        transcript_infos = [
+            item.get("transcript_stat")
+            for item in observations
+        ]
+        transcript_present = all(isinstance(item, dict) for item in transcript_infos)
+        turn_identities = {
+            (
+                item["event"]["session_id"],
+                item["event"]["turn_id"],
+            )
+            for item in observations
+            if isinstance(item.get("event"), dict)
+        }
+        required_fields = aggregate_required_fields(observations)
+        capture_error_codes = sorted(
+            {
+                str(item["capture_error_code"])
+                for item in observations
+                if "capture_error_code" in item
+            }
+        )
+        payload_shapes_stable = shapes[0] == shapes[1]
+        distinct_turns = len(turn_identities) == 2
+        capture_supported = (
+            nonce_matches
+            and payload_shapes_stable
+            and distinct_turns
+            and not capture_error_codes
+            and all(field["valid"] is True for field in required_fields.values())
+            and transcript_present
+            and all(
+                item["regular"] is True
+                and item["owned_by_current_user"] is True
+                and item["size"] > 0
+                and isinstance(item["mtime_ns"], int)
+                and isinstance(item["device"], int)
+                and isinstance(item["inode"], int)
+                for item in transcript_infos
+            )
+        )
+        report = {
+            "schema_version": 1,
+            "surface": surface,
+            "observation_count": len(observations),
+            "capture_supported": capture_supported,
+            "distinct_turns": distinct_turns,
+            "hook_event_name": "Stop",
+            "payload_shapes_stable": payload_shapes_stable,
+            "payload_keys": sorted(
+                set(shapes[0]["payload_keys"]) | set(shapes[1]["payload_keys"])
+            ),
+            "field_types": (
+                shapes[0]["field_types"]
+                if shapes[0]["field_types"] == shapes[1]["field_types"]
+                else {}
+            ),
+            "required_fields": required_fields,
+            "capture_error_codes": capture_error_codes,
+            "transcript_stat": {
+                "present": transcript_present,
+                "regular": transcript_present
+                and all(item["regular"] is True for item in transcript_infos),
+                "owned_by_current_user": transcript_present
+                and all(item["owned_by_current_user"] is True for item in transcript_infos),
+                "size_positive": transcript_present
+                and all(item["size"] > 0 for item in transcript_infos),
+                "has_mtime_ns": transcript_present
+                and all(isinstance(item["mtime_ns"], int) for item in transcript_infos),
+                "has_device": transcript_present
+                and all(isinstance(item["device"], int) for item in transcript_infos),
+                "has_inode": transcript_present
+                and all(isinstance(item["inode"], int) for item in transcript_infos),
+            },
+            "shared_nonce_match": nonce_matches,
+        }
+        atomic_write_json(
+            installation.data_root / "reports" / f"{surface}-observation.json",
+            {
+                "schema_version": 1,
+                "surface": surface,
+                "observations": [path.name for path in paths],
+            },
+        )
+        atomic_write_json(output.resolve(), report)
+        return report
     except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
         allowed = {
             "invalid_stop_observation",
@@ -583,96 +681,6 @@ def promote_surface_stop(
             output,
             code if isinstance(error, ValueError) and code in allowed else "surface_observation_unavailable",
         )
-    nonce_matches = all(
-        item.get("installation_nonce") == installation.nonce
-        for item in observations
-    )
-    shapes = [item["shape"] for item in observations]
-    transcript_infos = [
-        item.get("transcript_stat")
-        for item in observations
-    ]
-    transcript_present = all(isinstance(item, dict) for item in transcript_infos)
-    turn_identities = {
-        (
-            item["event"]["session_id"],
-            item["event"]["turn_id"],
-        )
-        for item in observations
-        if isinstance(item.get("event"), dict)
-    }
-    required_fields = aggregate_required_fields(observations)
-    capture_error_codes = sorted(
-        {
-            str(item["capture_error_code"])
-            for item in observations
-            if "capture_error_code" in item
-        }
-    )
-    payload_shapes_stable = shapes[0] == shapes[1]
-    distinct_turns = len(turn_identities) == 2
-    capture_supported = (
-        nonce_matches
-        and payload_shapes_stable
-        and distinct_turns
-        and not capture_error_codes
-        and all(field["valid"] is True for field in required_fields.values())
-        and transcript_present
-        and all(
-            item["regular"] is True
-            and item["owned_by_current_user"] is True
-            and item["size"] > 0
-            and isinstance(item["mtime_ns"], int)
-            and isinstance(item["device"], int)
-            and isinstance(item["inode"], int)
-            for item in transcript_infos
-        )
-    )
-    report = {
-        "schema_version": 1,
-        "surface": surface,
-        "observation_count": len(observations),
-        "capture_supported": capture_supported,
-        "distinct_turns": distinct_turns,
-        "hook_event_name": "Stop",
-        "payload_shapes_stable": payload_shapes_stable,
-        "payload_keys": sorted(
-            set(shapes[0]["payload_keys"]) | set(shapes[1]["payload_keys"])
-        ),
-        "field_types": (
-            shapes[0]["field_types"]
-            if shapes[0]["field_types"] == shapes[1]["field_types"]
-            else {}
-        ),
-        "required_fields": required_fields,
-        "capture_error_codes": capture_error_codes,
-        "transcript_stat": {
-            "present": transcript_present,
-            "regular": transcript_present
-            and all(item["regular"] is True for item in transcript_infos),
-            "owned_by_current_user": transcript_present
-            and all(item["owned_by_current_user"] is True for item in transcript_infos),
-            "size_positive": transcript_present
-            and all(item["size"] > 0 for item in transcript_infos),
-            "has_mtime_ns": transcript_present
-            and all(isinstance(item["mtime_ns"], int) for item in transcript_infos),
-            "has_device": transcript_present
-            and all(isinstance(item["device"], int) for item in transcript_infos),
-            "has_inode": transcript_present
-            and all(isinstance(item["inode"], int) for item in transcript_infos),
-        },
-        "shared_nonce_match": nonce_matches,
-    }
-    atomic_write_json(
-        installation.data_root / "reports" / f"{surface}-observation.json",
-        {
-            "schema_version": 1,
-            "surface": surface,
-            "observations": [path.name for path in paths],
-        },
-    )
-    atomic_write_json(output.resolve(), report)
-    return report
 
 
 def cmd_probe_status(args: argparse.Namespace) -> int:

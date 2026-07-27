@@ -4,12 +4,13 @@ import argparse
 import json
 import os
 import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import load_runtime, run_isolated
+from support import SCRIPT, load_runtime, run_isolated
 
 
 class StopProbeTests(unittest.TestCase):
@@ -113,6 +114,34 @@ class StopProbeTests(unittest.TestCase):
             self.assertEqual(result.stdout, b"")
             self.assertEqual(result.stderr, b"")
 
+    def test_fifo_transcript_fails_open_without_blocking(self) -> None:
+        fifo = self.sessions / "blocked.fifo"
+        os.mkfifo(fifo, 0o600)
+        self.payload["transcript_path"] = str(fifo)
+
+        result = subprocess.run(
+            [
+                "/usr/bin/python3",
+                "-I",
+                str(SCRIPT),
+                "probe-stop",
+                "--installation",
+                str(self.installation_path),
+            ],
+            input=json.dumps(self.payload).encode(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=2,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, b"")
+        observation = self.runtime.observation_paths(self.installation)[-1]
+        stored = json.loads(observation.read_text(encoding="utf-8"))
+        self.assertEqual(stored["capture_error_code"], "transcript_not_regular")
+
     def test_promoted_fixture_contains_structure_only(self) -> None:
         self.runtime.mark_surface_boundary(self.installation, "cli")
         self.runtime.capture_stop(self.installation, json.dumps(self.payload).encode())
@@ -160,6 +189,31 @@ class StopProbeTests(unittest.TestCase):
         self.assertEqual(report["capture_error_codes"], ["surface_observation_count"])
         self.assertTrue(output.is_file())
 
+    def test_surface_promotion_sanitizes_malformed_observations(self) -> None:
+        self.runtime.mark_surface_boundary(self.installation, "cli")
+        for name in ("malformed-one.json", "malformed-two.json"):
+            self.runtime.atomic_write_json(
+                self.installation.data_root / "incoming" / name,
+                {"schema_version": 1},
+            )
+        output = self.base / "stop.structure.json"
+
+        report = self.runtime.promote_surface_stop(self.installation, "cli", output)
+
+        self.assertFalse(report["capture_supported"])
+        self.assertEqual(
+            report["capture_error_codes"],
+            ["surface_observation_unavailable"],
+        )
+        self.assertTrue(output.is_file())
+        args = argparse.Namespace(
+            installation=str(self.installation_path),
+            surface="cli",
+            output=str(output),
+        )
+        with mock.patch.object(self.runtime, "write_json_stdout"):
+            self.assertEqual(self.runtime.cmd_probe_promote_stop(args), 2)
+
     def test_promote_stop_command_returns_two_for_failure_fixture(self) -> None:
         self.runtime.mark_surface_boundary(self.installation, "cli")
         args = argparse.Namespace(
@@ -203,6 +257,41 @@ class StopProbeTests(unittest.TestCase):
                 "write": False,
             },
         )
+
+    def test_preflight_promotion_rejects_invalid_challenge_contract(self) -> None:
+        reports = self.installation.data_root / "reports"
+        valid = {
+            "schema_version": 1,
+            "surface": "cli",
+            "installation_nonce": self.installation.nonce,
+            "challenge": "current-challenge",
+        }
+        missing_challenge = {
+            key: value for key, value in valid.items() if key != "challenge"
+        }
+        cases = {
+            "missing": (missing_challenge, missing_challenge),
+            "non_string": ({**valid, "challenge": 7}, {**valid, "challenge": 7}),
+            "empty": ({**valid, "challenge": ""}, {**valid, "challenge": ""}),
+            "wrong_schema": (valid, {**valid, "schema_version": 2}),
+        }
+        for name, (challenge, response) in cases.items():
+            with self.subTest(name=name):
+                self.runtime.atomic_write_json(
+                    reports / "cli-skill-challenge.json",
+                    challenge,
+                )
+                self.runtime.atomic_write_json(
+                    reports / "cli-skill-response.json",
+                    response,
+                )
+                report = self.runtime.promote_skill_preflight(
+                    self.installation,
+                    "cli",
+                    self.base / f"access-{name}.structure.json",
+                )
+                self.assertFalse(report["read"])
+                self.assertFalse(report["write"])
 
 
 if __name__ == "__main__":
