@@ -548,6 +548,59 @@ class GateTests(unittest.TestCase):
         self.assertTrue(committed_report.exists())
         self.assertTrue(installation_path.exists())
 
+    def test_scrub_deletes_interrupted_atomic_write_orphans(self) -> None:
+        _installation_path, installation = self.create_installation()
+        orphans = [
+            installation.data_root / "incoming" / ".123-observation.json.crash",
+            installation.data_root / "reports" / ".cli-observation.json.crash",
+            installation.data_root / "reports" / ".cli-boundary.json.crash",
+            installation.data_root / "reports" / ".cli-skill-challenge.json.crash",
+            installation.data_root / "reports" / ".cli-skill-response.json.crash",
+        ]
+        for path in orphans:
+            self.runtime.atomic_write_json(path, {"private": "raw"})
+
+        result = self.runtime.scrub_probe_raw(
+            installation,
+            "DELETE-FEASIBILITY-RAW",
+        )
+
+        self.assertEqual(
+            result,
+            {"observations_deleted": 1, "ephemeral_reports_deleted": 4},
+        )
+        self.assertTrue(all(not path.exists() for path in orphans))
+
+    def test_scrub_preserves_unrelated_hidden_and_persistent_files(self) -> None:
+        installation_path, installation = self.create_installation()
+        nonce_path = installation.data_root / "nonce.json"
+        preserved = [
+            installation.data_root / "incoming" / ".keep",
+            installation.data_root / "incoming" / ".observation.txt.crash",
+            installation.data_root / "reports" / ".gate.json.crash",
+            installation.data_root / "reports" / ".cli-observation.txt.crash",
+            installation.data_root / "reports" / "gate.json",
+            installation.data_root / ".installation.json.crash",
+            installation.data_root / ".nonce.json.crash",
+        ]
+        for path in preserved:
+            self.runtime.atomic_write_json(path, {"keep": True})
+        installation_before = installation_path.read_bytes()
+        nonce_before = nonce_path.read_bytes()
+
+        result = self.runtime.scrub_probe_raw(
+            installation,
+            "DELETE-FEASIBILITY-RAW",
+        )
+
+        self.assertEqual(
+            result,
+            {"observations_deleted": 0, "ephemeral_reports_deleted": 0},
+        )
+        self.assertTrue(all(path.exists() for path in preserved))
+        self.assertEqual(installation_path.read_bytes(), installation_before)
+        self.assertEqual(nonce_path.read_bytes(), nonce_before)
+
     def test_scrub_validates_every_target_before_deleting_any(self) -> None:
         _installation_path, installation = self.create_installation()
         raw = installation.data_root / "incoming" / "raw.json"
@@ -566,6 +619,27 @@ class GateTests(unittest.TestCase):
         self.assertTrue(raw.exists())
         self.assertTrue(valid_report.exists())
         self.assertTrue(invalid_report.exists())
+
+    def test_scrub_validates_temp_orphans_before_deleting_any(self) -> None:
+        _installation_path, installation = self.create_installation()
+        raw = installation.data_root / "incoming" / "raw.json"
+        valid_report = installation.data_root / "reports" / "cli-observation.json"
+        invalid_temp = (
+            installation.data_root / "reports" / ".desktop-boundary.json.crash"
+        )
+        self.runtime.atomic_write_json(raw, {"secret": "raw"})
+        self.runtime.atomic_write_json(valid_report, {"observation": "raw.json"})
+        invalid_temp.mkdir(mode=0o700)
+
+        with self.assertRaisesRegex(ValueError, "scrub_target_not_regular"):
+            self.runtime.scrub_probe_raw(
+                installation,
+                "DELETE-FEASIBILITY-RAW",
+            )
+
+        self.assertTrue(raw.exists())
+        self.assertTrue(valid_report.exists())
+        self.assertTrue(invalid_temp.exists())
 
     def test_scrub_rejects_wrong_confirmation(self) -> None:
         _installation_path, installation = self.create_installation()

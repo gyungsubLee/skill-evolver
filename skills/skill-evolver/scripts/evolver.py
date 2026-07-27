@@ -1642,15 +1642,25 @@ def scrub_probe_raw(
     reports = validate_private_child_directory(
         installation.data_root / "reports"
     )
-    observations = sorted(incoming.glob("*.json"))
+    observations = sorted(
+        {
+            path
+            for pattern in ("*.json", ".*.json.*")
+            for path in incoming.glob(pattern)
+        }
+    )
     ephemeral_reports = sorted(
         {
             path
             for pattern in (
                 "*-observation.json",
+                ".*-observation.json.*",
                 "*-boundary.json",
+                ".*-boundary.json.*",
                 "*-skill-challenge.json",
+                ".*-skill-challenge.json.*",
                 "*-skill-response.json",
+                ".*-skill-response.json.*",
             )
             for path in reports.glob(pattern)
         }
