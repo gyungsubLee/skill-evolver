@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from support import TEST_ROOT, load_runtime
 
@@ -34,6 +36,47 @@ class TranscriptProbeTests(unittest.TestCase):
         }
         with self.transcript.open("ab") as stream:
             stream.write(lines[4])
+
+    def prepare_promotable_surface(self):
+        workspace = Path(tempfile.mkdtemp(dir=self.root))
+        sessions = workspace / "sessions"
+        sessions.mkdir(mode=0o700)
+        installation_path = self.runtime.initialize_probe(
+            workspace / "probe", (sessions,), Path("/usr/bin/python3")
+        )
+        installation = self.runtime.load_installation(installation_path)
+        copied_transcript = sessions / "session.jsonl"
+        copied_transcript.write_bytes(self.transcript.read_bytes())
+        copied = copied_transcript.stat()
+        observation = {
+            **self.observation,
+            "installation_nonce": installation.nonce,
+            "event": {
+                **self.observation["event"],
+                "transcript_path": str(copied_transcript),
+            },
+            "transcript_stat": {
+                "size": copied.st_size,
+                "mtime_ns": copied.st_mtime_ns,
+                "device": copied.st_dev,
+                "inode": copied.st_ino,
+            },
+        }
+        for name in ("one.json", "two.json"):
+            self.runtime.atomic_write_json(
+                installation.data_root / "incoming" / name,
+                observation,
+            )
+        mapping_path = installation.data_root / "reports" / "cli-observation.json"
+        self.runtime.atomic_write_json(
+            mapping_path,
+            {
+                "schema_version": 1,
+                "surface": "cli",
+                "observations": ["one.json", "two.json"],
+            },
+        )
+        return installation, mapping_path
 
     def test_inspection_reads_only_captured_prefix(self) -> None:
         report = self.runtime.inspect_transcript_structure(self.observation, "cli")
@@ -92,43 +135,106 @@ class TranscriptProbeTests(unittest.TestCase):
             },
         )
 
-    def test_promotion_requires_two_observations_with_stable_layout(self) -> None:
-        sessions = self.root / "sessions"
-        sessions.mkdir(mode=0o700)
-        installation_path = self.runtime.initialize_probe(
-            self.root / "probe", (sessions,), Path("/usr/bin/python3")
+    def test_dynamic_dictionary_keys_are_redacted_from_pointer_reports(self) -> None:
+        raw_key = "secret-id-/Users/example/private~path"
+        report = self.runtime.discover_turn_structure(
+            [
+                {"payload": {raw_key: {"turn_id": "turn-target", "role": "user"}}},
+                {"payload": {raw_key: {"turn_id": "turn-target", "role": "assistant"}}},
+            ],
+            "turn-target",
         )
-        installation = self.runtime.load_installation(installation_path)
-        copied_transcript = sessions / "session.jsonl"
-        copied_transcript.write_bytes(self.transcript.read_bytes())
-        copied = copied_transcript.stat()
+
+        serialized = json.dumps(report)
+        self.assertNotIn(raw_key, serialized)
+        self.assertNotIn("/Users/", serialized)
+        self.assertEqual(
+            report["turn_id_pointer_paths"],
+            ["/payload/_redacted_0/turn_id"],
+        )
+        self.assertEqual(
+            report["provenance_pointer_paths"],
+            ["/payload/_redacted_0/role"],
+        )
+
+    def test_blank_captured_jsonl_line_is_unsupported(self) -> None:
+        transcript = self.root / "blank.jsonl"
+        transcript.write_bytes(
+            b'{"turn_id":"turn-target","role":"user"}\n\n'
+            b'{"turn_id":"turn-target","role":"assistant"}\n'
+        )
+        info = transcript.stat()
         observation = {
-            **self.observation,
-            "installation_nonce": installation.nonce,
-            "event": {
-                **self.observation["event"],
-                "transcript_path": str(copied_transcript),
-            },
+            "event": {"turn_id": "turn-target", "transcript_path": str(transcript)},
             "transcript_stat": {
-                "size": copied.st_size,
-                "mtime_ns": copied.st_mtime_ns,
-                "device": copied.st_dev,
-                "inode": copied.st_ino,
+                "size": info.st_size,
+                "mtime_ns": info.st_mtime_ns,
+                "device": info.st_dev,
+                "inode": info.st_ino,
             },
         }
-        for name in ("one.json", "two.json"):
-            self.runtime.atomic_write_json(
-                installation.data_root / "incoming" / name,
-                observation,
-            )
-        self.runtime.atomic_write_json(
-            installation.data_root / "reports" / "cli-observation.json",
-            {
-                "schema_version": 1,
-                "surface": "cli",
-                "observations": ["one.json", "two.json"],
-            },
-        )
+
+        with self.assertRaisesRegex(ValueError, "unsupported_jsonl"):
+            self.runtime.inspect_transcript_structure(observation, "cli")
+
+    def test_non_private_or_symlinked_mapping_is_not_read(self) -> None:
+        for kind in ("symlink", "wrong-mode"):
+            with self.subTest(kind=kind):
+                installation, mapping_path = self.prepare_promotable_surface()
+                if kind == "symlink":
+                    replacement = self.root / "valid-mapping.json"
+                    replacement.write_bytes(mapping_path.read_bytes())
+                    mapping_path.unlink()
+                    mapping_path.symlink_to(replacement)
+                else:
+                    os.chmod(mapping_path, 0o644)
+                output = self.root / f"mapping-{kind}.structure.json"
+                original_read_text = Path.read_text
+
+                def guarded_read_text(path, *args, **kwargs):
+                    if path == mapping_path:
+                        raise AssertionError("mapping target read")
+                    return original_read_text(path, *args, **kwargs)
+
+                with mock.patch.object(Path, "read_text", guarded_read_text):
+                    report = self.runtime.promote_transcript_structure(
+                        installation, "cli", output
+                    )
+                self.assertFalse(report["supported"])
+                self.assertEqual(report["error_codes"], ["surface_observation_unavailable"])
+
+    def test_invalid_mapped_observations_are_not_read(self) -> None:
+        for kind in ("symlink", "directory", "wrong-mode"):
+            with self.subTest(kind=kind):
+                installation, _mapping_path = self.prepare_promotable_surface()
+                observation_path = installation.data_root / "incoming" / "one.json"
+                if kind == "symlink":
+                    replacement = self.root / "valid-observation.json"
+                    replacement.write_bytes(observation_path.read_bytes())
+                    observation_path.unlink()
+                    observation_path.symlink_to(replacement)
+                elif kind == "directory":
+                    observation_path.unlink()
+                    observation_path.mkdir(mode=0o700)
+                else:
+                    os.chmod(observation_path, 0o644)
+                output = self.root / f"observation-{kind}.structure.json"
+                original_read_text = Path.read_text
+
+                def guarded_read_text(path, *args, **kwargs):
+                    if path == observation_path:
+                        raise AssertionError("observation target read")
+                    return original_read_text(path, *args, **kwargs)
+
+                with mock.patch.object(Path, "read_text", guarded_read_text):
+                    report = self.runtime.promote_transcript_structure(
+                        installation, "cli", output
+                    )
+                self.assertFalse(report["supported"])
+                self.assertEqual(report["error_codes"], ["surface_observation_unavailable"])
+
+    def test_promotion_requires_two_observations_with_stable_layout(self) -> None:
+        installation, _mapping_path = self.prepare_promotable_surface()
         report = self.runtime.promote_transcript_structure(
             installation,
             "cli",

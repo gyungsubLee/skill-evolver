@@ -26,6 +26,13 @@ PROVENANCE_VALUES = {
     "user",
     "user_direct",
 }
+POINTER_SEGMENT_ALLOWLIST = {
+    "internal_chat_message_metadata_passthrough",
+    "payload",
+    "role",
+    "source_kind",
+    "turn_id",
+}
 MAX_TRANSCRIPT_PROBE_BYTES = 2_097_152
 
 
@@ -50,10 +57,19 @@ def pointer_escape(value: str) -> str:
     return value.replace("~", "~0").replace("/", "~1")
 
 
+def pointer_segment(key: object, ordinal: int) -> str:
+    value = str(key)
+    return (
+        pointer_escape(value)
+        if value in POINTER_SEGMENT_ALLOWLIST
+        else f"_redacted_{ordinal}"
+    )
+
+
 def walk_scalars(value: object, pointer: str = "") -> Iterator[tuple[str, object]]:
     if isinstance(value, dict):
-        for key in sorted(value):
-            child = f"{pointer}/{pointer_escape(str(key))}"
+        for ordinal, key in enumerate(sorted(value)):
+            child = f"{pointer}/{pointer_segment(key, ordinal)}"
             yield from walk_scalars(value[key], child)
     elif isinstance(value, list):
         for index, item in enumerate(value):
@@ -755,8 +771,9 @@ def load_captured_records(
     records: list[object] = []
     try:
         for raw_line in prefix.splitlines():
-            if raw_line:
-                records.append(json.loads(raw_line))
+            if not raw_line:
+                raise ValueError("unsupported_jsonl")
+            records.append(json.loads(raw_line))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("unsupported_jsonl") from error
     return records, captured_size, current.st_size
@@ -871,6 +888,7 @@ def load_surface_observations(
 ) -> list[dict[str, object]]:
     surface = validate_surface(surface)
     mapping_path = installation.data_root / "reports" / f"{surface}-observation.json"
+    validate_observation(mapping_path)
     mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
     filenames = mapping.get("observations")
     if (
@@ -886,6 +904,7 @@ def load_surface_observations(
         if Path(filename).name != filename:
             raise ValueError("invalid_observation_name")
         observation_path = installation.data_root / "incoming" / filename
+        validate_observation(observation_path)
         observations.append(json.loads(observation_path.read_text(encoding="utf-8")))
     return observations
 
