@@ -29,3 +29,12 @@ Supported user-facing actions:
 
 Do not open a transcript for status or list. Do not copy raw observations into chat.
 Do not claim feasibility passed unless `probe-gate` exits 0 and both report files say `PASS`.
+
+## Gate boundary
+
+A `PASS` report authorizes writing a separate Read-only MVP implementation plan.
+It does not authorize SQLite queue implementation, model review, skill mutation,
+evaluation, apply, or undo.
+
+A `FAIL` report requires a design amendment for session-level capture. Do not
+guess transcript fields or broaden filesystem access to force a pass.

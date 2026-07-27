@@ -9,6 +9,7 @@ import stat
 import sys
 import tempfile
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Iterator, Optional, Sequence, TextIO
@@ -34,6 +35,31 @@ POINTER_SEGMENT_ALLOWLIST = {
     "turn_id",
 }
 MAX_TRANSCRIPT_PROBE_BYTES = 2_097_152
+MAX_GATE_FIXTURE_BYTES = 65_536
+SCRUB_CONFIRMATION = "DELETE-FEASIBILITY-RAW"
+PRIVATE_STRUCTURE_KEY_FRAGMENTS = {
+    "authorization",
+    "bearer",
+    "credential",
+    "api_key",
+    "apikey",
+    "password",
+    "private_key",
+    "privatekey",
+    "prompt",
+    "secret",
+    "token",
+    "tool_result",
+}
+HOOK_FIELD_TYPE_NAMES = {
+    "NoneType",
+    "bool",
+    "dict",
+    "float",
+    "int",
+    "list",
+    "str",
+}
 
 
 @dataclass(frozen=True)
@@ -1051,6 +1077,620 @@ def promote_transcript_structure(
     return report
 
 
+def is_safe_payload_key(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 128
+        and value.isascii()
+        and all(character.isalnum() or character == "_" for character in value)
+        and not any(
+            fragment in value.casefold()
+            for fragment in PRIVATE_STRUCTURE_KEY_FRAGMENTS
+        )
+    )
+
+
+def is_safe_pointer_path(value: object) -> bool:
+    if (
+        not isinstance(value, str)
+        or not value.startswith("/")
+        or len(value) > 4_096
+        or not value.isascii()
+    ):
+        return False
+    return all(
+        segment in POINTER_SEGMENT_ALLOWLIST
+        or segment.isdecimal()
+        or (
+            segment.startswith("_redacted_")
+            and segment.removeprefix("_redacted_").isdecimal()
+        )
+        for segment in value[1:].split("/")
+    )
+
+
+def stop_fixture_passes(
+    fixture: dict[str, object],
+    expected_surface: str,
+) -> bool:
+    required_names = {
+        "hook_event_name",
+        "session_id",
+        "turn_id",
+        "cwd",
+        "transcript_path",
+    }
+    transcript_stat_names = {
+        "present",
+        "regular",
+        "owned_by_current_user",
+        "size_positive",
+        "has_mtime_ns",
+        "has_device",
+        "has_inode",
+    }
+    payload_keys = fixture.get("payload_keys")
+    field_types = fixture.get("field_types")
+    required = fixture.get("required_fields")
+    capture_errors = fixture.get("capture_error_codes")
+    transcript_stat = fixture.get("transcript_stat")
+    return (
+        set(fixture)
+        == {
+            "schema_version",
+            "surface",
+            "observation_count",
+            "capture_supported",
+            "distinct_turns",
+            "hook_event_name",
+            "payload_shapes_stable",
+            "payload_keys",
+            "field_types",
+            "required_fields",
+            "capture_error_codes",
+            "transcript_stat",
+            "shared_nonce_match",
+        }
+        and type(fixture.get("schema_version")) is int
+        and fixture["schema_version"] == 1
+        and fixture.get("surface") == expected_surface
+        and type(fixture.get("observation_count")) is int
+        and fixture["observation_count"] == 2
+        and fixture.get("capture_supported") is True
+        and fixture.get("distinct_turns") is True
+        and fixture.get("payload_shapes_stable") is True
+        and fixture.get("hook_event_name") == "Stop"
+        and fixture.get("shared_nonce_match") is True
+        and isinstance(payload_keys, list)
+        and all(is_safe_payload_key(value) for value in payload_keys)
+        and len(set(payload_keys)) == len(payload_keys)
+        and required_names.issubset(set(payload_keys))
+        and isinstance(field_types, dict)
+        and all(
+            is_safe_payload_key(key)
+            and isinstance(value, str)
+            and value in HOOK_FIELD_TYPE_NAMES
+            for key, value in field_types.items()
+        )
+        and set(field_types) == set(payload_keys)
+        and all(field_types.get(name) == "str" for name in required_names)
+        and isinstance(required, dict)
+        and set(required) == required_names
+        and all(
+            isinstance(value, dict)
+            and set(value) == {"present", "type", "valid"}
+            and value.get("present") is True
+            and value.get("type") == "str"
+            and value.get("valid") is True
+            for value in required.values()
+        )
+        and isinstance(capture_errors, list)
+        and not capture_errors
+        and isinstance(transcript_stat, dict)
+        and set(transcript_stat) == transcript_stat_names
+        and all(transcript_stat.get(name) is True for name in transcript_stat_names)
+    )
+
+
+def transcript_fixture_passes(
+    fixture: dict[str, object],
+    expected_surface: str,
+) -> bool:
+    occurrences = fixture.get("turn_occurrence_counts")
+    turn_paths = fixture.get("turn_id_pointer_paths")
+    provenance_paths = fixture.get("provenance_pointer_paths")
+    provenance_values = fixture.get("provenance_values")
+    error_codes = fixture.get("error_codes")
+    return (
+        set(fixture)
+        == {
+            "schema_version",
+            "surface",
+            "observation_count",
+            "supported",
+            "layouts_stable",
+            "format",
+            "suffix_ignored",
+            "read_past_boundary",
+            "turn_occurrence_counts",
+            "turn_record_spans_contiguous",
+            "turn_id_pointer_paths",
+            "provenance_pointer_paths",
+            "provenance_values",
+            "error_codes",
+        }
+        and type(fixture.get("schema_version")) is int
+        and fixture["schema_version"] == 1
+        and fixture.get("surface") == expected_surface
+        and type(fixture.get("observation_count")) is int
+        and fixture["observation_count"] == 2
+        and fixture.get("supported") is True
+        and fixture.get("layouts_stable") is True
+        and fixture.get("format") == "jsonl"
+        and fixture.get("suffix_ignored") is True
+        and fixture.get("read_past_boundary") is False
+        and isinstance(occurrences, list)
+        and len(occurrences) == 2
+        and all(type(value) is int and value > 0 for value in occurrences)
+        and fixture.get("turn_record_spans_contiguous") is True
+        and isinstance(turn_paths, list)
+        and bool(turn_paths)
+        and all(is_safe_pointer_path(value) for value in turn_paths)
+        and len(set(turn_paths)) == len(turn_paths)
+        and isinstance(provenance_paths, list)
+        and bool(provenance_paths)
+        and all(is_safe_pointer_path(value) for value in provenance_paths)
+        and len(set(provenance_paths)) == len(provenance_paths)
+        and isinstance(provenance_values, list)
+        and all(isinstance(value, str) for value in provenance_values)
+        and set(provenance_values).issubset(PROVENANCE_VALUES)
+        and {"user", "assistant"}.issubset(set(provenance_values))
+        and isinstance(error_codes, list)
+        and not error_codes
+    )
+
+
+def access_fixture_passes(
+    fixture: dict[str, object],
+    expected_surface: str,
+) -> bool:
+    return (
+        set(fixture) == {"schema_version", "surface", "read", "write"}
+        and type(fixture.get("schema_version")) is int
+        and fixture["schema_version"] == 1
+        and fixture.get("surface") == expected_surface
+        and fixture.get("read") is True
+        and fixture.get("write") is True
+    )
+
+
+def structural_differences(
+    cli_stop: dict[str, object],
+    desktop_stop: dict[str, object],
+    cli_transcript: dict[str, object],
+    desktop_transcript: dict[str, object],
+) -> dict[str, object]:
+    def only(
+        left: object,
+        right: object,
+        validator,
+    ) -> list[str]:
+        left_values = {
+            value for value in left if validator(value)
+        } if isinstance(left, list) else set()
+        right_values = {
+            value for value in right if validator(value)
+        } if isinstance(right, list) else set()
+        return sorted(left_values - right_values)
+
+    return {
+        "stop_keys_only_cli": only(
+            cli_stop.get("payload_keys"),
+            desktop_stop.get("payload_keys"),
+            is_safe_payload_key,
+        ),
+        "stop_keys_only_desktop": only(
+            desktop_stop.get("payload_keys"),
+            cli_stop.get("payload_keys"),
+            is_safe_payload_key,
+        ),
+        "turn_paths_only_cli": only(
+            cli_transcript.get("turn_id_pointer_paths"),
+            desktop_transcript.get("turn_id_pointer_paths"),
+            is_safe_pointer_path,
+        ),
+        "turn_paths_only_desktop": only(
+            desktop_transcript.get("turn_id_pointer_paths"),
+            cli_transcript.get("turn_id_pointer_paths"),
+            is_safe_pointer_path,
+        ),
+        "provenance_paths_only_cli": only(
+            cli_transcript.get("provenance_pointer_paths"),
+            desktop_transcript.get("provenance_pointer_paths"),
+            is_safe_pointer_path,
+        ),
+        "provenance_paths_only_desktop": only(
+            desktop_transcript.get("provenance_pointer_paths"),
+            cli_transcript.get("provenance_pointer_paths"),
+            is_safe_pointer_path,
+        ),
+    }
+
+
+def evaluate_feasibility_gate(
+    cli_stop: dict[str, object],
+    desktop_stop: dict[str, object],
+    cli_transcript: dict[str, object],
+    desktop_transcript: dict[str, object],
+    cli_access: dict[str, object],
+    desktop_access: dict[str, object],
+) -> dict[str, object]:
+    checks = {
+        "cli_stop_contract": stop_fixture_passes(cli_stop, "cli"),
+        "desktop_stop_contract": stop_fixture_passes(desktop_stop, "desktop"),
+        "cli_shared_data_root": cli_stop.get("shared_nonce_match") is True,
+        "desktop_shared_data_root": desktop_stop.get("shared_nonce_match") is True,
+        "cli_skill_data_root": access_fixture_passes(cli_access, "cli"),
+        "desktop_skill_data_root": access_fixture_passes(desktop_access, "desktop"),
+        "cli_transcript_supported": transcript_fixture_passes(
+            cli_transcript,
+            "cli",
+        ),
+        "desktop_transcript_supported": transcript_fixture_passes(
+            desktop_transcript,
+            "desktop",
+        ),
+    }
+    decision = "PASS" if all(checks.values()) else "FAIL"
+
+    def string_list(value: object, validator) -> list[str]:
+        return (
+            [item for item in value if validator(item)]
+            if isinstance(value, list)
+            else []
+        )
+
+    return {
+        "schema_version": 1,
+        "decision": decision,
+        "checks": checks,
+        "schema_differences": structural_differences(
+            cli_stop,
+            desktop_stop,
+            cli_transcript,
+            desktop_transcript,
+        ),
+        "surfaces": {
+            "cli": {
+                "stop_keys": string_list(
+                    cli_stop.get("payload_keys"),
+                    is_safe_payload_key,
+                ),
+                "turn_id_pointer_paths": string_list(
+                    cli_transcript.get("turn_id_pointer_paths"),
+                    is_safe_pointer_path,
+                ),
+                "provenance_pointer_paths": string_list(
+                    cli_transcript.get("provenance_pointer_paths"),
+                    is_safe_pointer_path,
+                ),
+            },
+            "desktop": {
+                "stop_keys": string_list(
+                    desktop_stop.get("payload_keys"),
+                    is_safe_payload_key,
+                ),
+                "turn_id_pointer_paths": string_list(
+                    desktop_transcript.get("turn_id_pointer_paths"),
+                    is_safe_pointer_path,
+                ),
+                "provenance_pointer_paths": string_list(
+                    desktop_transcript.get("provenance_pointer_paths"),
+                    is_safe_pointer_path,
+                ),
+            },
+        },
+        "next_action": (
+            "write_read_only_mvp_plan"
+            if decision == "PASS"
+            else "amend_design_for_session_level_queue"
+        ),
+    }
+
+
+def render_gate_markdown(report: dict[str, object]) -> str:
+    lines = [
+        "# Skill Evolver Feasibility Report",
+        "",
+        f"Decision: **{report['decision']}**",
+        "",
+        "The gate checks Codex CLI and Desktop against the same bounded Stop and transcript contract.",
+        "",
+        "## Checks",
+        "",
+    ]
+    for name, passed in report["checks"].items():
+        lines.append(f"- [{'x' if passed else ' '}] `{name}`")
+    lines.extend(["", "## CLI/Desktop schema differences", ""])
+    for name, values in report["schema_differences"].items():
+        lines.append(
+            f"- `{name}`: `{json.dumps(values, ensure_ascii=False, sort_keys=True)}`"
+        )
+    lines.extend(
+        [
+            "",
+            "## Next action",
+            "",
+            (
+                "Write the Read-only MVP plan using the recorded JSON-pointer paths."
+                if report["decision"] == "PASS"
+                else "Stop implementation and amend the design to use a session-level queue."
+            ),
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def atomic_write_text(path: Path, value: str, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+        os.chmod(path, mode)
+        fsync_directory(path.parent)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def reject_symlink_components(path: Path, error_code: str) -> None:
+    absolute = Path(os.path.abspath(str(path.expanduser())))
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        current /= component
+        if current.is_symlink():
+            raise ValueError(error_code)
+        if not current.exists():
+            return
+
+
+def resolve_report_output(path: Path) -> Path:
+    requested = Path(os.path.abspath(str(path.expanduser())))
+    reject_symlink_components(
+        requested.parent,
+        "report_output_parent_symlink",
+    )
+    if requested.is_symlink():
+        raise ValueError("report_output_symlink")
+    parent = requested.parent
+    cursor = parent
+    while not cursor.exists():
+        if cursor.is_symlink():
+            raise ValueError("report_output_parent_symlink")
+        if cursor == cursor.parent:
+            raise ValueError("report_output_parent_missing")
+        cursor = cursor.parent
+    if cursor.is_symlink():
+        raise ValueError("report_output_parent_symlink")
+    parent_info = cursor.lstat()
+    if (
+        not stat.S_ISDIR(parent_info.st_mode)
+        or parent_info.st_uid != os.getuid()
+        or stat.S_IMODE(parent_info.st_mode) & 0o022
+    ):
+        raise ValueError("report_output_parent_permissions")
+    if requested.exists():
+        info = requested.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("report_output_not_regular")
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
+            raise ValueError("report_output_permissions")
+    return requested
+
+
+def paths_alias(left: Path, right: Path) -> bool:
+    def key(path: Path) -> str:
+        normalized = unicodedata.normalize(
+            "NFC",
+            os.path.normpath(str(path)),
+        )
+        return unicodedata.normalize("NFC", normalized.casefold())
+
+    if key(left) == key(right):
+        return True
+    try:
+        return left.exists() and right.exists() and left.samefile(right)
+    except OSError:
+        return False
+
+
+def write_gate_report(
+    fixture_root: Path,
+    output_json: Path,
+    output_markdown: Path,
+) -> dict[str, object]:
+    json_path = resolve_report_output(output_json)
+    markdown_path = resolve_report_output(output_markdown)
+    if paths_alias(json_path, markdown_path):
+        raise ValueError("report_output_alias")
+    fixture_base = fixture_root.expanduser().resolve(strict=False)
+    fixture_paths = [
+        fixture_base / name
+        for name in (
+            "stop-cli.structure.json",
+            "stop-desktop.structure.json",
+            "transcript-cli.structure.json",
+            "transcript-desktop.structure.json",
+            "access-cli.structure.json",
+            "access-desktop.structure.json",
+        )
+    ]
+    if any(
+        paths_alias(output, fixture)
+        for output in (json_path, markdown_path)
+        for fixture in fixture_paths
+    ):
+        raise ValueError("report_output_alias")
+
+    def load(root: Path, name: str) -> dict[str, object]:
+        path = root / name
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError("gate_fixture_symlink")
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("gate_fixture_not_regular")
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
+            raise ValueError("gate_fixture_permissions")
+        if info.st_size > MAX_GATE_FIXTURE_BYTES:
+            raise ValueError("gate_fixture_too_large")
+        flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(str(path), flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                opened.st_dev != info.st_dev
+                or opened.st_ino != info.st_ino
+                or opened.st_size != info.st_size
+            ):
+                raise ValueError("gate_fixture_changed")
+            raw = read_exact_prefix(descriptor, info.st_size)
+            if os.fstat(descriptor).st_size != info.st_size:
+                raise ValueError("gate_fixture_changed")
+        finally:
+            os.close(descriptor)
+        value = json.loads(raw.decode("utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("gate_fixture_not_object")
+        return value
+
+    try:
+        requested_root = Path(
+            os.path.abspath(str(fixture_root.expanduser()))
+        )
+        reject_symlink_components(
+            requested_root,
+            "gate_fixture_root_symlink",
+        )
+        root = requested_root.resolve(strict=True)
+        root_info = root.stat()
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or root_info.st_uid != os.getuid()
+            or stat.S_IMODE(root_info.st_mode) & 0o022
+        ):
+            raise ValueError("gate_fixture_root_permissions")
+        report = evaluate_feasibility_gate(
+            load(root, "stop-cli.structure.json"),
+            load(root, "stop-desktop.structure.json"),
+            load(root, "transcript-cli.structure.json"),
+            load(root, "transcript-desktop.structure.json"),
+            load(root, "access-cli.structure.json"),
+            load(root, "access-desktop.structure.json"),
+        )
+    except (KeyError, OSError, RecursionError, TypeError, ValueError):
+        report = {
+            "schema_version": 1,
+            "decision": "FAIL",
+            "checks": {"gate_inputs_valid": False},
+            "schema_differences": {},
+            "surfaces": {},
+            "next_action": "amend_design_for_session_level_queue",
+        }
+    atomic_write_text(markdown_path, render_gate_markdown(report))
+    atomic_write_json(json_path, report)
+    return report
+
+
+def cmd_probe_gate(args: argparse.Namespace) -> int:
+    report = write_gate_report(
+        Path(args.fixture_root),
+        Path(args.output_json),
+        Path(args.output_markdown),
+    )
+    write_json_stdout(report)
+    return 0 if report["decision"] == "PASS" else 2
+
+
+def validate_scrub_target(path: Path, expected_parent: Path) -> Path:
+    if path.parent != expected_parent:
+        raise ValueError("scrub_target_outside_root")
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode):
+        raise ValueError("scrub_target_symlink")
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("scrub_target_not_regular")
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+        raise ValueError("scrub_target_permissions")
+    return path
+
+
+def scrub_probe_raw(
+    installation: Installation,
+    confirmation: str,
+) -> dict[str, int]:
+    if confirmation != SCRUB_CONFIRMATION:
+        raise ValueError("confirmation_mismatch")
+    validate_private_directory(installation.data_root)
+    incoming = validate_private_child_directory(
+        installation.data_root / "incoming"
+    )
+    reports = validate_private_child_directory(
+        installation.data_root / "reports"
+    )
+    observations = sorted(incoming.glob("*.json"))
+    ephemeral_reports = sorted(
+        {
+            path
+            for pattern in (
+                "*-observation.json",
+                "*-boundary.json",
+                "*-skill-challenge.json",
+                "*-skill-response.json",
+            )
+            for path in reports.glob(pattern)
+        }
+    )
+    observations = [
+        validate_scrub_target(path, incoming)
+        for path in observations
+    ]
+    ephemeral_reports = [
+        validate_scrub_target(path, reports)
+        for path in ephemeral_reports
+    ]
+    for path in observations:
+        path.unlink()
+    for path in ephemeral_reports:
+        path.unlink()
+    fsync_directory(incoming)
+    fsync_directory(reports)
+    return {
+        "observations_deleted": len(observations),
+        "ephemeral_reports_deleted": len(ephemeral_reports),
+    }
+
+
+def cmd_probe_scrub(args: argparse.Namespace) -> int:
+    if not sys.stdin.isatty():
+        raise ValueError("tty_required")
+    sys.stdout.write(
+        f"Type {SCRUB_CONFIRMATION} to delete private raw observations: "
+    )
+    sys.stdout.flush()
+    typed = sys.stdin.readline(len(SCRUB_CONFIRMATION) + 2).removesuffix("\n")
+    installation = load_installation(Path(args.installation))
+    result = scrub_probe_raw(installation, typed)
+    write_json_stdout(result)
+    return 0
+
+
 def cmd_probe_status(args: argparse.Namespace) -> int:
     installation = load_installation(Path(args.installation))
     observations = observation_paths(installation)
@@ -1174,6 +1814,16 @@ def build_parser() -> argparse.ArgumentParser:
     promote_transcript.add_argument("--surface", choices=("cli", "desktop"), required=True)
     promote_transcript.add_argument("--output", required=True)
     promote_transcript.set_defaults(handler=cmd_probe_promote_transcript)
+
+    probe_gate = subparsers.add_parser("probe-gate")
+    probe_gate.add_argument("--fixture-root", required=True)
+    probe_gate.add_argument("--output-json", required=True)
+    probe_gate.add_argument("--output-markdown", required=True)
+    probe_gate.set_defaults(handler=cmd_probe_gate)
+
+    probe_scrub = subparsers.add_parser("probe-scrub")
+    probe_scrub.add_argument("--installation", required=True)
+    probe_scrub.set_defaults(handler=cmd_probe_scrub)
     return parser
 
 
