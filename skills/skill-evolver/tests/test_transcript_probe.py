@@ -233,6 +233,60 @@ class TranscriptProbeTests(unittest.TestCase):
                 self.assertFalse(report["supported"])
                 self.assertEqual(report["error_codes"], ["surface_observation_unavailable"])
 
+    def test_promotion_rejects_different_redacted_wrapper_layouts(self) -> None:
+        workspace = Path(tempfile.mkdtemp(dir=self.root))
+        sessions = workspace / "sessions"
+        sessions.mkdir(mode=0o700)
+        installation_path = self.runtime.initialize_probe(
+            workspace / "probe", (sessions,), Path("/usr/bin/python3")
+        )
+        installation = self.runtime.load_installation(installation_path)
+        raw_keys = ("private-wrapper-one", "private-wrapper-two")
+        for index, raw_key in enumerate(raw_keys, start=1):
+            transcript = sessions / f"session-{index}.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    json.dumps({"payload": {raw_key: {"turn_id": "turn-target", "role": role}}})
+                    for role in ("user", "assistant")
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            info = transcript.stat()
+            self.runtime.atomic_write_json(
+                installation.data_root / "incoming" / f"{index}.json",
+                {
+                    "installation_nonce": installation.nonce,
+                    "event": {
+                        "turn_id": "turn-target",
+                        "transcript_path": str(transcript),
+                    },
+                    "transcript_stat": {
+                        "size": info.st_size,
+                        "mtime_ns": info.st_mtime_ns,
+                        "device": info.st_dev,
+                        "inode": info.st_ino,
+                    },
+                },
+            )
+        self.runtime.atomic_write_json(
+            installation.data_root / "reports" / "cli-observation.json",
+            {"schema_version": 1, "surface": "cli", "observations": ["1.json", "2.json"]},
+        )
+
+        report = self.runtime.promote_transcript_structure(
+            installation, "cli", workspace / "layout.structure.json"
+        )
+
+        self.assertFalse(report["layouts_stable"])
+        self.assertFalse(report["supported"])
+        self.assertEqual(report["error_codes"], ["layout_unstable"])
+        serialized = json.dumps(report)
+        for raw_key in raw_keys:
+            self.assertNotIn(raw_key, serialized)
+        self.assertNotIn("hash", serialized)
+        self.assertNotIn("digest", serialized)
+
     def test_promotion_requires_two_observations_with_stable_layout(self) -> None:
         installation, _mapping_path = self.prepare_promotable_surface()
         report = self.runtime.promote_transcript_structure(

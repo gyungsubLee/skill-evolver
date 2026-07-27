@@ -66,16 +66,29 @@ def pointer_segment(key: object, ordinal: int) -> str:
     )
 
 
-def walk_scalars(value: object, pointer: str = "") -> Iterator[tuple[str, object]]:
+def _walk_scalar_entries(
+    value: object,
+    pointer: str = "",
+    identity: tuple[object, ...] = (),
+) -> Iterator[tuple[str, tuple[object, ...], object]]:
     if isinstance(value, dict):
         for ordinal, key in enumerate(sorted(value)):
             child = f"{pointer}/{pointer_segment(key, ordinal)}"
-            yield from walk_scalars(value[key], child)
+            yield from _walk_scalar_entries(
+                value[key], child, identity + (str(key),)
+            )
     elif isinstance(value, list):
         for index, item in enumerate(value):
-            yield from walk_scalars(item, f"{pointer}/{index}")
+            yield from _walk_scalar_entries(
+                item, f"{pointer}/{index}", identity + (index,)
+            )
     else:
-        yield pointer or "/", value
+        yield pointer or "/", identity, value
+
+
+def walk_scalars(value: object, pointer: str = "") -> Iterator[tuple[str, object]]:
+    for public_pointer, _identity, scalar in _walk_scalar_entries(value, pointer):
+        yield public_pointer, scalar
 
 
 def read_exact_prefix(descriptor: int, size: int) -> bytes:
@@ -782,38 +795,52 @@ def load_captured_records(
 def discover_turn_structure(
     records: list[object],
     turn_id: str,
+    layout_identity: Optional[dict[str, object]] = None,
 ) -> dict[str, object]:
-    turn_matches: list[tuple[int, str]] = []
-    provenance: list[tuple[int, str, str]] = []
+    turn_matches: list[tuple[int, str, tuple[object, ...]]] = []
+    provenance: list[tuple[int, str, tuple[object, ...], str]] = []
     for index, record in enumerate(records):
-        for pointer, scalar in walk_scalars(record):
+        for pointer, identity, scalar in _walk_scalar_entries(record):
             leaf = pointer.rsplit("/", 1)[-1]
             if scalar == turn_id:
-                turn_matches.append((index, pointer))
+                turn_matches.append((index, pointer, identity))
             if leaf in PROVENANCE_KEYS and scalar in PROVENANCE_VALUES:
-                provenance.append((index, pointer, str(scalar)))
+                provenance.append((index, pointer, identity, str(scalar)))
     if not turn_matches:
         raise ValueError("turn_id_not_found")
 
-    turn_indices = sorted({index for index, _pointer in turn_matches})
+    turn_indices = sorted({index for index, _pointer, _identity in turn_matches})
     start, end = turn_indices[0], turn_indices[-1]
     contiguous = turn_indices == list(range(start, end + 1))
     relevant_provenance = [
-        (index, pointer, value)
-        for index, pointer, value in provenance
+        (index, pointer, identity, value)
+        for index, pointer, identity, value in provenance
         if start <= index <= end
     ]
-    provenance_values = sorted({value for _index, _pointer, value in relevant_provenance})
+    provenance_values = sorted(
+        {value for _index, _pointer, _identity, value in relevant_provenance}
+    )
     if not {"user", "assistant"}.issubset(provenance_values):
         raise ValueError("provenance_not_found")
+
+    if layout_identity is not None:
+        layout_identity["turn"] = frozenset(
+            identity for _index, _pointer, identity in turn_matches
+        )
+        layout_identity["provenance"] = frozenset(
+            identity
+            for _index, _pointer, identity, _value in relevant_provenance
+        )
 
     return {
         "turn_occurrence_count": len(turn_matches),
         "turn_record_span": [start, end],
         "turn_record_span_contiguous": contiguous,
-        "turn_id_pointer_paths": sorted({pointer for _index, pointer in turn_matches}),
+        "turn_id_pointer_paths": sorted(
+            {pointer for _index, pointer, _identity in turn_matches}
+        ),
         "provenance_pointer_paths": sorted(
-            {pointer for _index, pointer, _value in relevant_provenance}
+            {pointer for _index, pointer, _identity, _value in relevant_provenance}
         ),
         "provenance_values": provenance_values,
     }
@@ -822,11 +849,13 @@ def discover_turn_structure(
 def inspect_transcript_structure(
     observation: dict[str, object],
     surface: str,
+    layout_identity: Optional[dict[str, object]] = None,
 ) -> dict[str, object]:
     records, captured_size, current_size = load_captured_records(observation)
     turn = discover_turn_structure(
         records,
         str(observation["event"]["turn_id"]),
+        layout_identity,
     )
     return {
         "schema_version": 1,
@@ -845,6 +874,7 @@ def inspect_transcript_structure(
 def safe_inspect_transcript_structure(
     observation: dict[str, object],
     surface: str,
+    layout_identity: Optional[dict[str, object]] = None,
 ) -> dict[str, object]:
     if "event" not in observation or "transcript_stat" not in observation:
         code = observation.get("capture_error_code")
@@ -859,7 +889,7 @@ def safe_inspect_transcript_structure(
             ),
         }
     try:
-        return inspect_transcript_structure(observation, surface)
+        return inspect_transcript_structure(observation, surface, layout_identity)
     except (KeyError, OSError, TypeError, ValueError) as error:
         allowed = {
             "captured_prefix_partial_record",
@@ -943,10 +973,14 @@ def promote_transcript_structure(
         atomic_write_json(output.resolve(), report)
         return report
 
-    individual = [
-        safe_inspect_transcript_structure(observation, surface)
-        for observation in observations
-    ]
+    identities: list[dict[str, object]] = []
+    individual = []
+    for observation in observations:
+        layout_identity: dict[str, object] = {}
+        individual.append(
+            safe_inspect_transcript_structure(observation, surface, layout_identity)
+        )
+        identities.append(layout_identity)
     all_supported = all(item.get("supported") is True for item in individual)
     turn_layouts = [
         tuple(item.get("turn_id_pointer_paths", []))
@@ -960,6 +994,7 @@ def promote_transcript_structure(
         all_supported
         and turn_layouts[0] == turn_layouts[1]
         and provenance_layouts[0] == provenance_layouts[1]
+        and identities[0] == identities[1]
     )
     spans_contiguous = all(
         item.get("turn_record_span_contiguous") is True
