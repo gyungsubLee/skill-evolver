@@ -227,16 +227,25 @@ def validate_transcript_root(path: Path) -> Path:
     return resolved
 
 
+def path_identity(path: Path) -> str:
+    normalized = unicodedata.normalize(
+        "NFC",
+        os.path.normpath(str(path)),
+    )
+    return unicodedata.normalize("NFC", normalized.casefold())
+
+
 def validate_transcript_separation(
     data_root: Path, transcript_roots: tuple[Path, ...]
 ) -> None:
-    if any(
-        data_root == transcript_root
-        or data_root in transcript_root.parents
-        or transcript_root in data_root.parents
-        for transcript_root in transcript_roots
-    ):
-        raise ValueError("data_transcript_overlap")
+    data_parts = Path(path_identity(data_root)).parts
+    for transcript_root in transcript_roots:
+        transcript_parts = Path(path_identity(transcript_root)).parts
+        if (
+            data_parts[: len(transcript_parts)] == transcript_parts
+            or transcript_parts[: len(data_parts)] == data_parts
+        ):
+            raise ValueError("data_transcript_overlap")
 
 
 def initialize_probe(
@@ -1560,14 +1569,7 @@ def resolve_report_output(path: Path) -> Path:
 
 
 def paths_alias(left: Path, right: Path) -> bool:
-    def key(path: Path) -> str:
-        normalized = unicodedata.normalize(
-            "NFC",
-            os.path.normpath(str(path)),
-        )
-        return unicodedata.normalize("NFC", normalized.casefold())
-
-    if key(left) == key(right):
+    if path_identity(left) == path_identity(right):
         return True
     try:
         return left.exists() and right.exists() and left.samefile(right)

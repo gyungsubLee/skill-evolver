@@ -313,6 +313,77 @@ class InstallationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "data_transcript_overlap"):
                     self.runtime.load_installation(installation_path)
 
+    def test_case_variant_transcript_overlap_is_rejected(self) -> None:
+        base = Path(self.temp.name)
+        equal_root = base / "CaseEqual"
+        equal_root.mkdir(mode=0o700)
+        parent_transcript = base / "CaseParent"
+        parent_transcript.mkdir(mode=0o700)
+        child_root = base / "CaseChild"
+        child_root.mkdir(mode=0o700)
+        (child_root / "Sessions").mkdir(mode=0o700)
+        cases = (
+            (
+                "equal",
+                equal_root,
+                equal_root.with_name("caseequal"),
+                equal_root,
+                equal_root.with_name("caseequal"),
+            ),
+            (
+                "parent",
+                parent_transcript / "Probe",
+                parent_transcript.with_name("caseparent"),
+                parent_transcript,
+                parent_transcript.with_name("caseparent"),
+            ),
+            (
+                "child",
+                child_root,
+                child_root.with_name("casechild") / "Sessions",
+                child_root,
+                child_root.with_name("casechild"),
+            ),
+        )
+
+        for name, data_root, transcript_root, actual, case_variant in cases:
+            with self.subTest(name=name):
+                if case_variant.exists():
+                    self.assertTrue(actual.samefile(case_variant))
+                with self.assertRaisesRegex(ValueError, "data_transcript_overlap"):
+                    self.runtime.validate_transcript_separation(
+                        data_root, (transcript_root,)
+                    )
+
+    def test_case_variant_separated_paths_keep_component_boundaries(self) -> None:
+        base = Path(self.temp.name)
+        prefix_parent = base / "Prefix"
+        (prefix_parent / "Bar").mkdir(parents=True, mode=0o700)
+        (prefix_parent / "Barley").mkdir(mode=0o700)
+        (base / "Root" / "Probe").mkdir(parents=True, mode=0o700)
+        (base / "Rooted" / "Probe").mkdir(parents=True, mode=0o700)
+        cases = (
+            (
+                base / "prefix" / "BAR",
+                base / "PREFIX" / "barley",
+            ),
+            (
+                base / "root" / "PROBE",
+                base / "ROOTED" / "probe",
+            ),
+        )
+
+        for data_root, transcript_root in cases:
+            with self.subTest(
+                data_root=data_root.name,
+                transcript_root=transcript_root.name,
+            ):
+                if data_root.exists() and transcript_root.exists():
+                    self.assertFalse(data_root.samefile(transcript_root))
+                self.runtime.validate_transcript_separation(
+                    data_root, (transcript_root,)
+                )
+
     def test_symlink_data_root_is_rejected_before_initialization(self) -> None:
         target = Path(self.temp.name) / "target"
         target.mkdir(mode=0o700)
