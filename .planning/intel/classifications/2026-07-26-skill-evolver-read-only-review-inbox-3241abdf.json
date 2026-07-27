@@ -1,0 +1,23 @@
+{
+  "source_path": "/Users/igyeongseob/Documents/오픈소스/skill-evolver/docs/superpowers/plans/2026-07-26-skill-evolver-read-only-review-inbox.md",
+  "type": "SPEC",
+  "confidence": "medium",
+  "manifest_override": false,
+  "title": "Skill Evolver Read-only Review Inbox Implementation Plan",
+  "summary": "Hook-bounded transcript를 명시적으로 검토하고 검증된 session decision을 inspect, defer, reject 가능한 candidate inbox에 저장하는 구현 계약을 정의한다.",
+  "scope": [
+    "Skill Evolver",
+    "review inbox",
+    "transcript adapter",
+    "review lease",
+    "candidate fingerprint",
+    "secret sanitizer",
+    "candidate state transitions"
+  ],
+  "cross_refs": [
+    "skill-evolver/docs/superpowers/specs/2026-07-26-skill-evolver-design.md"
+  ],
+  "locked": false,
+  "precedence": null,
+  "notes": "The filename and path identify an implementation plan, while adapter contracts, lease rules, validation schemas, state transitions, limits, and completion criteria provide dominant SPEC signals."
+}

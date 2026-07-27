@@ -1,0 +1,21 @@
+{
+  "source_path": "/Users/igyeongseob/Documents/오픈소스/skill-evolver/docs/feasibility-report.md",
+  "type": "DOC",
+  "confidence": "medium",
+  "manifest_override": false,
+  "title": "Skill Evolver Feasibility Report",
+  "summary": "Reports a failed CLI and Desktop feasibility gate, schema differences, unsupported transcript checks, and the resulting session-level queue direction.",
+  "scope": [
+    "Skill Evolver",
+    "Codex CLI",
+    "Codex Desktop",
+    "Stop contract",
+    "data root",
+    "transcript",
+    "session-level queue"
+  ],
+  "cross_refs": [],
+  "locked": false,
+  "precedence": null,
+  "notes": "The Decision label records a feasibility gate result rather than an architectural decision; the document primarily reports checks and observed schema differences."
+}

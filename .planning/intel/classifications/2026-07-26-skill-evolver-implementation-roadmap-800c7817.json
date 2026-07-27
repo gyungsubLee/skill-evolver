@@ -1,0 +1,38 @@
+{
+  "source_path": "/Users/igyeongseob/Documents/오픈소스/skill-evolver/docs/superpowers/plans/2026-07-26-skill-evolver-implementation-roadmap.md",
+  "type": "SPEC",
+  "confidence": "medium",
+  "manifest_override": false,
+  "title": "Skill Evolver Implementation Roadmap",
+  "summary": "Defines the gated implementation sequence, technical constraints, schema evolution, interface contracts, and release gates for Skill Evolver.",
+  "scope": [
+    "Skill Evolver",
+    "Codex CLI",
+    "Codex Desktop",
+    "Stop Hook",
+    "SQLite",
+    "release gates",
+    "runtime data",
+    "schema evolution"
+  ],
+  "cross_refs": [
+    "skill-evolver/docs/superpowers/specs/2026-07-26-skill-evolver-design.md",
+    "2026-07-26-skill-evolver-feasibility-spike.md",
+    "2026-07-26-skill-evolver-read-only-runtime-queue.md",
+    "2026-07-26-skill-evolver-read-only-review-inbox.md",
+    "2026-07-26-skill-evolver-read-only-quality-gate.md",
+    "2026-07-26-skill-evolver-evaluate-runner-spike.md",
+    "2026-07-26-skill-evolver-evaluate-prepare.md",
+    "2026-07-26-skill-evolver-evaluate-execution.md",
+    "2026-07-26-skill-evolver-apply-versioning.md",
+    "2026-07-26-skill-evolver-undo-recovery.md",
+    "2026-07-26-skill-evolver-hardening.md",
+    "skill-evolver/docs/feasibility-report.json",
+    "skill-evolver/docs/release-reports/hardening.json",
+    "skill-evolver/docs/feasibility-report.md",
+    "skill-evolver/docs/release-reports/"
+  ],
+  "locked": false,
+  "precedence": null,
+  "notes": "The document is framed as a roadmap, but its dominant signals are technical constraints, SQLite schema versions, cross-plan interface contracts, and release-gate contracts."
+}

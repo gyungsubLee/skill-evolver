@@ -1,0 +1,28 @@
+{
+  "source_path": "/Users/igyeongseob/Documents/오픈소스/skill-evolver/docs/superpowers/plans/2026-07-26-skill-evolver-read-only-quality-gate.md",
+  "type": "SPEC",
+  "confidence": "medium",
+  "manifest_override": false,
+  "title": "Skill Evolver Read-only Quality Gate Implementation Plan",
+  "summary": "Defines retention, privacy purge, human audit labeling, and deterministic PASS/FAIL thresholds for the Skill Evolver Read-only MVP quality gate.",
+  "scope": [
+    "Skill Evolver",
+    "Read-only MVP",
+    "SQLite schema v1",
+    "retention",
+    "privacy purge",
+    "candidate labels",
+    "quality report",
+    "release gate"
+  ],
+  "cross_refs": [
+    "skill-evolver/docs/superpowers/specs/2026-07-26-skill-evolver-design.md",
+    "skill-evolver/docs/feasibility-report.json",
+    "skill-evolver/skills/skill-evolver/SKILL.md",
+    "skill-evolver/docs/release-reports/read-only-quality-gate.json",
+    "skill-evolver/README.md"
+  ],
+  "locked": false,
+  "precedence": null,
+  "notes": "Although framed as an implementation plan, its dominant signals are retention contracts, purge authorization rules, quality metric thresholds, schema constraints, and report interfaces."
+}

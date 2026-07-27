@@ -1,0 +1,31 @@
+{
+  "source_path": "/Users/igyeongseob/Documents/오픈소스/skill-evolver/docs/superpowers/plans/2026-07-26-skill-evolver-evaluate-execution.md",
+  "type": "SPEC",
+  "confidence": "medium",
+  "manifest_override": false,
+  "title": "Skill Evolver Evaluate Execution Implementation Plan",
+  "summary": "Defines exact-digest evaluation execution, isolated subject and grader runs, deterministic readiness rules, atomic state transitions, and immutable reporting for Skill Evolver.",
+  "scope": [
+    "Skill Evolver",
+    "evaluation spec",
+    "base artifact",
+    "candidate artifact",
+    "runner contract",
+    "Codex CLI",
+    "SQLite",
+    "blind grader",
+    "release report"
+  ],
+  "cross_refs": [
+    "skill-evolver/docs/superpowers/specs/2026-07-26-skill-evolver-design.md",
+    "reports/runner/runner-contract.json",
+    "reports/evaluations/E-xxx/spec.json",
+    "skill-evolver/skills/skill-evolver/SKILL.md",
+    "skill-evolver/docs/release-reports/evaluate-execution.json",
+    "<data_root>/reports/evaluations/E-xxx/report.json",
+    "<data_root>/reports/evaluations/E-xxx/report.md"
+  ],
+  "locked": false,
+  "precedence": null,
+  "notes": "Although framed as an implementation plan, its dominant signals are exact interfaces, artifact contracts, resource limits, state transitions, and report schemas."
+}

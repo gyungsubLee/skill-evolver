@@ -1,0 +1,23 @@
+{
+  "source_path": "/Users/igyeongseob/Documents/오픈소스/skill-evolver/docs/superpowers/plans/2026-07-26-skill-evolver-hardening.md",
+  "type": "SPEC",
+  "confidence": "medium",
+  "manifest_override": false,
+  "title": "Skill Evolver Hardening Implementation Plan",
+  "summary": "Skill Evolver 전체 release를 trigger, attribution, security, soak, crash recovery와 disposable end-to-end 검증으로 승인하는 hardening 계약을 정의한다.",
+  "scope": [
+    "Skill Evolver",
+    "hardening harness",
+    "trigger evaluation",
+    "behavior fixtures",
+    "10,000-event soak",
+    "crash recovery",
+    "end-to-end lifecycle"
+  ],
+  "cross_refs": [
+    "skill-evolver/docs/superpowers/specs/2026-07-26-skill-evolver-design.md"
+  ],
+  "locked": false,
+  "precedence": null,
+  "notes": "The filename and path identify an implementation plan, while fixed thresholds, test contracts, fixture schemas, upstream gates, and release-report requirements provide dominant SPEC signals."
+}

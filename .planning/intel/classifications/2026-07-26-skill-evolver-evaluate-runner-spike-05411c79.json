@@ -1,0 +1,29 @@
+{
+  "source_path": "/Users/igyeongseob/Documents/오픈소스/skill-evolver/docs/superpowers/plans/2026-07-26-skill-evolver-evaluate-runner-spike.md",
+  "type": "SPEC",
+  "confidence": "medium",
+  "manifest_override": false,
+  "title": "Skill Evolver Evaluate Runner Spike Implementation Plan",
+  "summary": "Defines a hard-gated Codex runner spike with pinned versions, sandboxing, external resource supervision, structured output validation, and immutable PASS/FAIL contracts.",
+  "scope": [
+    "Skill Evolver",
+    "Codex CLI",
+    "runner spike",
+    "quality gate",
+    "sandbox",
+    "resource supervisor",
+    "runner contract",
+    "synthetic fixtures"
+  ],
+  "cross_refs": [
+    "skill-evolver/docs/superpowers/specs/2026-07-26-skill-evolver-design.md",
+    "skill-evolver/docs/release-reports/read-only-quality-gate.json",
+    "skill-evolver/skills/skill-evolver/SKILL.md",
+    "skill-evolver/docs/release-reports/evaluate-runner-spike.json",
+    "<data_root>/reports/runner/runner-contract.json",
+    "<data_root>/reports/runner/runner-spike-report.md"
+  ],
+  "locked": false,
+  "precedence": null,
+  "notes": "Although framed as an implementation plan, its dominant signals are pinned runtime contracts, fixed invocation fields, resource limits, output schemas, and release-gate rules."
+}

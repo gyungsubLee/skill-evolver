@@ -1,7 +1,7 @@
 # Skill Evolver Feasibility Probe
 
 This directory contains the pre-MVP probe defined by
-`../docs/superpowers/specs/2026-07-26-skill-evolver-design.md`.
+`docs/superpowers/specs/2026-07-26-skill-evolver-design.md`.
 
 It answers three questions:
 
@@ -34,7 +34,7 @@ codex plugin add skill-evolver@skill-evolver-dev --json
 ```
 
 The exact surface-arm, capture, promotion, and gate commands are recorded in
-`../docs/superpowers/plans/2026-07-26-skill-evolver-feasibility-spike.md`.
+`docs/superpowers/plans/2026-07-26-skill-evolver-feasibility-spike.md`.
 
 Remove the probe before scrubbing private observations:
 

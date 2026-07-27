@@ -1,0 +1,24 @@
+{
+  "source_path": "/Users/igyeongseob/Documents/오픈소스/skill-evolver/docs/superpowers/specs/2026-07-26-skill-evolver-design.md",
+  "type": "SPEC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "Skill Evolver 설계",
+  "summary": "Stop Hook 관찰부터 수동 검토, 격리 평가, 승인 적용과 복구까지 Skill Evolver의 기술 설계와 운영 계약을 정의한다.",
+  "scope": [
+    "Skill Evolver",
+    "Stop Hook",
+    "SQLite queue",
+    "transcript review",
+    "candidate evaluation",
+    "manual apply",
+    "snapshot recovery"
+  ],
+  "cross_refs": [
+    "SKILL.md",
+    "improvement-policy.md"
+  ],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

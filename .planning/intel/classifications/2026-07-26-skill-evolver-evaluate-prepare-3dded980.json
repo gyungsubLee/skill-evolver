@@ -1,0 +1,24 @@
+{
+  "source_path": "/Users/igyeongseob/Documents/오픈소스/skill-evolver/docs/superpowers/plans/2026-07-26-skill-evolver-evaluate-prepare.md",
+  "type": "SPEC",
+  "confidence": "medium",
+  "manifest_override": false,
+  "title": "Skill Evolver Evaluate Prepare Implementation Plan",
+  "summary": "후보 스킬을 실행하지 않고 검증된 text change로 staging한 뒤 immutable evaluation artifact와 spec을 봉인하는 구현 계약을 정의한다.",
+  "scope": [
+    "Skill Evolver",
+    "prepare flow",
+    "SQLite schema v2",
+    "mutable skill catalog",
+    "canonical manifest",
+    "declarative text changes",
+    "evaluation spec"
+  ],
+  "cross_refs": [
+    "skill-evolver/docs/superpowers/specs/2026-07-26-skill-evolver-design.md",
+    "2026-07-26-skill-evolver-evaluate-runner-spike.md"
+  ],
+  "locked": false,
+  "precedence": null,
+  "notes": "The filename and path identify an implementation plan, while schema migration, interfaces, artifact contracts, state transitions, validation rules, and completion criteria provide dominant SPEC signals."
+}
