@@ -11,12 +11,22 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Optional, Sequence, TextIO
+from typing import BinaryIO, Iterator, Optional, Sequence, TextIO
 
 VERSION = "skill-evolver feasibility 0.0.1"
 MAX_STDIN_BYTES = 65_536
 REQUIRED_HOOK_FIELDS = {"hook_event_name": str, "session_id": str, "turn_id": str, "cwd": str}
 INSTALLATION_SCHEMA = 1
+PROVENANCE_KEYS = {"role", "source_kind"}
+PROVENANCE_VALUES = {
+    "assistant",
+    "external_content",
+    "tool",
+    "tool_output",
+    "user",
+    "user_direct",
+}
+MAX_TRANSCRIPT_PROBE_BYTES = 2_097_152
 
 
 @dataclass(frozen=True)
@@ -34,6 +44,38 @@ class StopEnvelope:
     transcript_path: Path
     cwd: Path
     shape: dict[str, object]
+
+
+def pointer_escape(value: str) -> str:
+    return value.replace("~", "~0").replace("/", "~1")
+
+
+def walk_scalars(value: object, pointer: str = "") -> Iterator[tuple[str, object]]:
+    if isinstance(value, dict):
+        for key in sorted(value):
+            child = f"{pointer}/{pointer_escape(str(key))}"
+            yield from walk_scalars(value[key], child)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from walk_scalars(item, f"{pointer}/{index}")
+    else:
+        yield pointer or "/", value
+
+
+def read_exact_prefix(descriptor: int, size: int) -> bytes:
+    if size < 0:
+        raise ValueError("negative_captured_size")
+    if size > MAX_TRANSCRIPT_PROBE_BYTES:
+        raise ValueError("oversized_transcript")
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = os.read(descriptor, min(65_536, remaining))
+        if not chunk:
+            raise ValueError("transcript_changed")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 
 def fsync_directory(path: Path) -> None:
@@ -683,6 +725,278 @@ def promote_surface_stop(
         )
 
 
+def load_captured_records(
+    observation: dict[str, object],
+) -> tuple[list[object], int, int]:
+    event = observation["event"]
+    captured = observation["transcript_stat"]
+    captured_size = int(captured["size"])
+    if captured_size > MAX_TRANSCRIPT_PROBE_BYTES:
+        raise ValueError("oversized_transcript")
+    transcript_path = Path(str(event["transcript_path"]))
+    if transcript_path.is_symlink():
+        raise ValueError("transcript_changed")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(str(transcript_path), flags)
+    try:
+        current = os.fstat(descriptor)
+        if (
+            current.st_dev != captured["device"]
+            or current.st_ino != captured["inode"]
+            or current.st_size < captured_size
+        ):
+            raise ValueError("transcript_changed")
+        prefix = read_exact_prefix(descriptor, captured_size)
+    finally:
+        os.close(descriptor)
+    if prefix and not prefix.endswith(b"\n"):
+        raise ValueError("captured_prefix_partial_record")
+
+    records: list[object] = []
+    try:
+        for raw_line in prefix.splitlines():
+            if raw_line:
+                records.append(json.loads(raw_line))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("unsupported_jsonl") from error
+    return records, captured_size, current.st_size
+
+
+def discover_turn_structure(
+    records: list[object],
+    turn_id: str,
+) -> dict[str, object]:
+    turn_matches: list[tuple[int, str]] = []
+    provenance: list[tuple[int, str, str]] = []
+    for index, record in enumerate(records):
+        for pointer, scalar in walk_scalars(record):
+            leaf = pointer.rsplit("/", 1)[-1]
+            if scalar == turn_id:
+                turn_matches.append((index, pointer))
+            if leaf in PROVENANCE_KEYS and scalar in PROVENANCE_VALUES:
+                provenance.append((index, pointer, str(scalar)))
+    if not turn_matches:
+        raise ValueError("turn_id_not_found")
+
+    turn_indices = sorted({index for index, _pointer in turn_matches})
+    start, end = turn_indices[0], turn_indices[-1]
+    contiguous = turn_indices == list(range(start, end + 1))
+    relevant_provenance = [
+        (index, pointer, value)
+        for index, pointer, value in provenance
+        if start <= index <= end
+    ]
+    provenance_values = sorted({value for _index, _pointer, value in relevant_provenance})
+    if not {"user", "assistant"}.issubset(provenance_values):
+        raise ValueError("provenance_not_found")
+
+    return {
+        "turn_occurrence_count": len(turn_matches),
+        "turn_record_span": [start, end],
+        "turn_record_span_contiguous": contiguous,
+        "turn_id_pointer_paths": sorted({pointer for _index, pointer in turn_matches}),
+        "provenance_pointer_paths": sorted(
+            {pointer for _index, pointer, _value in relevant_provenance}
+        ),
+        "provenance_values": provenance_values,
+    }
+
+
+def inspect_transcript_structure(
+    observation: dict[str, object],
+    surface: str,
+) -> dict[str, object]:
+    records, captured_size, current_size = load_captured_records(observation)
+    turn = discover_turn_structure(
+        records,
+        str(observation["event"]["turn_id"]),
+    )
+    return {
+        "schema_version": 1,
+        "surface": surface,
+        "supported": True,
+        "format": "jsonl",
+        "record_count": len(records),
+        "captured_size": captured_size,
+        "current_size": current_size,
+        "suffix_ignored": current_size > captured_size,
+        "read_past_boundary": False,
+        **turn,
+    }
+
+
+def safe_inspect_transcript_structure(
+    observation: dict[str, object],
+    surface: str,
+) -> dict[str, object]:
+    if "event" not in observation or "transcript_stat" not in observation:
+        code = observation.get("capture_error_code")
+        return {
+            "schema_version": 1,
+            "surface": surface,
+            "supported": False,
+            "error_code": (
+                str(code)
+                if isinstance(code, str) and code in CAPTURE_ERROR_CODES
+                else "capture_invalid"
+            ),
+        }
+    try:
+        return inspect_transcript_structure(observation, surface)
+    except (KeyError, OSError, TypeError, ValueError) as error:
+        allowed = {
+            "captured_prefix_partial_record",
+            "oversized_transcript",
+            "provenance_not_found",
+            "transcript_changed",
+            "turn_id_not_found",
+            "unsupported_jsonl",
+        }
+        code = str(error)
+        return {
+            "schema_version": 1,
+            "surface": surface,
+            "supported": False,
+            "error_code": (
+                code
+                if isinstance(error, ValueError) and code in allowed
+                else "transcript_unavailable"
+            ),
+        }
+
+
+def load_surface_observations(
+    installation: Installation,
+    surface: str,
+) -> list[dict[str, object]]:
+    surface = validate_surface(surface)
+    mapping_path = installation.data_root / "reports" / f"{surface}-observation.json"
+    mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+    filenames = mapping.get("observations")
+    if (
+        mapping.get("surface") != surface
+        or not isinstance(filenames, list)
+        or len(filenames) != 2
+        or len(set(filenames)) != 2
+    ):
+        raise ValueError("invalid_surface_mapping")
+    observations: list[dict[str, object]] = []
+    for value in filenames:
+        filename = str(value)
+        if Path(filename).name != filename:
+            raise ValueError("invalid_observation_name")
+        observation_path = installation.data_root / "incoming" / filename
+        observations.append(json.loads(observation_path.read_text(encoding="utf-8")))
+    return observations
+
+
+def failed_transcript_promotion(
+    surface: str,
+    code: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "surface": surface,
+        "observation_count": 0,
+        "supported": False,
+        "layouts_stable": False,
+        "error_codes": [code],
+    }
+
+
+def promote_transcript_structure(
+    installation: Installation,
+    surface: str,
+    output: Path,
+) -> dict[str, object]:
+    surface = validate_surface(surface)
+    try:
+        observations = load_surface_observations(installation, surface)
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        report = failed_transcript_promotion(surface, "surface_observation_unavailable")
+        atomic_write_json(output.resolve(), report)
+        return report
+    if not all(
+        observation.get("installation_nonce") == installation.nonce
+        for observation in observations
+    ):
+        report = failed_transcript_promotion(surface, "shared_nonce_mismatch")
+        atomic_write_json(output.resolve(), report)
+        return report
+
+    individual = [
+        safe_inspect_transcript_structure(observation, surface)
+        for observation in observations
+    ]
+    all_supported = all(item.get("supported") is True for item in individual)
+    turn_layouts = [
+        tuple(item.get("turn_id_pointer_paths", []))
+        for item in individual
+    ]
+    provenance_layouts = [
+        tuple(item.get("provenance_pointer_paths", []))
+        for item in individual
+    ]
+    layouts_stable = (
+        all_supported
+        and turn_layouts[0] == turn_layouts[1]
+        and provenance_layouts[0] == provenance_layouts[1]
+    )
+    spans_contiguous = all(
+        item.get("turn_record_span_contiguous") is True
+        for item in individual
+    )
+    supported = all_supported and layouts_stable and spans_contiguous
+    provenance_values = (
+        sorted(
+            set(individual[0].get("provenance_values", []))
+            & set(individual[1].get("provenance_values", []))
+        )
+        if all_supported
+        else []
+    )
+    error_codes = sorted(
+        {
+            str(item["error_code"])
+            for item in individual
+            if "error_code" in item
+        }
+    )
+    if all_supported and not layouts_stable:
+        error_codes.append("layout_unstable")
+    if all_supported and not spans_contiguous:
+        error_codes.append("turn_span_not_contiguous")
+    report = {
+        "schema_version": 1,
+        "surface": surface,
+        "observation_count": len(individual),
+        "supported": supported,
+        "layouts_stable": layouts_stable,
+        "format": "jsonl" if all_supported else None,
+        "read_past_boundary": any(
+            item.get("read_past_boundary") is not False
+            for item in individual
+        ),
+        "suffix_ignored": any(
+            item.get("suffix_ignored") is True
+            for item in individual
+        ),
+        "turn_occurrence_counts": [
+            item.get("turn_occurrence_count", 0)
+            for item in individual
+        ],
+        "turn_record_spans_contiguous": spans_contiguous,
+        "turn_id_pointer_paths": list(turn_layouts[0]) if layouts_stable else [],
+        "provenance_pointer_paths": (
+            list(provenance_layouts[0]) if layouts_stable else []
+        ),
+        "provenance_values": provenance_values,
+        "error_codes": error_codes,
+    }
+    atomic_write_json(output.resolve(), report)
+    return report
+
+
 def cmd_probe_status(args: argparse.Namespace) -> int:
     installation = load_installation(Path(args.installation))
     observations = observation_paths(installation)
@@ -742,6 +1056,17 @@ def cmd_probe_promote_stop(args: argparse.Namespace) -> int:
     return 0 if report["capture_supported"] else 2
 
 
+def cmd_probe_promote_transcript(args: argparse.Namespace) -> int:
+    installation = load_installation(Path(args.installation))
+    report = promote_transcript_structure(
+        installation,
+        args.surface,
+        Path(args.output),
+    )
+    write_json_stdout(report)
+    return 0 if report["supported"] else 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="evolver.py")
     parser.add_argument("--version", action="version", version=VERSION)
@@ -789,6 +1114,12 @@ def build_parser() -> argparse.ArgumentParser:
     promote_stop.add_argument("--surface", choices=("cli", "desktop"), required=True)
     promote_stop.add_argument("--output", required=True)
     promote_stop.set_defaults(handler=cmd_probe_promote_stop)
+
+    promote_transcript = subparsers.add_parser("probe-promote-transcript")
+    promote_transcript.add_argument("--installation", required=True)
+    promote_transcript.add_argument("--surface", choices=("cli", "desktop"), required=True)
+    promote_transcript.add_argument("--output", required=True)
+    promote_transcript.set_defaults(handler=cmd_probe_promote_transcript)
     return parser
 
 

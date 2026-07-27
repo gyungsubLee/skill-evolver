@@ -1,0 +1,5 @@
+{"record_type":"message","turn_id":"turn-before","role":"user","content":"before"}
+{"record_type":"message","turn_id":"turn-target","role":"user","content":"target prompt"}
+{"record_type":"tool_result","turn_id":"turn-target","role":"tool","content":"tool result"}
+{"record_type":"message","turn_id":"turn-target","role":"assistant","content":"target answer"}
+{"record_type":"message","turn_id":"turn-after","role":"user","content":"appended later"}
