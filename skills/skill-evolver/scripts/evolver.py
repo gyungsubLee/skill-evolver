@@ -37,20 +37,19 @@ POINTER_SEGMENT_ALLOWLIST = {
 MAX_TRANSCRIPT_PROBE_BYTES = 2_097_152
 MAX_GATE_FIXTURE_BYTES = 65_536
 SCRUB_CONFIRMATION = "DELETE-FEASIBILITY-RAW"
-PRIVATE_STRUCTURE_KEY_FRAGMENTS = {
-    "authorization",
-    "bearer",
-    "credential",
-    "api_key",
-    "apikey",
-    "password",
-    "private_key",
-    "privatekey",
-    "prompt",
-    "secret",
-    "token",
-    "tool_result",
-}
+REVIEWED_STOP_PAYLOAD_KEYS = frozenset(
+    {
+        "cwd",
+        "hook_event_name",
+        "last_assistant_message",
+        "model",
+        "permission_mode",
+        "session_id",
+        "stop_hook_active",
+        "transcript_path",
+        "turn_id",
+    }
+)
 HOOK_FIELD_TYPE_NAMES = {
     "NoneType",
     "bool",
@@ -60,6 +59,14 @@ HOOK_FIELD_TYPE_NAMES = {
     "list",
     "str",
 }
+GATE_FIXTURE_NAMES = (
+    "stop-cli.structure.json",
+    "stop-desktop.structure.json",
+    "transcript-cli.structure.json",
+    "transcript-desktop.structure.json",
+    "access-cli.structure.json",
+    "access-desktop.structure.json",
+)
 
 
 @dataclass(frozen=True)
@@ -1078,16 +1085,7 @@ def promote_transcript_structure(
 
 
 def is_safe_payload_key(value: object) -> bool:
-    return (
-        isinstance(value, str)
-        and 0 < len(value) <= 128
-        and value.isascii()
-        and all(character.isalnum() or character == "_" for character in value)
-        and not any(
-            fragment in value.casefold()
-            for fragment in PRIVATE_STRUCTURE_KEY_FRAGMENTS
-        )
-    )
+    return isinstance(value, str) and value in REVIEWED_STOP_PAYLOAD_KEYS
 
 
 def is_safe_pointer_path(value: object) -> bool:
@@ -1164,7 +1162,7 @@ def stop_fixture_passes(
         and isinstance(payload_keys, list)
         and all(is_safe_payload_key(value) for value in payload_keys)
         and len(set(payload_keys)) == len(payload_keys)
-        and required_names.issubset(set(payload_keys))
+        and set(payload_keys) == REVIEWED_STOP_PAYLOAD_KEYS
         and isinstance(field_types, dict)
         and all(
             is_safe_payload_key(key)
@@ -1523,14 +1521,7 @@ def write_gate_report(
     fixture_base = fixture_root.expanduser().resolve(strict=False)
     fixture_paths = [
         fixture_base / name
-        for name in (
-            "stop-cli.structure.json",
-            "stop-desktop.structure.json",
-            "transcript-cli.structure.json",
-            "transcript-desktop.structure.json",
-            "access-cli.structure.json",
-            "access-desktop.structure.json",
-        )
+        for name in GATE_FIXTURE_NAMES
     ]
     if any(
         paths_alias(output, fixture)
@@ -1586,6 +1577,13 @@ def write_gate_report(
             or stat.S_IMODE(root_info.st_mode) & 0o022
         ):
             raise ValueError("gate_fixture_root_permissions")
+        structural_names = {
+            path.name
+            for path in root.iterdir()
+            if path.name.endswith(".structure.json")
+        }
+        if structural_names != set(GATE_FIXTURE_NAMES):
+            raise ValueError("gate_fixture_inventory")
         report = evaluate_feasibility_gate(
             load(root, "stop-cli.structure.json"),
             load(root, "stop-desktop.structure.json"),

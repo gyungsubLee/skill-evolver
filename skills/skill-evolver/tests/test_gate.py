@@ -22,6 +22,13 @@ def stop_fixture(surface: str, valid: bool = True) -> dict[str, object]:
         name: {"present": True, "type": "str", "valid": valid}
         for name in ("hook_event_name", "session_id", "turn_id", "cwd", "transcript_path")
     }
+    field_types = {
+        **{name: "str" for name in required},
+        "last_assistant_message": "str",
+        "model": "str",
+        "permission_mode": "str",
+        "stop_hook_active": "bool",
+    }
     return {
         "schema_version": 1,
         "surface": surface,
@@ -30,8 +37,8 @@ def stop_fixture(surface: str, valid: bool = True) -> dict[str, object]:
         "distinct_turns": True,
         "hook_event_name": "Stop",
         "payload_shapes_stable": True,
-        "payload_keys": sorted(required),
-        "field_types": {name: "str" for name in required},
+        "payload_keys": sorted(field_types),
+        "field_types": field_types,
         "required_fields": required,
         "capture_error_codes": [],
         "transcript_stat": {
@@ -214,10 +221,16 @@ class GateTests(unittest.TestCase):
         )
 
         unsafe_type = stop_fixture("cli")
-        unsafe_type["payload_keys"].append("model")
         unsafe_type["field_types"]["model"] = "Authorization"
         self.assertFalse(
             self.runtime.stop_fixture_passes(unsafe_type, "cli")
+        )
+
+        missing_reviewed_key = stop_fixture("cli")
+        missing_reviewed_key["payload_keys"].remove("model")
+        del missing_reviewed_key["field_types"]["model"]
+        self.assertFalse(
+            self.runtime.stop_fixture_passes(missing_reviewed_key, "cli")
         )
 
     def test_write_gate_report_creates_both_outputs_and_exit_codes(self) -> None:
@@ -368,6 +381,63 @@ class GateTests(unittest.TestCase):
         self.assertEqual(report["decision"], "FAIL")
         self.assertNotIn("Authorization", output_json.read_text(encoding="utf-8"))
         self.assertNotIn("Authorization", output_markdown.read_text(encoding="utf-8"))
+
+    def test_gate_rejects_unknown_stop_key_without_reporting_it(self) -> None:
+        fixtures = self.root / "fixtures"
+        self.write_fixtures(fixtures)
+        unknown_key = "future_field"
+        for surface in ("cli", "desktop"):
+            fixture = stop_fixture(surface)
+            fixture["payload_keys"].append(unknown_key)
+            fixture["field_types"][unknown_key] = "str"
+            self.runtime.atomic_write_json(
+                fixtures / f"stop-{surface}.structure.json",
+                fixture,
+            )
+        output_json = self.root / "report.json"
+        output_markdown = self.root / "report.md"
+
+        report = self.runtime.write_gate_report(
+            fixtures,
+            output_json,
+            output_markdown,
+        )
+
+        self.assertEqual(report["decision"], "FAIL")
+        self.assertFalse(report["checks"]["cli_stop_contract"])
+        self.assertFalse(report["checks"]["desktop_stop_contract"])
+        self.assertNotIn(unknown_key, output_json.read_text(encoding="utf-8"))
+        self.assertNotIn(unknown_key, output_markdown.read_text(encoding="utf-8"))
+
+    def test_gate_rejects_seventh_structural_fixture(self) -> None:
+        fixtures = self.root / "fixtures"
+        self.write_fixtures(fixtures)
+        self.runtime.atomic_write_json(
+            fixtures / "extra.structure.json",
+            {"schema_version": 1},
+        )
+
+        report = self.runtime.write_gate_report(
+            fixtures,
+            self.root / "report.json",
+            self.root / "report.md",
+        )
+
+        self.assertEqual(report["decision"], "FAIL")
+        self.assertFalse(report["checks"]["gate_inputs_valid"])
+
+    def test_gate_allows_unrelated_non_structure_fixture_file(self) -> None:
+        fixtures = self.root / "fixtures"
+        self.write_fixtures(fixtures)
+        (fixtures / "README.txt").write_text("notes\n", encoding="utf-8")
+
+        report = self.runtime.write_gate_report(
+            fixtures,
+            self.root / "report.json",
+            self.root / "report.md",
+        )
+
+        self.assertEqual(report["decision"], "PASS")
 
     def test_gate_rejects_output_symlink_without_touching_target(self) -> None:
         fixtures = self.root / "fixtures"
