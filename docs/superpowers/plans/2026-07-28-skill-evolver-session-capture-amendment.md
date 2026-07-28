@@ -204,7 +204,7 @@ git commit -m "feat(skill-evolver): probe session stop metadata"
 
 **Interfaces:**
 - Consumes: `Installation`, `atomic_write_json`, `validate_surface`, and v2 Stop observations.
-- Produces: `arm_access_v2`, `run_default_access_v2`, `run_explicit_access_v2`, `promote_access_v2`, and four `probe-v2-*access` commands.
+- Produces: `arm_access_v2`, `load_access_challenge_v2`, `run_default_access_v2`, `run_explicit_access_v2`, `promote_access_v2`, and four `probe-v2-*access` commands.
 
 - [ ] **Step 1: Write failing asymmetric access tests**
 
@@ -214,10 +214,17 @@ shape:
 ```python
 def test_default_access_reads_challenge_and_records_write_denial(self) -> None:
     self.runtime.arm_access_v2(self.installation, "cli")
+    original_write = self.runtime.atomic_write_json
+
+    def deny_global(path, payload, mode=0o600):
+        if path.parent == self.installation.data_root / "reports":
+            raise PermissionError("denied")
+        return original_write(path, payload, mode)
+
     with mock.patch.object(
         self.runtime,
         "atomic_write_json",
-        side_effect=PermissionError("denied"),
+        side_effect=deny_global,
     ):
         result = self.runtime.run_default_access_v2(
             self.installation, "cli", self.root / "default.json"
