@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Iterator, Optional, Sequence, TextIO
@@ -916,6 +918,36 @@ def access_reports_directory(installation: Installation) -> Path:
     return validate_private_child_directory(installation.data_root / "reports")
 
 
+@contextmanager
+def access_generation_lock(
+    installation: Installation, surface: str
+) -> Iterator[None]:
+    path = access_reports_directory(installation) / f"{surface}-v2-access.lock"
+    descriptor = os.open(
+        str(path),
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    locked = False
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise ValueError(ACCESS_EVIDENCE_ERROR)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked = True
+        yield
+    finally:
+        try:
+            if locked:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
 def access_challenge_path(installation: Installation, surface: str) -> Path:
     return access_reports_directory(installation) / f"{surface}-v2-access-challenge.json"
 
@@ -985,21 +1017,25 @@ def load_access_challenge_v2(
 
 def arm_access_v2(installation: Installation, surface: str) -> dict[str, object]:
     surface = validate_surface(surface)
-    for path in (
-        access_default_response_path(installation, surface),
-        access_explicit_response_path(installation, surface),
-    ):
-        path.unlink(missing_ok=True)
-    challenge = secrets.token_hex(32)
-    atomic_write_json(
-        access_challenge_path(installation, surface),
-        {
-            "schema_version": 2,
-            "surface": surface,
-            "installation_nonce": installation.nonce,
-            "challenge": challenge,
-        },
-    )
+    try:
+        with access_generation_lock(installation, surface):
+            for path in (
+                access_default_response_path(installation, surface),
+                access_explicit_response_path(installation, surface),
+            ):
+                path.unlink(missing_ok=True)
+            challenge = secrets.token_hex(32)
+            atomic_write_json(
+                access_challenge_path(installation, surface),
+                {
+                    "schema_version": 2,
+                    "surface": surface,
+                    "installation_nonce": installation.nonce,
+                    "challenge": challenge,
+                },
+            )
+    except (OSError, ValueError) as error:
+        raise ValueError(ACCESS_EVIDENCE_ERROR) from error
     return {
         "schema_version": 2,
         "surface": surface,
@@ -1153,35 +1189,36 @@ def promote_access_v2(
 ) -> dict[str, object]:
     surface = validate_surface(surface)
     try:
-        challenge = load_access_challenge_v2(installation, surface)
-        digest = challenge_digest(str(challenge["challenge"]))
-        default = read_bounded_private_json(resolve_report_output(default_response))
-        explicit = read_bounded_private_json(
-            access_explicit_response_path(installation, surface)
-        )
-        evidence_ok = (
-            valid_access_result(default, surface, digest, False, True)
-            and valid_access_result(explicit, surface, digest, True, False)
-            and has_successful_session_stop_evidence(installation, surface)
-        )
-        if not evidence_ok:
-            return failed_access_promotion(surface, output)
+        with access_generation_lock(installation, surface):
+            challenge = load_access_challenge_v2(installation, surface)
+            digest = challenge_digest(str(challenge["challenge"]))
+            default = read_bounded_private_json(resolve_report_output(default_response))
+            explicit = read_bounded_private_json(
+                access_explicit_response_path(installation, surface)
+            )
+            evidence_ok = (
+                valid_access_result(default, surface, digest, False, True)
+                and valid_access_result(explicit, surface, digest, True, False)
+                and has_successful_session_stop_evidence(installation, surface)
+            )
+            if not evidence_ok:
+                return failed_access_promotion(surface, output)
+            report = {
+                "schema_version": 2,
+                "surface": surface,
+                "hook_global_read": True,
+                "hook_global_write": True,
+                "skill_default_read": True,
+                "skill_default_write": False,
+                "skill_default_write_denied": True,
+                "skill_explicit_read": True,
+                "skill_explicit_write": True,
+                "error_codes": [],
+            }
+            write_access_result(output, report)
+            return report
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return failed_access_promotion(surface, output)
-    report = {
-        "schema_version": 2,
-        "surface": surface,
-        "hook_global_read": True,
-        "hook_global_write": True,
-        "skill_default_read": True,
-        "skill_default_write": False,
-        "skill_default_write_denied": True,
-        "skill_explicit_read": True,
-        "skill_explicit_write": True,
-        "error_codes": [],
-    }
-    write_access_result(output, report)
-    return report
 
 
 def arm_skill_preflight(

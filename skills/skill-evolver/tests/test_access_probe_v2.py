@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -108,6 +109,86 @@ class AccessProbeV2Tests(unittest.TestCase):
             self.installation, "cli", default, self.output_root / "access.json"
         )
         self.assertEqual(report["error_codes"], ["access_evidence_unavailable"])
+
+    def test_promotion_publication_blocks_concurrent_rearm(self) -> None:
+        armed = self.runtime.arm_access_v2(self.installation, "cli")
+        default = self.output_root / "default.json"
+        original_write = self.runtime.atomic_write_json
+
+        def deny_global(path, payload, mode=0o600):
+            if path.parent == self.installation.data_root / "reports":
+                raise PermissionError("denied")
+            return original_write(path, payload, mode)
+
+        with mock.patch.object(
+            self.runtime, "atomic_write_json", side_effect=deny_global
+        ):
+            self.runtime.run_default_access_v2(self.installation, "cli", default)
+        self.runtime.run_explicit_access_v2(self.installation, "cli")
+        self.capture_two_stops()
+        publication_ready = threading.Event()
+        allow_publication = threading.Event()
+        rearm_done = threading.Event()
+        published_digest: list[str] = []
+        original_result_write = self.runtime.write_access_result
+
+        def pause_publication(path, result):
+            if result["error_codes"] == []:
+                challenge = self.runtime.load_access_challenge_v2(self.installation, "cli")
+                published_digest.append(
+                    self.runtime.challenge_digest(str(challenge["challenge"]))
+                )
+                publication_ready.set()
+                self.assertTrue(allow_publication.wait(2))
+            return original_result_write(path, result)
+
+        promotion: list[dict[str, object]] = []
+
+        with mock.patch.object(
+            self.runtime, "write_access_result", side_effect=pause_publication
+        ):
+            promote_thread = threading.Thread(
+                target=lambda: promotion.append(
+                    self.runtime.promote_access_v2(
+                        self.installation,
+                        "cli",
+                        default,
+                        self.output_root / "access.json",
+                    )
+                )
+            )
+            rearm_thread = threading.Thread(
+                target=lambda: (
+                    self.runtime.arm_access_v2(self.installation, "cli"),
+                    rearm_done.set(),
+                )
+            )
+            promote_thread.start()
+            self.assertTrue(publication_ready.wait(2))
+            rearm_thread.start()
+            self.assertFalse(rearm_done.wait(0.1))
+            allow_publication.set()
+            promote_thread.join(2)
+            rearm_thread.join(2)
+
+        self.assertFalse(promote_thread.is_alive())
+        self.assertFalse(rearm_thread.is_alive())
+        self.assertTrue(rearm_done.is_set())
+        self.assertEqual(promotion[0]["error_codes"], [])
+        self.assertEqual(published_digest, [armed["challenge_digest"]])
+        later = self.runtime.promote_access_v2(
+            self.installation, "cli", default, self.output_root / "later.json"
+        )
+        self.assertEqual(later["error_codes"], ["access_evidence_unavailable"])
+
+    def test_symlinked_generation_lock_fails_closed(self) -> None:
+        lock = self.installation.data_root / "reports" / "cli-v2-access.lock"
+        target = self.root / "lock-target"
+        target.write_text("lock-secret", encoding="utf-8")
+        target.chmod(0o600)
+        lock.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "access_evidence_unavailable"):
+            self.runtime.arm_access_v2(self.installation, "cli")
 
     def test_explicit_access_writes_and_round_trips_current_challenge(self) -> None:
         armed = self.runtime.arm_access_v2(self.installation, "cli")
