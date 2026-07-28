@@ -17,6 +17,11 @@ from typing import BinaryIO, Iterator, Optional, Sequence, TextIO
 VERSION = "skill-evolver feasibility 0.0.1"
 MAX_STDIN_BYTES = 65_536
 REQUIRED_HOOK_FIELDS = {"hook_event_name": str, "session_id": str, "turn_id": str, "cwd": str}
+REQUIRED_SESSION_HOOK_FIELDS = {
+    "hook_event_name": str,
+    "session_id": str,
+    "cwd": str,
+}
 INSTALLATION_SCHEMA = 1
 PROVENANCE_KEYS = {"role", "source_kind"}
 PROVENANCE_VALUES = {
@@ -81,6 +86,15 @@ class Installation:
 class StopEnvelope:
     session_id: str
     turn_id: str
+    transcript_path: Path
+    cwd: Path
+    shape: dict[str, object]
+
+
+@dataclass(frozen=True)
+class SessionStopEnvelope:
+    session_id: str
+    turn_id: Optional[str]
     transcript_path: Path
     cwd: Path
     shape: dict[str, object]
@@ -275,7 +289,7 @@ def initialize_probe(
     nonce_path = root / "nonce.json"
     if any(path.exists() or path.is_symlink() for path in (installation_path, nonce_path)):
         raise ValueError("existing_installation")
-    for child in ("incoming", "reports"):
+    for child in ("incoming", "incoming-v2", "reports"):
         directory = root / child
         if directory.is_symlink():
             raise ValueError("data_child_symlink")
@@ -425,6 +439,76 @@ def parse_stop_envelope(raw: bytes, installation: Installation) -> StopEnvelope:
     return StopEnvelope(session_id, turn_id, transcript_path, cwd, shape)
 
 
+def summarize_session_hook_shape(payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        raise ValueError("hook_payload_not_object")
+    keys = set(REQUIRED_SESSION_HOOK_FIELDS) | {"transcript_path", "turn_id"}
+    field_types = {
+        key: type(payload[key]).__name__
+        for key in sorted(keys & set(payload))
+    }
+    required = {
+        key: {
+            "present": key in payload,
+            "type": field_types.get(key),
+            "valid": isinstance(payload.get(key), expected)
+            and (not isinstance(payload.get(key), str) or bool(payload[key]))
+            and (key != "hook_event_name" or payload.get(key) == "Stop"),
+        }
+        for key, expected in REQUIRED_SESSION_HOOK_FIELDS.items()
+    }
+    transcript = payload.get("transcript_path")
+    required["transcript_path"] = {
+        "present": "transcript_path" in payload,
+        "type": field_types.get("transcript_path"),
+        "valid": isinstance(transcript, str) and bool(transcript),
+    }
+    turn = payload.get("turn_id")
+    required["turn_id"] = {
+        "present": "turn_id" in payload,
+        "type": field_types.get("turn_id"),
+        "valid": "turn_id" not in payload or (isinstance(turn, str) and bool(turn)),
+    }
+    return {
+        "payload_keys": sorted(field_types),
+        "field_types": field_types,
+        "required_fields": required,
+    }
+
+
+def empty_session_hook_shape() -> dict[str, object]:
+    return {
+        "payload_keys": [],
+        "field_types": {},
+        "required_fields": {
+            key: {"present": False, "type": None, "valid": False}
+            for key in (*REQUIRED_SESSION_HOOK_FIELDS, "transcript_path", "turn_id")
+        },
+    }
+
+
+def parse_session_stop_envelope(
+    raw: bytes, installation: Installation
+) -> SessionStopEnvelope:
+    if len(raw) > MAX_STDIN_BYTES:
+        raise ValueError("hook_input_too_large")
+    payload = json.loads(raw)
+    shape = summarize_session_hook_shape(payload)
+    if payload.get("hook_event_name") != "Stop":
+        raise ValueError("not_stop_event")
+    session_id = bounded_text(payload, "session_id", 512)
+    turn_id = bounded_text(payload, "turn_id", 512) if "turn_id" in payload else None
+    cwd = Path(bounded_text(payload, "cwd", 4_096)).expanduser().resolve(strict=True)
+    transcript_value = bounded_text(payload, "transcript_path", 4_096)
+    transcript_path = Path(transcript_value).expanduser()
+    if transcript_path.is_symlink():
+        raise ValueError("transcript_symlink")
+    transcript_path = transcript_path.resolve(strict=True)
+    if not is_within(transcript_path, installation.transcript_roots):
+        raise ValueError("transcript_outside_roots")
+    return SessionStopEnvelope(session_id, turn_id, transcript_path, cwd, shape)
+
+
 def stat_transcript(path: Path) -> dict[str, object]:
     flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(str(path), flags)
@@ -497,11 +581,98 @@ def capture_stop(installation: Installation, raw: bytes) -> Path:
     return destination
 
 
+SESSION_CAPTURE_ERROR_CODES = {
+    "hook_input_too_large",
+    "invalid_cwd",
+    "invalid_session_id",
+    "invalid_transcript_path",
+    "invalid_turn_id",
+    "not_stop_event",
+    "transcript_not_regular",
+    "transcript_outside_roots",
+    "transcript_owner",
+    "transcript_symlink",
+    "transcript_unavailable",
+}
+
+SESSION_STOP_PROMOTION_ERROR_CODES = {
+    "invalid_session_stop_observation",
+    "session_surface_boundary_mismatch",
+    "session_surface_boundary_missing",
+    "session_surface_observation_count",
+    "session_stop_observation_unavailable",
+}
+
+
+def safe_session_capture_error_code(error: BaseException) -> str:
+    code = str(error)
+    return (
+        code
+        if isinstance(error, ValueError) and code in SESSION_CAPTURE_ERROR_CODES
+        else "transcript_unavailable"
+    )
+
+
+def session_incoming_directory(installation: Installation) -> Path:
+    path = installation.data_root / "incoming-v2"
+    if path.is_symlink():
+        raise ValueError("data_child_symlink")
+    if not path.exists():
+        path.mkdir(mode=0o700)
+    return validate_private_child_directory(path)
+
+
+def capture_session_stop(installation: Installation, raw: bytes) -> Path:
+    observation: dict[str, object] = {
+        "schema_version": 2,
+        "received_at_ns": time.time_ns(),
+        "installation_nonce": installation.nonce,
+        "shape": empty_session_hook_shape(),
+    }
+    try:
+        if len(raw) > MAX_STDIN_BYTES:
+            raise ValueError("hook_input_too_large")
+        observation["shape"] = summarize_session_hook_shape(json.loads(raw))
+        envelope = parse_session_stop_envelope(raw, installation)
+        transcript_info = stat_transcript(envelope.transcript_path)
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        observation["capture_error_code"] = safe_session_capture_error_code(error)
+    else:
+        observation["event"] = {
+            "hook_event_name": "Stop",
+            "session_id": envelope.session_id,
+            "turn_id": envelope.turn_id,
+            "transcript_path": str(envelope.transcript_path),
+            "cwd": str(envelope.cwd),
+        }
+        observation["transcript_stat"] = transcript_info
+    destination = session_incoming_directory(installation) / (
+        f"{observation['received_at_ns']}-{os.getpid()}-{secrets.token_hex(4)}.json"
+    )
+    atomic_write_json(destination, observation)
+    return destination
+
+
 def cmd_probe_stop(args: argparse.Namespace) -> int:
     try:
         installation = load_installation(Path(args.installation))
         raw = read_bounded_stdin(sys.stdin.buffer)
         capture_stop(installation, raw)
+    except Exception:
+        pass
+    return 0
+
+
+def cmd_probe_v2_stop(args: argparse.Namespace) -> int:
+    try:
+        installation = load_installation(Path(args.installation))
+        try:
+            raw = read_bounded_stdin(sys.stdin.buffer)
+        except ValueError as error:
+            if str(error) != "hook_input_too_large":
+                raise
+            raw = b"\0" * (MAX_STDIN_BYTES + 1)
+        capture_session_stop(installation, raw)
     except Exception:
         pass
     return 0
@@ -537,6 +708,13 @@ def observation_paths(installation: Installation) -> list[Path]:
     return [
         validate_observation(path)
         for path in sorted((installation.data_root / "incoming").glob("*.json"))
+    ]
+
+
+def session_observation_paths(installation: Installation) -> list[Path]:
+    return [
+        validate_observation(path)
+        for path in sorted(session_incoming_directory(installation).glob("*.json"))
     ]
 
 
@@ -686,6 +864,46 @@ def surface_observations(
     return selected
 
 
+def mark_session_surface_boundary(
+    installation: Installation,
+    surface: str,
+) -> dict[str, object]:
+    surface = validate_surface(surface)
+    observations = session_observation_paths(installation)
+    boundary = observations[-1].name if observations else None
+    atomic_write_json(
+        installation.data_root / "reports" / f"{surface}-v2-session-boundary.json",
+        {"schema_version": 2, "surface": surface, "after": boundary},
+    )
+    return {"surface": surface, "marked": True}
+
+
+def session_surface_observations(
+    installation: Installation,
+    surface: str,
+) -> list[Path]:
+    surface = validate_surface(surface)
+    observations = session_observation_paths(installation)
+    marker = json.loads(
+        (
+            installation.data_root / "reports" / f"{surface}-v2-session-boundary.json"
+        ).read_text(encoding="utf-8")
+    )
+    if marker.get("schema_version") != 2 or marker.get("surface") != surface:
+        raise ValueError("session_surface_boundary_mismatch")
+    after = marker.get("after")
+    if after is None:
+        selected = observations
+    else:
+        names = [path.name for path in observations]
+        if after not in names:
+            raise ValueError("session_surface_boundary_missing")
+        selected = observations[names.index(after) + 1 :]
+    if len(selected) != 2:
+        raise ValueError("session_surface_observation_count")
+    return selected
+
+
 def aggregate_required_fields(
     observations: list[dict[str, object]],
 ) -> dict[str, object]:
@@ -700,6 +918,152 @@ def aggregate_required_fields(
             "valid": all(field.get("valid") is True for field in fields),
         }
     return result
+
+
+def aggregate_session_required_fields(
+    observations: list[dict[str, object]],
+) -> dict[str, object]:
+    names = ("hook_event_name", "session_id", "cwd", "transcript_path", "turn_id")
+    result: dict[str, object] = {}
+    for name in names:
+        fields = [item["shape"]["required_fields"][name] for item in observations]
+        types = {field.get("type") for field in fields}
+        result[name] = {
+            "present": all(field.get("present") is True for field in fields),
+            "type": next(iter(types)) if len(types) == 1 else "mixed",
+            "valid": all(field.get("valid") is True for field in fields),
+        }
+    return result
+
+
+def session_transcript_stat_report(
+    transcript_infos: list[object],
+) -> dict[str, object]:
+    present = all(isinstance(item, dict) for item in transcript_infos)
+    infos = [item for item in transcript_infos if isinstance(item, dict)]
+    return {
+        "present": present,
+        "regular": present and all(item.get("regular") is True for item in infos),
+        "owned_by_current_user": present
+        and all(item.get("owned_by_current_user") is True for item in infos),
+        "size_positive": present
+        and all(isinstance(item.get("size"), int) and item["size"] > 0 for item in infos),
+        "has_mtime_ns": present
+        and all(isinstance(item.get("mtime_ns"), int) for item in infos),
+        "has_device": present
+        and all(isinstance(item.get("device"), int) for item in infos),
+        "has_inode": present
+        and all(isinstance(item.get("inode"), int) for item in infos),
+    }
+
+
+def failed_session_stop_promotion(
+    surface: str,
+    output: Path,
+    code: str,
+) -> dict[str, object]:
+    report = {
+        "schema_version": 2,
+        "surface": surface,
+        "observation_count": 0,
+        "capture_supported": False,
+        "distinct_sessions": False,
+        "turn_id_optional": True,
+        "hook_event_name": "Stop",
+        "payload_shapes_stable": False,
+        "payload_keys": [],
+        "field_types": {},
+        "required_fields": {
+            name: {"present": False, "type": None, "valid": False}
+            for name in ("hook_event_name", "session_id", "cwd", "transcript_path", "turn_id")
+        },
+        "capture_error_codes": [code],
+        "transcript_stat": session_transcript_stat_report([]),
+        "shared_nonce_match": False,
+    }
+    atomic_write_json(output.resolve(), report)
+    return report
+
+
+def promote_session_stop_v2(
+    installation: Installation,
+    surface: str,
+    output: Path,
+) -> dict[str, object]:
+    surface = validate_surface(surface)
+    try:
+        paths = session_surface_observations(installation, surface)
+        observations = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+        if not all(isinstance(item, dict) and item.get("schema_version") == 2 for item in observations):
+            raise ValueError("invalid_session_stop_observation")
+        nonce_matches = all(
+            item.get("installation_nonce") == installation.nonce for item in observations
+        )
+        shapes = [item["shape"] for item in observations]
+        transcript_infos = [item.get("transcript_stat") for item in observations]
+        required_fields = aggregate_session_required_fields(observations)
+        capture_error_codes = sorted(
+            {
+                str(item["capture_error_code"])
+                for item in observations
+                if "capture_error_code" in item
+            }
+        )
+        session_ids = {
+            item["event"]["session_id"]
+            for item in observations
+            if isinstance(item.get("event"), dict)
+            and isinstance(item["event"].get("session_id"), str)
+        }
+        payload_shapes_stable = shapes[0] == shapes[1]
+        distinct_sessions = len(session_ids) == 2
+        transcript_stat = session_transcript_stat_report(transcript_infos)
+        capture_supported = (
+            nonce_matches
+            and payload_shapes_stable
+            and distinct_sessions
+            and not capture_error_codes
+            and all(field["valid"] is True for field in required_fields.values())
+            and all(transcript_stat.values())
+        )
+        report = {
+            "schema_version": 2,
+            "surface": surface,
+            "observation_count": len(observations),
+            "capture_supported": capture_supported,
+            "distinct_sessions": distinct_sessions,
+            "turn_id_optional": True,
+            "hook_event_name": "Stop",
+            "payload_shapes_stable": payload_shapes_stable,
+            "payload_keys": sorted(
+                set(shapes[0]["payload_keys"]) | set(shapes[1]["payload_keys"])
+            ),
+            "field_types": (
+                shapes[0]["field_types"]
+                if shapes[0]["field_types"] == shapes[1]["field_types"]
+                else {}
+            ),
+            "required_fields": required_fields,
+            "capture_error_codes": capture_error_codes,
+            "transcript_stat": transcript_stat,
+            "shared_nonce_match": nonce_matches,
+        }
+        atomic_write_json(
+            installation.data_root / "reports" / f"{surface}-v2-session-observation.json",
+            {"schema_version": 2, "surface": surface, "observations": [path.name for path in paths]},
+        )
+        atomic_write_json(output.resolve(), report)
+        return report
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        code = str(error)
+        return failed_session_stop_promotion(
+            surface,
+            output,
+            code
+            if isinstance(error, ValueError)
+            and code in SESSION_STOP_PROMOTION_ERROR_CODES
+            else "session_stop_observation_unavailable",
+        )
 
 
 def failed_stop_promotion(
@@ -1826,6 +2190,19 @@ def cmd_probe_promote_stop(args: argparse.Namespace) -> int:
     return 0 if report["capture_supported"] else 2
 
 
+def cmd_probe_v2_mark_surface(args: argparse.Namespace) -> int:
+    installation = load_installation(Path(args.installation))
+    write_json_stdout(mark_session_surface_boundary(installation, args.surface))
+    return 0
+
+
+def cmd_probe_v2_promote_stop(args: argparse.Namespace) -> int:
+    installation = load_installation(Path(args.installation))
+    report = promote_session_stop_v2(installation, args.surface, Path(args.output))
+    write_json_stdout(report)
+    return 0 if report["capture_supported"] else 2
+
+
 def cmd_probe_promote_transcript(args: argparse.Namespace) -> int:
     installation = load_installation(Path(args.installation))
     report = promote_transcript_structure(
@@ -1844,6 +2221,10 @@ def build_parser() -> argparse.ArgumentParser:
     probe_stop = subparsers.add_parser("probe-stop")
     probe_stop.add_argument("--installation", required=True)
     probe_stop.set_defaults(handler=cmd_probe_stop)
+
+    probe_v2_stop = subparsers.add_parser("probe-v2-stop")
+    probe_v2_stop.add_argument("--installation", required=True)
+    probe_v2_stop.set_defaults(handler=cmd_probe_v2_stop)
 
     probe_init = subparsers.add_parser("probe-init")
     probe_init.add_argument("--data-root", required=True)
@@ -1879,11 +2260,22 @@ def build_parser() -> argparse.ArgumentParser:
     mark_surface.add_argument("--surface", choices=("cli", "desktop"), required=True)
     mark_surface.set_defaults(handler=cmd_probe_mark_surface)
 
+    mark_v2_surface = subparsers.add_parser("probe-v2-mark-surface")
+    mark_v2_surface.add_argument("--installation", required=True)
+    mark_v2_surface.add_argument("--surface", choices=("cli", "desktop"), required=True)
+    mark_v2_surface.set_defaults(handler=cmd_probe_v2_mark_surface)
+
     promote_stop = subparsers.add_parser("probe-promote-stop")
     promote_stop.add_argument("--installation", required=True)
     promote_stop.add_argument("--surface", choices=("cli", "desktop"), required=True)
     promote_stop.add_argument("--output", required=True)
     promote_stop.set_defaults(handler=cmd_probe_promote_stop)
+
+    promote_v2_stop = subparsers.add_parser("probe-v2-promote-stop")
+    promote_v2_stop.add_argument("--installation", required=True)
+    promote_v2_stop.add_argument("--surface", choices=("cli", "desktop"), required=True)
+    promote_v2_stop.add_argument("--output", required=True)
+    promote_v2_stop.set_defaults(handler=cmd_probe_v2_promote_stop)
 
     promote_transcript = subparsers.add_parser("probe-promote-transcript")
     promote_transcript.add_argument("--installation", required=True)
