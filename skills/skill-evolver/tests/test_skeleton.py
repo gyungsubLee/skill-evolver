@@ -312,6 +312,51 @@ class SkeletonTests(unittest.TestCase):
             )
             self.assertFalse(raw.exists())
 
+    def test_scrub_pins_the_root_descriptor_across_root_replacement(self) -> None:
+        runtime = load_runtime()
+        for replacement in ("directory", "symlink"):
+            with self.subTest(replacement=replacement), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                sessions = base / "sessions"
+                sessions.mkdir(mode=0o700)
+                installation_path = runtime.initialize_probe(
+                    base / "probe", (sessions,), Path("/usr/bin/python3")
+                )
+                installation = runtime.load_installation(installation_path)
+                root = installation.data_root
+                original_raw = root / "incoming" / "raw.json"
+                runtime.atomic_write_json(original_raw, {"original": True})
+                replacement_root = base / "replacement"
+                replacement_root.mkdir(mode=0o700)
+                for child in ("incoming", "incoming-v2", "reports"):
+                    (replacement_root / child).mkdir(mode=0o700)
+                sentinel = replacement_root / "incoming" / "raw.json"
+                runtime.atomic_write_json(sentinel, {"replacement": True})
+                moved = base / "probe-moved"
+                original_marker = runtime.write_v2_scrub_marker
+
+                def replace_after_lock(descriptor: int) -> None:
+                    root.rename(moved)
+                    if replacement == "directory":
+                        root.mkdir(mode=0o700)
+                        for child in ("incoming", "incoming-v2", "reports"):
+                            (root / child).mkdir(mode=0o700)
+                        runtime.atomic_write_json(root / "incoming" / "raw.json", {"sentinel": True})
+                        sentinel_path = root / "incoming" / "raw.json"
+                    else:
+                        root.symlink_to(replacement_root, target_is_directory=True)
+                        sentinel_path = sentinel
+                    original_marker(descriptor)
+                    self.assertTrue(sentinel_path.exists())
+
+                with mock.patch.object(runtime, "write_v2_scrub_marker", side_effect=replace_after_lock):
+                    self.assertEqual(
+                        runtime.scrub_probe_raw(installation, "DELETE-FEASIBILITY-RAW"),
+                        {"observations_deleted": 1, "ephemeral_reports_deleted": 0},
+                    )
+                self.assertFalse((moved / "incoming" / "raw.json").exists())
+                self.assertTrue((root / "incoming" / "raw.json").exists())
+
     def test_probe_stop_is_silent_and_fail_open(self) -> None:
         malformed = run_isolated("probe-stop", "--installation", "/missing/file", stdin=b"{")
         self.assertEqual(malformed.returncode, 0)

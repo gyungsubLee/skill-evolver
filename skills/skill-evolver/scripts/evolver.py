@@ -240,15 +240,29 @@ def v2_state_lock(
     *,
     exclusive: bool,
     allow_scrubbed: bool = False,
-) -> Iterator[None]:
-    root = validate_private_directory(installation.data_root)
-    path = root / V2_STATE_LOCK
-    descriptor = os.open(
-        str(path),
-        (os.O_RDWR if exclusive else os.O_RDONLY) | getattr(os, "O_NOFOLLOW", 0),
+) -> Iterator[int]:
+    root_descriptor = os.open(
+        str(installation.data_root),
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
     )
+    try:
+        descriptor = os.open(
+            V2_STATE_LOCK,
+            (os.O_RDWR if exclusive else os.O_RDONLY) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=root_descriptor,
+        )
+    except BaseException:
+        os.close(root_descriptor)
+        raise
     locked = False
     try:
+        root_info = ORIGINAL_FSTAT(root_descriptor)
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or root_info.st_uid != os.getuid()
+            or stat.S_IMODE(root_info.st_mode) != 0o700
+        ):
+            raise ValueError("data_root_permissions")
         info = ORIGINAL_FSTAT(descriptor)
         if (
             not stat.S_ISREG(info.st_mode)
@@ -258,16 +272,22 @@ def v2_state_lock(
             raise ValueError("v2_lifecycle_lock_unavailable")
         fcntl.flock(descriptor, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
         locked = True
-        marker = root / V2_SCRUB_MARKER
-        if not allow_scrubbed and (marker.exists() or marker.is_symlink()):
+        try:
+            marker = os.stat(
+                V2_SCRUB_MARKER, dir_fd=root_descriptor, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            marker = None
+        if not allow_scrubbed and marker is not None:
             raise ValueError("v2_probe_scrubbed")
-        yield
+        yield root_descriptor
     finally:
         try:
             if locked:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
             os.close(descriptor)
+            os.close(root_descriptor)
 
 
 def atomic_write_json(path: Path, payload: dict[str, object], mode: int = 0o600) -> None:
@@ -3858,10 +3878,11 @@ def validate_scrub_target(path: Path, expected_parent: Path) -> Path:
     return path
 
 
-def open_private_directory_descriptor(path: Path) -> int:
+def open_private_directory_descriptor(root_descriptor: int, name: str) -> int:
     descriptor = os.open(
-        str(path),
+        name,
         os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=root_descriptor,
     )
     try:
         info = os.fstat(descriptor)
@@ -3875,6 +3896,29 @@ def open_private_directory_descriptor(path: Path) -> int:
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def write_v2_scrub_marker(root_descriptor: int) -> None:
+    descriptor = os.open(
+        V2_SCRUB_MARKER,
+        os.O_RDWR | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=root_descriptor,
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        info = ORIGINAL_FSTAT(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise ValueError("v2_lifecycle_lock_unavailable")
+        os.write(descriptor, b'{"schema_version":2,"scrubbed":true}\n')
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.fsync(root_descriptor)
 
 
 def scrub_directory_targets(
@@ -3920,16 +3964,13 @@ def scrub_probe_raw(
 ) -> dict[str, int]:
     if confirmation != SCRUB_CONFIRMATION:
         raise ValueError("confirmation_mismatch")
-    with v2_state_lock(installation, exclusive=True, allow_scrubbed=True):
-        atomic_write_json(
-            installation.data_root / V2_SCRUB_MARKER,
-            {"schema_version": 2, "scrubbed": True},
-        )
+    with v2_state_lock(installation, exclusive=True, allow_scrubbed=True) as root_descriptor:
+        write_v2_scrub_marker(root_descriptor)
         descriptors: list[int] = []
         try:
             for child in ("incoming", "incoming-v2", "reports"):
                 descriptors.append(
-                    open_private_directory_descriptor(installation.data_root / child)
+                    open_private_directory_descriptor(root_descriptor, child)
                 )
             observations = (
                 scrub_directory_targets(descriptors[0], ("*.json", ".*.json.*"))
