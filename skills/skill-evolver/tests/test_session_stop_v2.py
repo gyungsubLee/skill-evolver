@@ -120,6 +120,30 @@ class SessionStopV2Tests(unittest.TestCase):
             self.assertEqual(result.stdout, b"")
             self.assertEqual(result.stderr, b"")
 
+    def test_v2_stop_command_persists_deeply_nested_json_as_sanitized_error(self) -> None:
+        raw = (
+            '{"deep-input-secret":' + "[" * 1_100 + "0" + "]" * 1_100 + "}"
+        ).encode()
+        before = {path.name for path in self.runtime.session_observation_paths(self.installation)}
+        result = run_isolated(
+            "probe-v2-stop",
+            "--installation",
+            str(self.installation.data_root / "installation.json"),
+            stdin=raw,
+        )
+        observed = [
+            path for path in self.runtime.session_observation_paths(self.installation)
+            if path.name not in before
+        ]
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(len(observed), 1)
+        stored = json.loads(observed[0].read_text(encoding="utf-8"))
+        self.assertEqual(stored["capture_error_code"], "transcript_unavailable")
+        self.assertIn(stored["capture_error_code"], self.runtime.SESSION_CAPTURE_ERROR_CODES)
+        self.assertNotIn("deep-input-secret", json.dumps(stored))
+
     def test_v2_stop_command_is_silent_and_sanitizes_unsafe_transcripts(self) -> None:
         fifo = self.sessions / "blocked.fifo"
         os.mkfifo(fifo, 0o600)

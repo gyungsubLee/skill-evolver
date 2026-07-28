@@ -688,7 +688,7 @@ def capture_session_stop(installation: Installation, raw: bytes) -> Path:
         observation["shape"] = summarize_session_hook_shape(json.loads(raw))
         envelope = parse_session_stop_envelope(raw, installation)
         transcript_info = stat_transcript(envelope.transcript_path)
-    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+    except Exception as error:
         observation["capture_error_code"] = safe_session_capture_error_code(error)
     else:
         observation["event"] = {
