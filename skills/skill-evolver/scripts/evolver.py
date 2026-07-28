@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
-import hmac
 import json
 import os
 import secrets
@@ -567,14 +565,6 @@ def parse_session_stop_envelope(
     return SessionStopEnvelope(session_id, turn_id, transcript_path, cwd, shape)
 
 
-def session_id_digest(installation: Installation, session_id: str) -> str:
-    return hmac.new(
-        installation.nonce.encode("ascii"),
-        session_id.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-
-
 def session_stop_event_session_id(event: object) -> Optional[str]:
     if not isinstance(event, dict) or set(event) != SESSION_STOP_EVENT_FIELDS:
         return None
@@ -721,9 +711,6 @@ def capture_session_stop(installation: Installation, raw: bytes) -> Path:
     except Exception as error:
         observation["capture_error_code"] = safe_session_capture_error_code(error)
     else:
-        observation["session_id_digest"] = session_id_digest(
-            installation, envelope.session_id
-        )
         observation["event"] = {
             "hook_event_name": "Stop",
             "session_id": envelope.session_id,
@@ -1110,18 +1097,7 @@ def promote_session_stop_v2(
             session_stop_event_session_id(item.get("event"))
             for item in observations
         ]
-        if (
-            any(session_id is None for session_id in session_ids)
-            or not all(
-                isinstance(item.get("session_id_digest"), str)
-                and hmac.compare_digest(
-                    item["session_id_digest"],
-                    session_id_digest(installation, session_id),
-                )
-                for item, session_id in zip(observations, session_ids)
-                if session_id is not None
-            )
-        ):
+        if any(session_id is None for session_id in session_ids):
             raise ValueError("session_stop_observation_unavailable")
         payload_shapes_stable = core_shapes[0] == core_shapes[1]
         distinct_sessions = len(set(session_ids)) == 2

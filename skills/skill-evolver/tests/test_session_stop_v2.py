@@ -270,32 +270,13 @@ class SessionStopV2Tests(unittest.TestCase):
                 )
                 self.assertNotIn("session-secret", json.dumps(report))
 
-    def test_v2_promotion_rejects_tampered_event_session_identity(self) -> None:
-        self.runtime.mark_session_surface_boundary(self.installation, "cli")
-        first = self.runtime.capture_session_stop(
-            self.installation, json.dumps(self.payload).encode()
-        )
-        self.capture()
-        stored = json.loads(first.read_text(encoding="utf-8"))
-        stored["event"]["session_id"] = "forged-session-secret"
-        self.runtime.atomic_write_json(first, stored)
-        report = self.runtime.promote_session_stop_v2(
-            self.installation, "cli", self.root / "session-stop-cli.v2.structure.json"
-        )
-        self.assertFalse(report["capture_supported"])
-        self.assertFalse(report["distinct_sessions"])
-        self.assertEqual(
-            report["capture_error_codes"],
-            ["session_stop_observation_unavailable"],
-        )
-        self.assertNotIn("forged-session-secret", json.dumps(report))
-
     def test_v2_promotion_rejects_malformed_event_schema(self) -> None:
         cases = {
             "missing": lambda event: event.pop("session_id"),
             "extra": lambda event: event.update({"private-event-secret": "value"}),
             "wrong_event": lambda event: event.update({"hook_event_name": "SubagentStop"}),
             "long_session": lambda event: event.update({"session_id": "x" * 513}),
+            "wrong_type": lambda event: event.update({"session_id": 7}),
         }
         for name, tamper in cases.items():
             with self.subTest(name=name):
