@@ -80,6 +80,21 @@ GATE_FIXTURE_NAMES = (
     "access-cli.structure.json",
     "access-desktop.structure.json",
 )
+GATE_V2_FIXTURE_NAMES = (
+    "session-stop-cli.v2.structure.json",
+    "session-stop-desktop.v2.structure.json",
+    "session-transcript-cli.v2.structure.json",
+    "session-transcript-desktop.v2.structure.json",
+    "access-cli.v2.structure.json",
+    "access-desktop.v2.structure.json",
+)
+V2_SESSION_STOP_KEYS = frozenset(
+    {"cwd", "hook_event_name", "session_id", "transcript_path"}
+)
+V2_TRANSCRIPT_BINDING_MODES = frozenset(
+    {"same_file_identity", "same_inode_lookup", "embedded_session_id"}
+)
+V2_PREDECESSOR_PATH = "docs/feasibility-report.json"
 
 
 @dataclass(frozen=True)
@@ -2687,6 +2702,204 @@ def access_fixture_passes(
     )
 
 
+def session_stop_fixture_v2_passes(
+    fixture: dict[str, object],
+    expected_surface: str,
+) -> bool:
+    if type(fixture) is not dict or type(expected_surface) is not str:
+        return False
+    required = fixture.get("required_fields")
+    field_types = fixture.get("field_types")
+    payload_keys = fixture.get("payload_keys")
+    transcript_stat = fixture.get("transcript_stat")
+    stat_names = {
+        "present", "regular", "owned_by_current_user", "size_positive",
+        "has_mtime_ns", "has_device", "has_inode",
+    }
+    return (
+        set(fixture)
+        == {
+            "schema_version", "surface", "observation_count", "capture_supported",
+            "distinct_sessions", "turn_id_optional", "hook_event_name",
+            "payload_shapes_stable", "payload_keys", "field_types",
+            "required_fields", "capture_error_codes", "transcript_stat",
+            "shared_nonce_match",
+        }
+        and type(fixture.get("schema_version")) is int
+        and fixture["schema_version"] == 2
+        and type(fixture.get("surface")) is str
+        and fixture["surface"] == expected_surface
+        and type(fixture.get("observation_count")) is int
+        and fixture["observation_count"] == 2
+        and fixture.get("capture_supported") is True
+        and fixture.get("distinct_sessions") is True
+        and fixture.get("turn_id_optional") is True
+        and fixture.get("hook_event_name") == "Stop"
+        and fixture.get("payload_shapes_stable") is True
+        and type(payload_keys) is list
+        and all(type(value) is str for value in payload_keys)
+        and set(payload_keys) == V2_SESSION_STOP_KEYS
+        and len(payload_keys) == len(V2_SESSION_STOP_KEYS)
+        and type(field_types) is dict
+        and set(field_types) == V2_SESSION_STOP_KEYS
+        and all(type(value) is str and value == "str" for value in field_types.values())
+        and type(required) is dict
+        and set(required) == V2_SESSION_STOP_KEYS
+        and all(
+            type(value) is dict
+            and set(value) == {"present", "type", "valid"}
+            and value.get("present") is True
+            and value.get("type") == "str"
+            and value.get("valid") is True
+            for value in required.values()
+        )
+        and type(fixture.get("capture_error_codes")) is list
+        and fixture["capture_error_codes"] == []
+        and type(transcript_stat) is dict
+        and set(transcript_stat) == stat_names
+        and all(transcript_stat.get(name) is True for name in stat_names)
+        and fixture.get("shared_nonce_match") is True
+    )
+
+
+def access_fixture_v2_passes(
+    fixture: dict[str, object],
+    expected_surface: str,
+) -> bool:
+    if type(fixture) is not dict or type(expected_surface) is not str:
+        return False
+    return (
+        set(fixture)
+        == {
+            "schema_version", "surface", "hook_global_read", "hook_global_write",
+            "skill_default_read", "skill_default_write",
+            "skill_default_write_denied", "skill_explicit_read",
+            "skill_explicit_write", "error_codes",
+        }
+        and type(fixture.get("schema_version")) is int
+        and fixture["schema_version"] == 2
+        and type(fixture.get("surface")) is str
+        and fixture["surface"] == expected_surface
+        and fixture.get("hook_global_read") is True
+        and fixture.get("hook_global_write") is True
+        and fixture.get("skill_default_read") is True
+        and fixture.get("skill_default_write") is False
+        and fixture.get("skill_default_write_denied") is True
+        and fixture.get("skill_explicit_read") is True
+        and fixture.get("skill_explicit_write") is True
+        and type(fixture.get("error_codes")) is list
+        and fixture["error_codes"] == []
+    )
+
+
+def session_transcript_fixture_v2_passes(
+    fixture: dict[str, object],
+    expected_surface: str,
+) -> bool:
+    if type(fixture) is not dict or type(expected_surface) is not str:
+        return False
+    binding_modes = fixture.get("binding_modes")
+    session_paths = fixture.get("session_id_pointer_paths")
+    provenance_paths = fixture.get("provenance_pointer_paths")
+    provenance_values = fixture.get("provenance_values")
+    return (
+        set(fixture)
+        == {
+            "schema_version", "surface", "observation_count", "supported",
+            "distinct_sessions", "layouts_stable", "format", "suffix_ignored",
+            "read_past_boundary", "binding_modes", "epoch_reset",
+            "session_id_pointer_paths", "provenance_pointer_paths",
+            "provenance_values", "error_codes",
+        }
+        and type(fixture.get("schema_version")) is int
+        and fixture["schema_version"] == 2
+        and type(fixture.get("surface")) is str
+        and fixture["surface"] == expected_surface
+        and type(fixture.get("observation_count")) is int
+        and fixture["observation_count"] == 2
+        and fixture.get("supported") is True
+        and fixture.get("distinct_sessions") is True
+        and fixture.get("layouts_stable") is True
+        and fixture.get("format") == "jsonl"
+        and fixture.get("suffix_ignored") is True
+        and fixture.get("read_past_boundary") is False
+        and type(binding_modes) is list
+        and bool(binding_modes)
+        and all(type(value) is str and value in V2_TRANSCRIPT_BINDING_MODES for value in binding_modes)
+        and len(binding_modes) == len(set(binding_modes))
+        and type(fixture.get("epoch_reset")) is bool
+        and type(session_paths) is list
+        and bool(session_paths)
+        and all(is_safe_pointer_path(value) for value in session_paths)
+        and len(session_paths) == len(set(session_paths))
+        and type(provenance_paths) is list
+        and bool(provenance_paths)
+        and all(is_safe_pointer_path(value) for value in provenance_paths)
+        and len(provenance_paths) == len(set(provenance_paths))
+        and type(provenance_values) is list
+        and all(type(value) is str and value in PROVENANCE_VALUES for value in provenance_values)
+        and {"user", "assistant"}.issubset(set(provenance_values))
+        and type(fixture.get("error_codes")) is list
+        and fixture["error_codes"] == []
+    )
+
+
+def evaluate_feasibility_gate_v2(
+    cli_stop: dict[str, object],
+    desktop_stop: dict[str, object],
+    cli_transcript: dict[str, object],
+    desktop_transcript: dict[str, object],
+    cli_access: dict[str, object],
+    desktop_access: dict[str, object],
+    predecessor_sha256: str,
+) -> dict[str, object]:
+    checks = {
+        "cli_session_stop_contract": session_stop_fixture_v2_passes(cli_stop, "cli"),
+        "desktop_session_stop_contract": session_stop_fixture_v2_passes(desktop_stop, "desktop"),
+        "cli_asymmetric_access": access_fixture_v2_passes(cli_access, "cli"),
+        "desktop_asymmetric_access": access_fixture_v2_passes(desktop_access, "desktop"),
+        "cli_session_transcript_supported": session_transcript_fixture_v2_passes(cli_transcript, "cli"),
+        "desktop_session_transcript_supported": session_transcript_fixture_v2_passes(desktop_transcript, "desktop"),
+    }
+
+    def safe_list(value: object, validator) -> list[str]:
+        return [item for item in value if validator(item)] if type(value) is list else []
+
+    def surface_summary(stop: dict[str, object], transcript: dict[str, object]) -> dict[str, object]:
+        return {
+            "stop_keys": safe_list(stop.get("payload_keys"), is_safe_payload_key),
+            "session_id_pointer_paths": safe_list(
+                transcript.get("session_id_pointer_paths"), is_safe_pointer_path
+            ),
+            "provenance_pointer_paths": safe_list(
+                transcript.get("provenance_pointer_paths"), is_safe_pointer_path
+            ),
+            "binding_modes": safe_list(
+                transcript.get("binding_modes"),
+                lambda value: type(value) is str and value in V2_TRANSCRIPT_BINDING_MODES,
+            ),
+        }
+
+    return {
+        "schema_version": 2,
+        "decision": "PASS" if all(value is True for value in checks.values()) else "FAIL",
+        "checks": checks,
+        "predecessor": {
+            "path": V2_PREDECESSOR_PATH,
+            "sha256": predecessor_sha256,
+        },
+        "surfaces": {
+            "cli": surface_summary(cli_stop, cli_transcript),
+            "desktop": surface_summary(desktop_stop, desktop_transcript),
+        },
+        "next_action": (
+            "write_session_runtime_queue_plan"
+            if all(value is True for value in checks.values())
+            else "amend_design_for_session_level_queue"
+        ),
+    }
+
+
 def structural_differences(
     cli_stop: dict[str, object],
     desktop_stop: dict[str, object],
@@ -2927,6 +3140,157 @@ def paths_alias(left: Path, right: Path) -> bool:
         return False
 
 
+def _stable_private_file_bytes(path: Path, *, fixture: bool) -> bytes:
+    try:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise ValueError("gate_inputs_invalid")
+        mode = stat.S_IMODE(info.st_mode)
+        if info.st_uid != os.getuid() or (mode != 0o600 if fixture else mode & 0o022):
+            raise ValueError("gate_inputs_invalid")
+        if info.st_size < 0 or info.st_size > MAX_GATE_FIXTURE_BYTES:
+            raise ValueError("gate_inputs_invalid")
+        descriptor = os.open(
+            str(path), os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != info.st_uid
+                or stat.S_IMODE(before.st_mode) != mode
+                or before.st_dev != info.st_dev
+                or before.st_ino != info.st_ino
+                or before.st_size != info.st_size
+                or before.st_mtime_ns != info.st_mtime_ns
+            ):
+                raise ValueError("gate_inputs_invalid")
+            raw = read_exact_prefix(descriptor, info.st_size)
+            after = os.fstat(descriptor)
+            if (
+                after.st_dev != before.st_dev
+                or after.st_ino != before.st_ino
+                or after.st_size != before.st_size
+                or after.st_mtime_ns != before.st_mtime_ns
+                or after.st_mode != before.st_mode
+                or after.st_uid != before.st_uid
+            ):
+                raise ValueError("gate_inputs_invalid")
+            return raw
+        finally:
+            os.close(descriptor)
+    except (OSError, ValueError):
+        raise ValueError("gate_inputs_invalid") from None
+
+
+def _v2_fixture_inventory(fixture_root: Path) -> tuple[Path, dict[str, dict[str, object]]]:
+    requested = Path(os.path.abspath(str(fixture_root.expanduser())))
+    try:
+        reject_symlink_components(requested, "gate_inputs_invalid")
+        root = requested.resolve(strict=True)
+        root_info = root.stat()
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or root_info.st_uid != os.getuid()
+            or stat.S_IMODE(root_info.st_mode) & 0o022
+        ):
+            raise ValueError("gate_inputs_invalid")
+        names = {path.name for path in root.iterdir()}
+        if names != set(GATE_V2_FIXTURE_NAMES):
+            raise ValueError("gate_inputs_invalid")
+        paths = [root / name for name in GATE_V2_FIXTURE_NAMES]
+        identities = {(path.stat().st_dev, path.stat().st_ino) for path in paths}
+        if len(identities) != len(paths):
+            raise ValueError("gate_inputs_invalid")
+        fixtures: dict[str, dict[str, object]] = {}
+        for path in paths:
+            value = json.loads(_stable_private_file_bytes(path, fixture=True).decode("utf-8"))
+            if type(value) is not dict:
+                raise ValueError("gate_inputs_invalid")
+            expected_surface = "desktop" if "desktop" in path.name else "cli"
+            if value.get("surface") != expected_surface:
+                raise ValueError("gate_inputs_invalid")
+            fixtures[path.name] = value
+        return root, fixtures
+    except (OSError, RecursionError, TypeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        raise ValueError("gate_inputs_invalid") from None
+
+
+def _v2_predecessor_digest(predecessor_json: Path) -> str:
+    requested = Path(os.path.abspath(str(predecessor_json.expanduser())))
+    try:
+        reject_symlink_components(requested, "gate_inputs_invalid")
+        if requested.name != "feasibility-report.json" or requested.parent.name != "docs":
+            raise ValueError("gate_inputs_invalid")
+        raw = _stable_private_file_bytes(requested, fixture=False)
+        value = json.loads(raw.decode("utf-8"))
+        if type(value) is not dict:
+            raise ValueError("gate_inputs_invalid")
+        return hashlib.sha256(raw).hexdigest()
+    except (RecursionError, TypeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        raise ValueError("gate_inputs_invalid") from None
+
+
+def render_gate_markdown_v2(report: dict[str, object]) -> str:
+    checks = report.get("checks")
+    lines = [
+        "# Skill Evolver Session Feasibility Report",
+        "",
+        f"Decision: **{report.get('decision', 'FAIL')}**",
+        "",
+        "## Checks",
+        "",
+    ]
+    if type(checks) is dict:
+        for name, passed in checks.items():
+            if type(name) is str and type(passed) is bool:
+                lines.append(f"- [{'x' if passed else ' '}] `{name}`")
+    lines.extend(["", "## Predecessor", ""])
+    predecessor = report.get("predecessor")
+    if type(predecessor) is dict and type(predecessor.get("sha256")) is str:
+        lines.append(f"- `{V2_PREDECESSOR_PATH}` SHA-256: `{predecessor['sha256']}`")
+    lines.extend(["", "## Next action", "", "Use the recorded session contract only after a PASS.", ""])
+    return "\n".join(lines)
+
+
+def write_gate_report_v2(
+    fixture_root: Path,
+    predecessor_json: Path,
+    output_json: Path,
+    output_markdown: Path,
+) -> dict[str, object]:
+    json_path = resolve_report_output(output_json)
+    markdown_path = resolve_report_output(output_markdown)
+    if paths_alias(json_path, markdown_path):
+        raise ValueError("gate_inputs_invalid")
+    root, fixtures = _v2_fixture_inventory(fixture_root)
+    predecessor = Path(os.path.abspath(str(predecessor_json.expanduser())))
+    fixture_paths = [root / name for name in GATE_V2_FIXTURE_NAMES]
+    if any(
+        paths_alias(output, protected)
+        for output in (json_path, markdown_path)
+        for protected in [*fixture_paths, predecessor]
+    ):
+        raise ValueError("gate_inputs_invalid")
+    digest = _v2_predecessor_digest(predecessor)
+    report = evaluate_feasibility_gate_v2(
+        fixtures["session-stop-cli.v2.structure.json"],
+        fixtures["session-stop-desktop.v2.structure.json"],
+        fixtures["session-transcript-cli.v2.structure.json"],
+        fixtures["session-transcript-desktop.v2.structure.json"],
+        fixtures["access-cli.v2.structure.json"],
+        fixtures["access-desktop.v2.structure.json"],
+        digest,
+    )
+    atomic_write_json(json_path, report)
+    try:
+        atomic_write_text(markdown_path, render_gate_markdown_v2(report))
+    except BaseException:
+        json_path.unlink(missing_ok=True)
+        raise
+    return report
+
+
 def write_gate_report(
     fixture_root: Path,
     output_json: Path,
@@ -3032,6 +3396,29 @@ def cmd_probe_gate(args: argparse.Namespace) -> int:
     )
     write_json_stdout(report)
     return 0 if report["decision"] == "PASS" else 2
+
+
+def cmd_probe_v2_gate(args: argparse.Namespace) -> int:
+    try:
+        report = write_gate_report_v2(
+            Path(args.fixture_root),
+            Path(args.predecessor_json),
+            Path(args.output_json),
+            Path(args.output_markdown),
+        )
+        write_json_stdout(report)
+        return 0 if report["decision"] == "PASS" else 2
+    except Exception:
+        write_json_stdout(
+            {
+                "schema_version": 2,
+                "decision": "FAIL",
+                "checks": {"gate_inputs_valid": False},
+                "error_codes": ["gate_inputs_invalid"],
+                "predecessor": {"path": V2_PREDECESSOR_PATH, "sha256": None},
+            }
+        )
+        return 2
 
 
 def validate_scrub_target(path: Path, expected_parent: Path) -> Path:
@@ -3363,6 +3750,13 @@ def build_parser() -> argparse.ArgumentParser:
     probe_gate.add_argument("--output-json", required=True)
     probe_gate.add_argument("--output-markdown", required=True)
     probe_gate.set_defaults(handler=cmd_probe_gate)
+
+    probe_v2_gate = subparsers.add_parser("probe-v2-gate")
+    probe_v2_gate.add_argument("--fixture-root", required=True)
+    probe_v2_gate.add_argument("--predecessor-json", required=True)
+    probe_v2_gate.add_argument("--output-json", required=True)
+    probe_v2_gate.add_argument("--output-markdown", required=True)
+    probe_v2_gate.set_defaults(handler=cmd_probe_v2_gate)
 
     probe_scrub = subparsers.add_parser("probe-scrub")
     probe_scrub.add_argument("--installation", required=True)
