@@ -2,7 +2,7 @@
   "description": "Capture bounded Stop metadata for the Skill Evolver feasibility spike.",
   "hooks": { "Stop": [{ "hooks": [{
     "type": "command",
-    "command": "/usr/bin/python3 -I \"$PLUGIN_ROOT/skills/skill-evolver/scripts/evolver.py\" probe-stop --installation \"/Users/igyeongseob/.codex/skill-evolver-feasibility/installation.json\"",
+    "command": "/usr/bin/python3 -I \"$PLUGIN_ROOT/skills/skill-evolver/scripts/evolver.py\" probe-v2-stop --installation \"/Users/igyeongseob/.codex/skill-evolver-feasibility-v2/installation.json\"",
     "timeout": 2
   }] }] }
 }

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Iterator, Optional, Sequence, TextIO
 
-VERSION = "skill-evolver feasibility 0.0.1"
+VERSION = "skill-evolver feasibility 0.0.2"
 MAX_STDIN_BYTES = 65_536
 REQUIRED_HOOK_FIELDS = {"hook_event_name": str, "session_id": str, "turn_id": str, "cwd": str}
 REQUIRED_SESSION_HOOK_FIELDS = {
@@ -3954,6 +3954,25 @@ def cmd_probe_promote_transcript(args: argparse.Namespace) -> int:
     return 0 if report["supported"] else 2
 
 
+def cmd_probe_v2_promote_transcript(args: argparse.Namespace) -> int:
+    try:
+        installation = load_installation(Path(args.installation))
+        report = promote_session_transcript_v2(
+            installation,
+            args.surface,
+            Path(args.output),
+        )
+        write_json_stdout(report)
+        return 0 if report["supported"] else 2
+    except Exception:
+        write_json_stdout(
+            failed_session_transcript_promotion(
+                args.surface, "session_transcript_unavailable"
+            )
+        )
+        return 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = SanitizedArgumentParser(prog="evolver.py")
     parser.add_argument("--version", action="version", version=VERSION)
@@ -4047,6 +4066,12 @@ def build_parser() -> argparse.ArgumentParser:
     promote_transcript.add_argument("--surface", choices=("cli", "desktop"), required=True)
     promote_transcript.add_argument("--output", required=True)
     promote_transcript.set_defaults(handler=cmd_probe_promote_transcript)
+
+    promote_v2_transcript = subparsers.add_parser("probe-v2-promote-transcript")
+    promote_v2_transcript.add_argument("--installation", required=True)
+    promote_v2_transcript.add_argument("--surface", choices=("cli", "desktop"), required=True)
+    promote_v2_transcript.add_argument("--output", required=True)
+    promote_v2_transcript.set_defaults(handler=cmd_probe_v2_promote_transcript)
 
     probe_gate = subparsers.add_parser("probe-gate")
     probe_gate.add_argument("--fixture-root", required=True)

@@ -1,4 +1,5 @@
 {
   "schema_version": 1,
-  "installation": "/Users/igyeongseob/.codex/skill-evolver-feasibility/installation.json"
+  "version": "0.0.2",
+  "installation": "/Users/igyeongseob/.codex/skill-evolver-feasibility-v2/installation.json"
 }
