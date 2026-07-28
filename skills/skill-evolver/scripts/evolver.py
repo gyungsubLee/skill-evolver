@@ -42,10 +42,12 @@ POINTER_SEGMENT_ALLOWLIST = {
     "internal_chat_message_metadata_passthrough",
     "payload",
     "role",
+    "session_id",
     "source_kind",
     "turn_id",
 }
 MAX_TRANSCRIPT_PROBE_BYTES = 2_097_152
+MAX_TRANSCRIPT_LOOKUP_ENTRIES = 4096
 MAX_GATE_FIXTURE_BYTES = 65_536
 SCRUB_CONFIRMATION = "DELETE-FEASIBILITY-RAW"
 REVIEWED_STOP_PAYLOAD_KEYS = frozenset(
@@ -104,6 +106,13 @@ class SessionStopEnvelope:
     transcript_path: Path
     cwd: Path
     shape: dict[str, object]
+
+
+@dataclass(frozen=True)
+class ResolvedSessionTranscript:
+    path: Path
+    binding_mode: str
+    epoch_reset: bool
 
 
 def pointer_escape(value: str) -> str:
@@ -1790,6 +1799,231 @@ def load_captured_records(
     return records, captured_size, current.st_size
 
 
+def _session_event_path(
+    observation: dict[str, object], installation: Installation
+) -> Path:
+    if not valid_session_stop_observation(observation, installation):
+        raise ValueError("session_binding_unavailable")
+    event = observation["event"]
+    assert isinstance(event, dict)
+    path = Path(str(event["transcript_path"]))
+    if (
+        not path.is_absolute()
+        or path.is_symlink()
+        or not is_within(path, installation.transcript_roots)
+    ):
+        raise ValueError("session_binding_unavailable")
+    return path
+
+
+def _open_session_prefix(
+    path: Path, captured: dict[str, object], same_identity: bool
+) -> tuple[list[object], int, int]:
+    captured_size = captured["size"]
+    if type(captured_size) is not int or captured_size < 0:
+        raise ValueError("transcript_changed")
+    if captured_size > MAX_TRANSCRIPT_PROBE_BYTES:
+        raise ValueError("oversized_transcript")
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(str(path), flags)
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_size < captured_size
+            or (
+                same_identity
+                and (
+                    before.st_dev != captured["device"]
+                    or before.st_ino != captured["inode"]
+                )
+            )
+        ):
+            raise ValueError("transcript_changed")
+        prefix = read_exact_prefix(descriptor, captured_size)
+        after = os.fstat(descriptor)
+        if (
+            after.st_dev != before.st_dev
+            or after.st_ino != before.st_ino
+            or after.st_size < captured_size
+        ):
+            raise ValueError("transcript_changed")
+    finally:
+        os.close(descriptor)
+    if prefix and not prefix.endswith(b"\n"):
+        raise ValueError("captured_prefix_partial_record")
+    records: list[object] = []
+    try:
+        for raw_line in prefix.splitlines():
+            if not raw_line:
+                raise ValueError("unsupported_jsonl")
+            records.append(json.loads(raw_line.decode("utf-8")))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("unsupported_jsonl") from error
+    return records, captured_size, after.st_size
+
+
+def _same_inode_path(
+    installation: Installation, device: int, inode: int, max_entries: int
+) -> Optional[Path]:
+    if type(max_entries) is not int or max_entries < 0:
+        raise ValueError("session_binding_unavailable")
+    visited = 0
+    pending = list(reversed(installation.transcript_roots))
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    visited += 1
+                    if visited > max_entries:
+                        return None
+                    if entry.is_symlink():
+                        continue
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(Path(entry.path))
+                            continue
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if (
+                        stat.S_ISREG(info.st_mode)
+                        and info.st_uid == os.getuid()
+                        and info.st_dev == device
+                        and info.st_ino == inode
+                    ):
+                        return Path(entry.path)
+        except OSError:
+            continue
+    return None
+
+
+def _has_embedded_session_id(records: list[object], session_id: str) -> bool:
+    return any(
+        pointer.rsplit("/", 1)[-1] == "session_id" and scalar == session_id
+        for record in records
+        for pointer, _identity, scalar in _walk_scalar_entries(record)
+    )
+
+
+def resolve_session_transcript(
+    observation: dict[str, object],
+    installation: Installation,
+    max_entries: int = MAX_TRANSCRIPT_LOOKUP_ENTRIES,
+) -> ResolvedSessionTranscript:
+    original = _session_event_path(observation, installation)
+    captured = observation["transcript_stat"]
+    event = observation["event"]
+    assert isinstance(captured, dict) and isinstance(event, dict)
+    try:
+        _open_session_prefix(original, captured, True)
+    except (FileNotFoundError, OSError, ValueError):
+        relocated = _same_inode_path(
+            installation, int(captured["device"]), int(captured["inode"]), max_entries
+        )
+        if relocated is not None:
+            _open_session_prefix(relocated, captured, True)
+            return ResolvedSessionTranscript(relocated, "same_inode_lookup", False)
+        try:
+            records, _size, _current = _open_session_prefix(original, captured, False)
+        except (OSError, ValueError) as error:
+            raise ValueError("session_binding_unavailable") from error
+        if _has_embedded_session_id(records, str(event["session_id"])):
+            return ResolvedSessionTranscript(original, "embedded_session_id", True)
+        raise ValueError("session_binding_unavailable")
+    return ResolvedSessionTranscript(original, "same_file_identity", False)
+
+
+def discover_session_structure(
+    records: list[object],
+    session_id: str,
+    require_embedded_binding: bool,
+    layout_identity: Optional[dict[str, object]] = None,
+) -> dict[str, object]:
+    session_matches: list[tuple[str, tuple[object, ...]]] = []
+    provenance: list[tuple[str, tuple[object, ...], str]] = []
+    for record in records:
+        for pointer, identity, scalar in _walk_scalar_entries(record):
+            leaf = pointer.rsplit("/", 1)[-1]
+            if leaf == "session_id" and scalar == session_id:
+                session_matches.append((pointer, identity))
+            if leaf in PROVENANCE_KEYS and scalar in PROVENANCE_VALUES:
+                provenance.append((pointer, identity, str(scalar)))
+    if require_embedded_binding and not session_matches:
+        raise ValueError("session_binding_unavailable")
+    if layout_identity is not None:
+        layout_identity["session"] = frozenset(
+            identity for _pointer, identity in session_matches
+        )
+        layout_identity["provenance"] = frozenset(
+            identity for _pointer, identity, _value in provenance
+        )
+    return {
+        "session_id_pointer_paths": sorted(
+            {pointer for pointer, _identity in session_matches}
+        ),
+        "provenance_pointer_paths": sorted(
+            {pointer for pointer, _identity, _value in provenance}
+        ),
+        "provenance_values": sorted({value for _pointer, _identity, value in provenance}),
+    }
+
+
+def inspect_session_structure_v2(
+    observation: dict[str, object],
+    surface: str,
+    installation: Installation,
+    layout_identity: Optional[dict[str, object]] = None,
+) -> dict[str, object]:
+    surface = validate_surface(surface)
+    resolved = resolve_session_transcript(observation, installation)
+    captured = observation["transcript_stat"]
+    event = observation["event"]
+    assert isinstance(captured, dict) and isinstance(event, dict)
+    records, captured_size, current_size = _open_session_prefix(
+        resolved.path, captured, resolved.binding_mode != "embedded_session_id"
+    )
+    structure = discover_session_structure(
+        records,
+        str(event["session_id"]),
+        resolved.binding_mode == "embedded_session_id",
+        layout_identity,
+    )
+    return {
+        "schema_version": 2,
+        "surface": surface,
+        "supported": True,
+        "format": "jsonl",
+        "record_count": len(records),
+        "suffix_ignored": current_size > captured_size,
+        "read_past_boundary": False,
+        "binding_mode": resolved.binding_mode,
+        "epoch_reset": resolved.epoch_reset,
+        **structure,
+    }
+
+
+def safe_inspect_session_structure_v2(
+    observation: dict[str, object],
+    surface: str,
+    installation: Installation,
+    layout_identity: Optional[dict[str, object]] = None,
+) -> dict[str, object]:
+    try:
+        return inspect_session_structure_v2(
+            observation, surface, installation, layout_identity
+        )
+    except (KeyError, OSError, TypeError, ValueError):
+        return {
+            "schema_version": 2,
+            "surface": surface if surface in {"cli", "desktop"} else "cli",
+            "supported": False,
+            "error_code": "session_transcript_unavailable",
+        }
+
+
 def discover_turn_structure(
     records: list[object],
     turn_id: str,
@@ -2044,6 +2278,133 @@ def promote_transcript_structure(
         ),
         "provenance_values": provenance_values,
         "error_codes": error_codes,
+    }
+    atomic_write_json(output.resolve(), report)
+    return report
+
+
+def failed_session_transcript_promotion(surface: str, code: str) -> dict[str, object]:
+    return {
+        "schema_version": 2,
+        "surface": surface,
+        "observation_count": 0,
+        "supported": False,
+        "distinct_sessions": False,
+        "layouts_stable": False,
+        "format": None,
+        "suffix_ignored": False,
+        "read_past_boundary": True,
+        "binding_modes": [],
+        "epoch_reset": False,
+        "session_id_pointer_paths": [],
+        "provenance_pointer_paths": [],
+        "provenance_values": [],
+        "error_codes": [code],
+    }
+
+
+def promote_session_transcript_v2(
+    installation: Installation,
+    surface: str,
+    output: Path,
+) -> dict[str, object]:
+    surface = validate_surface(surface)
+    try:
+        paths = session_surface_observations(installation, surface)
+        observations = [read_bounded_private_json(path) for path in paths]
+        if len(observations) != 2 or not all(
+            valid_session_stop_observation(observation, installation)
+            for observation in observations
+        ):
+            raise ValueError("session_transcript_unavailable")
+        raw_sessions = [
+            session_stop_event_session_id(observation["event"])
+            for observation in observations
+        ]
+        if any(session_id is None for session_id in raw_sessions):
+            raise ValueError("session_transcript_unavailable")
+    except (OSError, TypeError, ValueError):
+        report = failed_session_transcript_promotion(
+            surface, "session_transcript_unavailable"
+        )
+        atomic_write_json(output.resolve(), report)
+        return report
+
+    identities: list[dict[str, object]] = []
+    individual: list[dict[str, object]] = []
+    for observation in observations:
+        identity: dict[str, object] = {}
+        individual.append(
+            safe_inspect_session_structure_v2(
+                observation, surface, installation, identity
+            )
+        )
+        identities.append(identity)
+    all_supported = all(item.get("supported") is True for item in individual)
+    binding_modes = (
+        sorted({str(item.get("binding_mode")) for item in individual})
+        if all_supported
+        else []
+    )
+    layouts_stable = (
+        all_supported
+        and identities[0] == identities[1]
+        and tuple(individual[0].get("session_id_pointer_paths", []))
+        == tuple(individual[1].get("session_id_pointer_paths", []))
+        and tuple(individual[0].get("provenance_pointer_paths", []))
+        == tuple(individual[1].get("provenance_pointer_paths", []))
+    )
+    distinct_sessions = len(set(raw_sessions)) == 2
+    provenance_values = (
+        sorted(
+            set(individual[0].get("provenance_values", []))
+            & set(individual[1].get("provenance_values", []))
+        )
+        if all_supported else []
+    )
+    errors = sorted(
+        {str(item["error_code"]) for item in individual if "error_code" in item}
+    )
+    if all_supported and not layouts_stable:
+        errors.append("layout_unstable")
+    if not distinct_sessions:
+        errors.append("session_binding_unavailable")
+    supported = (
+        all_supported
+        and layouts_stable
+        and distinct_sessions
+        and set(binding_modes).issubset(
+            {"same_file_identity", "same_inode_lookup", "embedded_session_id"}
+        )
+        and {"user", "assistant"}.issubset(provenance_values)
+        and all(item.get("read_past_boundary") is False for item in individual)
+    )
+    if all_supported and not {"user", "assistant"}.issubset(provenance_values):
+        errors.append("provenance_not_found")
+    report = {
+        "schema_version": 2,
+        "surface": surface,
+        "observation_count": len(individual),
+        "supported": supported,
+        "distinct_sessions": distinct_sessions,
+        "layouts_stable": layouts_stable,
+        "format": "jsonl" if all_supported else None,
+        "suffix_ignored": any(item.get("suffix_ignored") is True for item in individual),
+        "read_past_boundary": any(item.get("read_past_boundary") is not False for item in individual),
+        "binding_modes": binding_modes,
+        "epoch_reset": any(item.get("epoch_reset") is True for item in individual),
+        "session_id_pointer_paths": (
+            list(individual[0].get("session_id_pointer_paths", []))
+            if layouts_stable
+            else []
+        ),
+        "provenance_pointer_paths": (
+            list(individual[0].get("provenance_pointer_paths", []))
+            if layouts_stable
+            else []
+        ),
+        "provenance_values": provenance_values,
+        "error_codes": sorted(set(errors)),
     }
     atomic_write_json(output.resolve(), report)
     return report

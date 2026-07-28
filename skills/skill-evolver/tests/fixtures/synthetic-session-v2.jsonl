@@ -1,0 +1,5 @@
+{"payload":{"session_id":"session-one","role":"user","text":"private prompt"}}
+{"payload":{"session_id":"session-one","role":"tool","text":"private output"}}
+{"payload":{"session_id":"session-one","role":"assistant","text":"private answer"}}
+{"payload":{"role":"internal","text":"record without a turn id"}}
+{"payload":{"session_id":"session-one","role":"assistant","text":"later suffix"}}
