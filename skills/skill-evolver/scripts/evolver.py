@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import secrets
@@ -887,6 +888,284 @@ def validate_surface(surface: str) -> str:
     if surface not in {"cli", "desktop"}:
         raise ValueError("invalid_surface")
     return surface
+
+
+ACCESS_EVIDENCE_ERROR = "access_evidence_unavailable"
+ACCESS_CHALLENGE_ERROR = "access_challenge_unavailable"
+ACCESS_GLOBAL_WRITE_ERROR = "access_global_write_unavailable"
+
+
+def challenge_digest(challenge: str) -> str:
+    return hashlib.sha256(challenge.encode("ascii")).hexdigest()
+
+
+def access_reports_directory(installation: Installation) -> Path:
+    return validate_private_child_directory(installation.data_root / "reports")
+
+
+def access_challenge_path(installation: Installation, surface: str) -> Path:
+    return access_reports_directory(installation) / f"{surface}-v2-access-challenge.json"
+
+
+def access_default_response_path(installation: Installation, surface: str) -> Path:
+    return access_reports_directory(installation) / f"{surface}-v2-default-response.json"
+
+
+def access_explicit_response_path(installation: Installation, surface: str) -> Path:
+    return access_reports_directory(installation) / f"{surface}-v2-explicit-response.json"
+
+
+def access_result(
+    surface: str,
+    challenge_read: bool,
+    global_write: bool,
+    write_denied: bool,
+    digest: Optional[str],
+    error_codes: list[str],
+) -> dict[str, object]:
+    return {
+        "schema_version": 2,
+        "surface": surface,
+        "challenge_read": challenge_read,
+        "global_write": global_write,
+        "write_denied": write_denied,
+        "challenge_digest": digest,
+        "error_codes": error_codes,
+    }
+
+
+def valid_access_challenge(
+    payload: object, installation: Installation, surface: str
+) -> bool:
+    return (
+        isinstance(payload, dict)
+        and set(payload) == {
+            "schema_version",
+            "surface",
+            "installation_nonce",
+            "challenge",
+        }
+        and type(payload["schema_version"]) is int
+        and payload["schema_version"] == 2
+        and type(payload["surface"]) is str
+        and payload["surface"] == surface
+        and type(payload["installation_nonce"]) is str
+        and payload["installation_nonce"] == installation.nonce
+        and type(payload["challenge"]) is str
+        and len(payload["challenge"]) == 64
+        and all(character in "0123456789abcdef" for character in payload["challenge"])
+    )
+
+
+def load_access_challenge_v2(
+    installation: Installation, surface: str
+) -> dict[str, object]:
+    surface = validate_surface(surface)
+    try:
+        payload = read_bounded_private_json(access_challenge_path(installation, surface))
+    except ValueError as error:
+        raise ValueError(ACCESS_CHALLENGE_ERROR) from error
+    if not valid_access_challenge(payload, installation, surface):
+        raise ValueError(ACCESS_CHALLENGE_ERROR)
+    return payload
+
+
+def arm_access_v2(installation: Installation, surface: str) -> dict[str, object]:
+    surface = validate_surface(surface)
+    for path in (
+        access_default_response_path(installation, surface),
+        access_explicit_response_path(installation, surface),
+    ):
+        path.unlink(missing_ok=True)
+    challenge = secrets.token_hex(32)
+    atomic_write_json(
+        access_challenge_path(installation, surface),
+        {
+            "schema_version": 2,
+            "surface": surface,
+            "installation_nonce": installation.nonce,
+            "challenge": challenge,
+        },
+    )
+    return {
+        "schema_version": 2,
+        "surface": surface,
+        "armed": True,
+        "challenge_digest": challenge_digest(challenge),
+        "error_codes": [],
+    }
+
+
+def valid_access_result(
+    payload: object,
+    surface: str,
+    digest: str,
+    global_write: bool,
+    write_denied: bool,
+) -> bool:
+    return (
+        isinstance(payload, dict)
+        and set(payload)
+        == {
+            "schema_version",
+            "surface",
+            "challenge_read",
+            "global_write",
+            "write_denied",
+            "challenge_digest",
+            "error_codes",
+        }
+        and type(payload["schema_version"]) is int
+        and payload["schema_version"] == 2
+        and type(payload["surface"]) is str
+        and payload["surface"] == surface
+        and payload["challenge_read"] is True
+        and payload["global_write"] is global_write
+        and payload["write_denied"] is write_denied
+        and type(payload["challenge_digest"]) is str
+        and payload["challenge_digest"] == digest
+        and payload["error_codes"] == []
+    )
+
+
+def write_access_result(output: Path, result: dict[str, object]) -> None:
+    atomic_write_json(resolve_report_output(output), result)
+
+
+def run_default_access_v2(
+    installation: Installation,
+    surface: str,
+    output: Path,
+) -> dict[str, object]:
+    surface = validate_surface(surface)
+    try:
+        challenge = load_access_challenge_v2(installation, surface)
+    except ValueError:
+        result = access_result(
+            surface, False, False, False, None, [ACCESS_CHALLENGE_ERROR]
+        )
+        write_access_result(output, result)
+        return result
+    digest = challenge_digest(str(challenge["challenge"]))
+    result = access_result(surface, True, False, False, digest, [])
+    try:
+        atomic_write_json(access_default_response_path(installation, surface), result)
+    except PermissionError:
+        result["write_denied"] = True
+    except OSError:
+        result["error_codes"] = [ACCESS_GLOBAL_WRITE_ERROR]
+    write_access_result(output, result)
+    return result
+
+
+def run_explicit_access_v2(
+    installation: Installation,
+    surface: str,
+) -> dict[str, object]:
+    surface = validate_surface(surface)
+    try:
+        challenge = load_access_challenge_v2(installation, surface)
+    except ValueError:
+        return access_result(surface, False, False, False, None, [ACCESS_CHALLENGE_ERROR])
+    digest = challenge_digest(str(challenge["challenge"]))
+    result = access_result(surface, True, True, False, digest, [])
+    try:
+        path = access_explicit_response_path(installation, surface)
+        atomic_write_json(path, result)
+        stored = read_bounded_private_json(path)
+        if not valid_access_result(stored, surface, digest, True, False):
+            raise ValueError(ACCESS_EVIDENCE_ERROR)
+    except PermissionError:
+        return access_result(surface, True, False, True, digest, [])
+    except (OSError, ValueError):
+        return access_result(
+            surface, True, False, False, digest, [ACCESS_GLOBAL_WRITE_ERROR]
+        )
+    return result
+
+
+def has_successful_session_stop_evidence(
+    installation: Installation, surface: str
+) -> bool:
+    try:
+        paths = session_surface_observations(installation, surface)
+        observations = [read_bounded_private_json(path) for path in paths]
+        if len(observations) != 2 or not all(
+            valid_session_stop_observation(item, installation) for item in observations
+        ):
+            return False
+        session_ids = [session_stop_event_session_id(item.get("event")) for item in observations]
+        transcript_stat = session_transcript_stat_report(
+            [item.get("transcript_stat") for item in observations]
+        )
+        return (
+            all(item.get("installation_nonce") == installation.nonce for item in observations)
+            and all(session_id is not None for session_id in session_ids)
+            and len(set(session_ids)) == 2
+            and all(transcript_stat.values())
+        )
+    except (OSError, ValueError):
+        return False
+
+
+def failed_access_report(surface: str) -> dict[str, object]:
+    return {
+        "schema_version": 2,
+        "surface": surface,
+        "hook_global_read": False,
+        "hook_global_write": False,
+        "skill_default_read": False,
+        "skill_default_write": False,
+        "skill_default_write_denied": False,
+        "skill_explicit_read": False,
+        "skill_explicit_write": False,
+        "error_codes": [ACCESS_EVIDENCE_ERROR],
+    }
+
+
+def failed_access_promotion(surface: str, output: Path) -> dict[str, object]:
+    report = failed_access_report(surface)
+    write_access_result(output, report)
+    return report
+
+
+def promote_access_v2(
+    installation: Installation,
+    surface: str,
+    default_response: Path,
+    output: Path,
+) -> dict[str, object]:
+    surface = validate_surface(surface)
+    try:
+        challenge = load_access_challenge_v2(installation, surface)
+        digest = challenge_digest(str(challenge["challenge"]))
+        default = read_bounded_private_json(resolve_report_output(default_response))
+        explicit = read_bounded_private_json(
+            access_explicit_response_path(installation, surface)
+        )
+        evidence_ok = (
+            valid_access_result(default, surface, digest, False, True)
+            and valid_access_result(explicit, surface, digest, True, False)
+            and has_successful_session_stop_evidence(installation, surface)
+        )
+        if not evidence_ok:
+            return failed_access_promotion(surface, output)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return failed_access_promotion(surface, output)
+    report = {
+        "schema_version": 2,
+        "surface": surface,
+        "hook_global_read": True,
+        "hook_global_write": True,
+        "skill_default_read": True,
+        "skill_default_write": False,
+        "skill_default_write_denied": True,
+        "skill_explicit_read": True,
+        "skill_explicit_write": True,
+        "error_codes": [],
+    }
+    write_access_result(output, report)
+    return report
 
 
 def arm_skill_preflight(
@@ -2397,6 +2676,70 @@ def cmd_probe_v2_promote_stop(args: argparse.Namespace) -> int:
     return 0 if report["capture_supported"] else 2
 
 
+def cmd_probe_v2_arm_access(args: argparse.Namespace) -> int:
+    try:
+        installation = load_installation(Path(args.installation))
+        write_json_stdout(arm_access_v2(installation, args.surface))
+        return 0
+    except Exception:
+        write_json_stdout(
+            {
+                "schema_version": 2,
+                "surface": args.surface,
+                "armed": False,
+                "challenge_digest": None,
+                "error_codes": [ACCESS_EVIDENCE_ERROR],
+            }
+        )
+        return 2
+
+
+def cmd_probe_v2_default_access(args: argparse.Namespace) -> int:
+    try:
+        installation = load_installation(Path(args.installation))
+        report = run_default_access_v2(installation, args.surface, Path(args.output))
+        write_json_stdout(report)
+        return 0 if report["challenge_read"] and report["write_denied"] else 2
+    except Exception:
+        write_json_stdout(
+            access_result(
+                args.surface, False, False, False, None, [ACCESS_EVIDENCE_ERROR]
+            )
+        )
+        return 2
+
+
+def cmd_probe_v2_explicit_access(args: argparse.Namespace) -> int:
+    try:
+        installation = load_installation(Path(args.installation))
+        report = run_explicit_access_v2(installation, args.surface)
+        write_json_stdout(report)
+        return 0 if report["challenge_read"] and report["global_write"] else 2
+    except Exception:
+        write_json_stdout(
+            access_result(
+                args.surface, False, False, False, None, [ACCESS_EVIDENCE_ERROR]
+            )
+        )
+        return 2
+
+
+def cmd_probe_v2_promote_access(args: argparse.Namespace) -> int:
+    try:
+        installation = load_installation(Path(args.installation))
+        report = promote_access_v2(
+            installation,
+            args.surface,
+            Path(args.default_response),
+            Path(args.output),
+        )
+        write_json_stdout(report)
+        return 0 if not report["error_codes"] else 2
+    except Exception:
+        write_json_stdout(failed_access_report(args.surface))
+        return 2
+
+
 def cmd_probe_promote_transcript(args: argparse.Namespace) -> int:
     installation = load_installation(Path(args.installation))
     report = promote_transcript_structure(
@@ -2470,6 +2813,29 @@ def build_parser() -> argparse.ArgumentParser:
     promote_v2_stop.add_argument("--surface", choices=("cli", "desktop"), required=True)
     promote_v2_stop.add_argument("--output", required=True)
     promote_v2_stop.set_defaults(handler=cmd_probe_v2_promote_stop)
+
+    arm_v2_access = subparsers.add_parser("probe-v2-arm-access")
+    arm_v2_access.add_argument("--installation", required=True)
+    arm_v2_access.add_argument("--surface", choices=("cli", "desktop"), required=True)
+    arm_v2_access.set_defaults(handler=cmd_probe_v2_arm_access)
+
+    default_v2_access = subparsers.add_parser("probe-v2-default-access")
+    default_v2_access.add_argument("--installation", required=True)
+    default_v2_access.add_argument("--surface", choices=("cli", "desktop"), required=True)
+    default_v2_access.add_argument("--output", required=True)
+    default_v2_access.set_defaults(handler=cmd_probe_v2_default_access)
+
+    explicit_v2_access = subparsers.add_parser("probe-v2-explicit-access")
+    explicit_v2_access.add_argument("--installation", required=True)
+    explicit_v2_access.add_argument("--surface", choices=("cli", "desktop"), required=True)
+    explicit_v2_access.set_defaults(handler=cmd_probe_v2_explicit_access)
+
+    promote_v2_access = subparsers.add_parser("probe-v2-promote-access")
+    promote_v2_access.add_argument("--installation", required=True)
+    promote_v2_access.add_argument("--surface", choices=("cli", "desktop"), required=True)
+    promote_v2_access.add_argument("--default-response", required=True)
+    promote_v2_access.add_argument("--output", required=True)
+    promote_v2_access.set_defaults(handler=cmd_probe_v2_promote_access)
 
     promote_transcript = subparsers.add_parser("probe-promote-transcript")
     promote_transcript.add_argument("--installation", required=True)
