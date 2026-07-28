@@ -973,20 +973,21 @@ def aggregate_required_fields(
     return result
 
 
-def aggregate_session_required_fields(
-    observations: list[dict[str, object]],
-) -> dict[str, object]:
-    names = ("hook_event_name", "session_id", "cwd", "transcript_path", "turn_id")
-    result: dict[str, object] = {}
-    for name in names:
-        fields = [item["shape"]["required_fields"][name] for item in observations]
-        types = {field.get("type") for field in fields}
-        result[name] = {
-            "present": all(field.get("present") is True for field in fields),
-            "type": next(iter(types)) if len(types) == 1 else "mixed",
-            "valid": all(field.get("valid") is True for field in fields),
-        }
-    return result
+def session_stop_core_shape() -> dict[str, object]:
+    field_types = {
+        "cwd": "str",
+        "hook_event_name": "str",
+        "session_id": "str",
+        "transcript_path": "str",
+    }
+    return {
+        "payload_keys": sorted(field_types),
+        "field_types": field_types,
+        "required_fields": {
+            key: {"present": True, "type": "str", "valid": True}
+            for key in field_types
+        },
+    }
 
 
 def session_transcript_stat_report(
@@ -1002,13 +1003,13 @@ def session_transcript_stat_report(
         "owned_by_current_user": present
         and all(item.get("owned_by_current_user") is True for item in infos),
         "size_positive": present
-        and all(isinstance(item.get("size"), int) and item["size"] > 0 for item in infos),
+        and all(type(item.get("size")) is int and item["size"] > 0 for item in infos),
         "has_mtime_ns": present
-        and all(isinstance(item.get("mtime_ns"), int) for item in infos),
+        and all(type(item.get("mtime_ns")) is int for item in infos),
         "has_device": present
-        and all(isinstance(item.get("device"), int) for item in infos),
+        and all(type(item.get("device")) is int for item in infos),
         "has_inode": present
-        and all(isinstance(item.get("inode"), int) for item in infos),
+        and all(type(item.get("inode")) is int for item in infos),
     }
 
 
@@ -1057,8 +1058,9 @@ def promote_session_stop_v2(
         shapes = [item["shape"] for item in observations]
         if not all(valid_session_hook_shape(shape) for shape in shapes):
             raise ValueError("session_stop_observation_unavailable")
+        core_shapes = [session_stop_core_shape() for _shape in shapes]
         transcript_infos = [item.get("transcript_stat") for item in observations]
-        required_fields = aggregate_session_required_fields(observations)
+        required_fields = core_shapes[0]["required_fields"]
         capture_error_codes = sorted(
             {
                 str(item["capture_error_code"])
@@ -1074,9 +1076,11 @@ def promote_session_stop_v2(
             if isinstance(item.get("event"), dict)
             and isinstance(item["event"].get("session_id"), str)
         }
-        payload_shapes_stable = shapes[0] == shapes[1]
+        payload_shapes_stable = core_shapes[0] == core_shapes[1]
         distinct_sessions = len(session_ids) == 2
         transcript_stat = session_transcript_stat_report(transcript_infos)
+        if not all(transcript_stat.values()):
+            raise ValueError("session_stop_observation_unavailable")
         capture_supported = (
             nonce_matches
             and payload_shapes_stable
@@ -1094,14 +1098,8 @@ def promote_session_stop_v2(
             "turn_id_optional": True,
             "hook_event_name": "Stop",
             "payload_shapes_stable": payload_shapes_stable,
-            "payload_keys": sorted(
-                set(shapes[0]["payload_keys"]) | set(shapes[1]["payload_keys"])
-            ),
-            "field_types": (
-                shapes[0]["field_types"]
-                if shapes[0]["field_types"] == shapes[1]["field_types"]
-                else {}
-            ),
+            "payload_keys": core_shapes[0]["payload_keys"],
+            "field_types": core_shapes[0]["field_types"],
             "required_fields": required_fields,
             "capture_error_codes": capture_error_codes,
             "transcript_stat": transcript_stat,

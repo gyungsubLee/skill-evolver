@@ -234,6 +234,42 @@ class SessionStopV2Tests(unittest.TestCase):
         self.assertFalse(report["distinct_sessions"])
         self.assertFalse(report["capture_supported"])
 
+    def test_v2_promotion_accepts_distinct_sessions_with_mixed_optional_turns(self) -> None:
+        self.runtime.mark_session_surface_boundary(self.installation, "cli")
+        self.capture({**self.payload, "turn_id": "turn-secret-one"})
+        self.capture({**self.payload, "session_id": "session-secret-two"})
+        report = self.runtime.promote_session_stop_v2(
+            self.installation, "cli", self.root / "session-stop-cli.v2.structure.json"
+        )
+        self.assertTrue(report["capture_supported"])
+        self.assertTrue(report["distinct_sessions"])
+        self.assertTrue(report["payload_shapes_stable"])
+        self.assertNotIn("turn-secret-one", json.dumps(report))
+        self.assertNotIn("session-secret", json.dumps(report))
+
+    def test_v2_promotion_rejects_boolean_transcript_stat_numbers(self) -> None:
+        for name in ("size", "mtime_ns", "device", "inode"):
+            with self.subTest(name=name):
+                self.runtime.mark_session_surface_boundary(self.installation, "cli")
+                first = self.runtime.capture_session_stop(
+                    self.installation, json.dumps(self.payload).encode()
+                )
+                self.capture({**self.payload, "session_id": f"session-secret-{name}"})
+                stored = json.loads(first.read_text(encoding="utf-8"))
+                stored["transcript_stat"][name] = True
+                self.runtime.atomic_write_json(first, stored)
+                report = self.runtime.promote_session_stop_v2(
+                    self.installation,
+                    "cli",
+                    self.root / f"session-stop-cli-{name}.v2.structure.json",
+                )
+                self.assertFalse(report["capture_supported"])
+                self.assertEqual(
+                    report["capture_error_codes"],
+                    ["session_stop_observation_unavailable"],
+                )
+                self.assertNotIn("session-secret", json.dumps(report))
+
     def test_v2_promotion_sanitizes_tampered_capture_error(self) -> None:
         self.runtime.mark_session_surface_boundary(self.installation, "cli")
         first = self.runtime.capture_session_stop(
