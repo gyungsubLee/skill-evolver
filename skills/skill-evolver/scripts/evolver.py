@@ -95,6 +95,17 @@ V2_TRANSCRIPT_BINDING_MODES = frozenset(
     {"same_file_identity", "same_inode_lookup", "embedded_session_id"}
 )
 V2_PREDECESSOR_PATH = "docs/feasibility-report.json"
+V2_PREDECESSOR_SHA256 = "ced4503adb44bd041de063c04e0c6c64d0831370fc12e96a920fe97244d8ae15"
+V1_PREDECESSOR_CHECKS = {
+    "cli_shared_data_root": True,
+    "cli_skill_data_root": False,
+    "cli_stop_contract": True,
+    "cli_transcript_supported": False,
+    "desktop_shared_data_root": True,
+    "desktop_skill_data_root": False,
+    "desktop_stop_contract": True,
+    "desktop_transcript_supported": False,
+}
 
 
 @dataclass(frozen=True)
@@ -3143,7 +3154,11 @@ def paths_alias(left: Path, right: Path) -> bool:
 def _stable_private_file_bytes(path: Path, *, fixture: bool) -> bytes:
     try:
         info = path.lstat()
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+        ):
             raise ValueError("gate_inputs_invalid")
         mode = stat.S_IMODE(info.st_mode)
         if info.st_uid != os.getuid() or (mode != 0o600 if fixture else mode & 0o022):
@@ -3163,6 +3178,7 @@ def _stable_private_file_bytes(path: Path, *, fixture: bool) -> bytes:
                 or before.st_ino != info.st_ino
                 or before.st_size != info.st_size
                 or before.st_mtime_ns != info.st_mtime_ns
+                or before.st_nlink != 1
             ):
                 raise ValueError("gate_inputs_invalid")
             raw = read_exact_prefix(descriptor, info.st_size)
@@ -3174,6 +3190,7 @@ def _stable_private_file_bytes(path: Path, *, fixture: bool) -> bytes:
                 or after.st_mtime_ns != before.st_mtime_ns
                 or after.st_mode != before.st_mode
                 or after.st_uid != before.st_uid
+                or after.st_nlink != 1
             ):
                 raise ValueError("gate_inputs_invalid")
             return raw
@@ -3216,17 +3233,39 @@ def _v2_fixture_inventory(fixture_root: Path) -> tuple[Path, dict[str, dict[str,
         raise ValueError("gate_inputs_invalid") from None
 
 
+def v2_predecessor_binding() -> tuple[Path, str]:
+    return (
+        Path(__file__).resolve().parents[3] / V2_PREDECESSOR_PATH,
+        V2_PREDECESSOR_SHA256,
+    )
+
+
 def _v2_predecessor_digest(predecessor_json: Path) -> str:
     requested = Path(os.path.abspath(str(predecessor_json.expanduser())))
     try:
         reject_symlink_components(requested, "gate_inputs_invalid")
-        if requested.name != "feasibility-report.json" or requested.parent.name != "docs":
+        expected_path, expected_digest = v2_predecessor_binding()
+        if requested != expected_path:
             raise ValueError("gate_inputs_invalid")
         raw = _stable_private_file_bytes(requested, fixture=False)
         value = json.loads(raw.decode("utf-8"))
-        if type(value) is not dict:
+        if (
+            type(value) is not dict
+            or set(value)
+            != {
+                "checks", "decision", "next_action", "schema_differences",
+                "schema_version", "surfaces",
+            }
+            or type(value.get("schema_version")) is not int
+            or value["schema_version"] != 1
+            or value.get("decision") != "FAIL"
+            or value.get("checks") != V1_PREDECESSOR_CHECKS
+        ):
             raise ValueError("gate_inputs_invalid")
-        return hashlib.sha256(raw).hexdigest()
+        digest = hashlib.sha256(raw).hexdigest()
+        if digest != expected_digest:
+            raise ValueError("gate_inputs_invalid")
+        return digest
     except (RecursionError, TypeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
         raise ValueError("gate_inputs_invalid") from None
 
@@ -3253,6 +3292,89 @@ def render_gate_markdown_v2(report: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def _stage_gate_v2_file(parent: Path, name: str, raw: bytes, mode: int) -> Path:
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{name}.", dir=parent)
+    staged = Path(temporary)
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        return staged
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        staged.unlink(missing_ok=True)
+        raise
+
+
+def _stage_gate_v2_backup(path: Path, parent: Path) -> tuple[Optional[Path], Optional[int]]:
+    if not path.exists():
+        return None, None
+    info = path.lstat()
+    return (
+        _stage_gate_v2_file(
+            parent,
+            f"{path.name}.backup",
+            _stable_private_file_bytes(path, fixture=False),
+            stat.S_IMODE(info.st_mode),
+        ),
+        stat.S_IMODE(info.st_mode),
+    )
+
+
+def _publish_gate_v2_pair(
+    json_path: Path,
+    json_raw: bytes,
+    markdown_path: Path,
+    markdown_raw: bytes,
+) -> None:
+    parent = json_path.parent
+    stages: dict[Path, Path] = {}
+    backups: dict[Path, tuple[Optional[Path], Optional[int]]] = {}
+    published: set[Path] = set()
+    modes = {json_path: 0o600, markdown_path: 0o644}
+    try:
+        stages[json_path] = _stage_gate_v2_file(
+            parent, json_path.name, json_raw, modes[json_path]
+        )
+        stages[markdown_path] = _stage_gate_v2_file(
+            parent, markdown_path.name, markdown_raw, modes[markdown_path]
+        )
+        fsync_directory(parent)
+        backups[json_path] = _stage_gate_v2_backup(json_path, parent)
+        backups[markdown_path] = _stage_gate_v2_backup(markdown_path, parent)
+        for destination in (json_path, markdown_path):
+            os.replace(stages[destination], destination)
+            published.add(destination)
+            os.chmod(destination, modes[destination])
+            fsync_directory(parent)
+    except BaseException:
+        for destination in reversed((json_path, markdown_path)):
+            if destination not in published:
+                continue
+            backup, prior_mode = backups.get(destination, (None, None))
+            try:
+                if backup is None:
+                    destination.unlink(missing_ok=True)
+                else:
+                    os.replace(backup, destination)
+                    if prior_mode is not None:
+                        os.chmod(destination, prior_mode)
+            except OSError:
+                pass
+        try:
+            fsync_directory(parent)
+        except OSError:
+            pass
+        raise
+    finally:
+        for staged in (*stages.values(), *(backup for backup, _mode in backups.values() if backup is not None)):
+            staged.unlink(missing_ok=True)
+
+
 def write_gate_report_v2(
     fixture_root: Path,
     predecessor_json: Path,
@@ -3261,7 +3383,10 @@ def write_gate_report_v2(
 ) -> dict[str, object]:
     json_path = resolve_report_output(output_json)
     markdown_path = resolve_report_output(output_markdown)
-    if paths_alias(json_path, markdown_path):
+    if (
+        paths_alias(json_path, markdown_path)
+        or path_identity(json_path.parent) != path_identity(markdown_path.parent)
+    ):
         raise ValueError("gate_inputs_invalid")
     root, fixtures = _v2_fixture_inventory(fixture_root)
     predecessor = Path(os.path.abspath(str(predecessor_json.expanduser())))
@@ -3282,12 +3407,15 @@ def write_gate_report_v2(
         fixtures["access-desktop.v2.structure.json"],
         digest,
     )
-    atomic_write_json(json_path, report)
-    try:
-        atomic_write_text(markdown_path, render_gate_markdown_v2(report))
-    except BaseException:
-        json_path.unlink(missing_ok=True)
-        raise
+    json_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    json_path = resolve_report_output(json_path)
+    markdown_path = resolve_report_output(markdown_path)
+    _publish_gate_v2_pair(
+        json_path,
+        (json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"),
+        markdown_path,
+        render_gate_markdown_v2(report).encode("utf-8"),
+    )
     return report
 
 

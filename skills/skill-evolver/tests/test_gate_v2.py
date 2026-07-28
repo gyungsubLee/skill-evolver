@@ -4,12 +4,13 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import load_runtime, run_isolated
+from support import PLUGIN_ROOT, load_runtime, run_isolated
 
 
 V2_FIXTURE_NAMES = {
@@ -94,10 +95,7 @@ class GateV2Tests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
-        self.predecessor = self.root / "docs" / "feasibility-report.json"
-        self.predecessor.parent.mkdir(mode=0o700)
-        self.predecessor.write_text('{"schema_version":1}\n', encoding="utf-8")
-        self.predecessor.chmod(0o600)
+        self.predecessor = PLUGIN_ROOT / "docs" / "feasibility-report.json"
 
     def write_fixtures(self, root: Path) -> None:
         root.mkdir(mode=0o700)
@@ -283,10 +281,14 @@ class GateV2Tests(unittest.TestCase):
     def test_predecessor_is_private_regular_stable_and_digest_is_checked(self) -> None:
         fixtures = self.root / "fixtures"
         self.write_fixtures(fixtures)
-        self.predecessor.chmod(0o666)
+        wrong = self.root / "docs" / "feasibility-report.json"
+        wrong.parent.mkdir(mode=0o700)
+        wrong.write_bytes(self.predecessor.read_bytes())
+        wrong.chmod(0o600)
         with self.assertRaises(ValueError):
-            self.write_report(fixtures)
-        self.predecessor.chmod(0o600)
+            self.runtime.write_gate_report_v2(
+                fixtures, wrong, self.root / "out.json", self.root / "out.md"
+            )
         original_fstat = self.runtime.os.fstat
         calls = 0
 
@@ -305,6 +307,109 @@ class GateV2Tests(unittest.TestCase):
         with mock.patch.object(self.runtime.os, "fstat", side_effect=changed_fstat):
             with self.assertRaises(ValueError):
                 self.runtime._v2_predecessor_digest(self.predecessor)
+
+    def test_predecessor_requires_the_canonical_artifact_and_its_declared_digest(self) -> None:
+        fixtures = self.root / "fixtures"
+        self.write_fixtures(fixtures)
+        wrong = self.root / "docs" / "feasibility-report.json"
+        wrong.parent.mkdir(mode=0o700)
+        wrong.write_bytes(self.predecessor.read_bytes())
+        wrong.chmod(0o600)
+        with self.assertRaises(ValueError):
+            self.runtime.write_gate_report_v2(
+                fixtures, wrong, self.root / "out.json", self.root / "out.md"
+            )
+        with mock.patch.object(
+            self.runtime,
+            "v2_predecessor_binding",
+            return_value=(self.predecessor, "0" * 64),
+            create=True,
+        ):
+            with self.assertRaises(ValueError):
+                self.write_report(fixtures)
+
+    def test_external_hardlinks_to_fixtures_or_predecessor_fail_closed(self) -> None:
+        fixtures = self.root / "fixtures"
+        self.write_fixtures(fixtures)
+        external_fixture = self.root / "external-fixture.json"
+        os.link(fixtures / "access-cli.v2.structure.json", external_fixture)
+        try:
+            with self.assertRaises(ValueError):
+                self.write_report(fixtures)
+        finally:
+            external_fixture.unlink()
+
+        external_predecessor = self.root / "external-predecessor.json"
+        os.link(self.predecessor, external_predecessor)
+        try:
+            with self.assertRaises(ValueError):
+                self.write_report(fixtures)
+        finally:
+            external_predecessor.unlink()
+
+    def test_pair_publication_restores_prior_outputs_when_markdown_publish_fails(self) -> None:
+        self._assert_publication_failure_rolls_back("replace_markdown")
+
+    def test_pair_publication_restores_prior_outputs_when_markdown_sync_fails(self) -> None:
+        self._assert_publication_failure_rolls_back("sync_markdown")
+
+    def _assert_publication_failure_rolls_back(self, point: str) -> None:
+        for existing in (False, True):
+            with self.subTest(point=point, existing=existing):
+                case = self.root / f"{point}-{existing}"
+                case.mkdir()
+                fixtures = case / "fixtures"
+                self.write_fixtures(fixtures)
+                output = case / "output"
+                output.mkdir(mode=0o700)
+                json_path = output / "feasibility-report-v2.json"
+                markdown_path = output / "feasibility-report-v2.md"
+                old_json = b'{"old":true}\n'
+                old_markdown = b"old markdown\n"
+                if existing:
+                    json_path.write_bytes(old_json)
+                    json_path.chmod(0o600)
+                    markdown_path.write_bytes(old_markdown)
+                    markdown_path.chmod(0o640)
+                if point == "replace_markdown":
+                    original_replace = self.runtime.os.replace
+
+                    def fail_markdown(source, destination):
+                        if Path(destination) == markdown_path:
+                            raise OSError("publish secret path")
+                        return original_replace(source, destination)
+
+                    patched = mock.patch.object(
+                        self.runtime.os, "replace", side_effect=fail_markdown
+                    )
+                else:
+                    original_fsync = self.runtime.fsync_directory
+                    calls = 0
+
+                    def fail_after_markdown(directory):
+                        nonlocal calls
+                        calls += 1
+                        if calls == 3:
+                            raise OSError("sync secret path")
+                        return original_fsync(directory)
+
+                    patched = mock.patch.object(
+                        self.runtime, "fsync_directory", side_effect=fail_after_markdown
+                    )
+                with patched:
+                    with self.assertRaises(OSError):
+                        self.runtime.write_gate_report_v2(
+                            fixtures, self.predecessor, json_path, markdown_path
+                        )
+                if existing:
+                    self.assertEqual(json_path.read_bytes(), old_json)
+                    self.assertEqual(markdown_path.read_bytes(), old_markdown)
+                    self.assertEqual(stat.S_IMODE(json_path.stat().st_mode), 0o600)
+                    self.assertEqual(stat.S_IMODE(markdown_path.stat().st_mode), 0o640)
+                else:
+                    self.assertFalse(json_path.exists())
+                    self.assertFalse(markdown_path.exists())
+                self.assertFalse(any(path.name.startswith(".") for path in output.iterdir()))
 
     def test_output_aliases_with_fixture_predecessor_or_each_other_are_refused(self) -> None:
         fixtures = self.root / "fixtures"
