@@ -141,6 +141,47 @@ class SessionTranscriptV2Tests(unittest.TestCase):
                 self.assertEqual(report["error_code"], "session_transcript_unavailable")
                 self.assertNotIn(str(path), json.dumps(report))
 
+    def test_lexical_parent_escape_and_intermediate_symlink_fail_closed(self) -> None:
+        outside = self.root / "outside"
+        outside.mkdir(mode=0o700)
+        escaped = outside / "session.jsonl"
+        escaped.write_bytes(self.transcript.read_bytes())
+        nested = self.sessions / "nested"
+        nested.symlink_to(outside, target_is_directory=True)
+        for path in (
+            str(self.sessions / ".." / "outside" / "session.jsonl"),
+            f"{self.sessions.resolve()}/./session.jsonl",
+            f"{self.sessions.resolve()}//session.jsonl",
+            nested / "session.jsonl",
+        ):
+            with self.subTest(path=str(path)):
+                observation = {
+                    **self.observation,
+                    "event": {
+                        **self.observation["event"],
+                        "transcript_path": str(path),
+                    },
+                }
+                report = self.runtime.safe_inspect_session_structure_v2(
+                    observation, "cli", self.installation
+                )
+                self.assertFalse(report["supported"])
+                self.assertEqual(report["error_code"], "session_transcript_unavailable")
+                self.assertNotIn(str(path), json.dumps(report))
+
+    def test_same_size_rewrite_after_capture_fails_closed(self) -> None:
+        self.transcript.write_bytes(b"".join(self.lines[:4]))
+        os.utime(
+            self.transcript,
+            ns=(
+                self.transcript.stat().st_atime_ns,
+                self.observation["transcript_stat"]["mtime_ns"] + 1,
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "transcript_changed"):
+            self.inspect()
+
     def test_changed_size_during_read_fails_closed(self) -> None:
         original_fstat = self.runtime.os.fstat
         calls = 0
@@ -160,6 +201,66 @@ class SessionTranscriptV2Tests(unittest.TestCase):
         with mock.patch.object(self.runtime.os, "fstat", side_effect=shrinking):
             with self.assertRaisesRegex(ValueError, "transcript_changed"):
                 self.inspect()
+
+    def test_same_size_change_during_read_fails_closed(self) -> None:
+        original_fstat = self.runtime.os.fstat
+        original_read = self.runtime.os.read
+        changed = False
+
+        def changing_read(descriptor: int, size: int) -> bytes:
+            nonlocal changed
+            chunk = original_read(descriptor, size)
+            changed = True
+            return chunk
+
+        def changed_stat(descriptor: int) -> os.stat_result:
+            info = original_fstat(descriptor)
+            if changed:
+                return os.stat_result((
+                    info.st_mode, info.st_ino, info.st_dev, info.st_nlink,
+                    info.st_uid, info.st_gid, info.st_size, info.st_atime,
+                    info.st_mtime + 1, info.st_ctime,
+                ))
+            return info
+
+        with mock.patch.object(self.runtime.os, "read", side_effect=changing_read), mock.patch.object(
+            self.runtime.os, "fstat", side_effect=changed_stat
+        ):
+            with self.assertRaisesRegex(ValueError, "transcript_changed"):
+                self.inspect()
+
+    def test_directory_swap_before_final_open_cannot_read_outside_file(self) -> None:
+        nested = self.sessions / "nested"
+        nested.mkdir(mode=0o700)
+        target = nested / "session.jsonl"
+        target.write_bytes(self.transcript.read_bytes())
+        observed = {**self.observation, "event": {**self.observation["event"], "transcript_path": str(target.resolve())}}
+        info = target.stat()
+        observed["transcript_stat"] = {
+            **observed["transcript_stat"], "size": info.st_size,
+            "mtime_ns": info.st_mtime_ns, "device": info.st_dev, "inode": info.st_ino,
+        }
+        outside = self.root / "outside"
+        outside.mkdir(mode=0o700)
+        (outside / "session.jsonl").write_text("outside-secret\n", encoding="utf-8")
+        original_open = self.runtime.os.open
+        swapped = False
+
+        def swap_before_final(name, flags, *args, **kwargs):
+            nonlocal swapped
+            if name == "session.jsonl" and "dir_fd" in kwargs and not swapped:
+                swapped = True
+                nested.rename(self.sessions / "moved")
+                nested.symlink_to(outside, target_is_directory=True)
+            return original_open(name, flags, *args, **kwargs)
+
+        with mock.patch.object(self.runtime.os, "open", side_effect=swap_before_final):
+            report = self.runtime.safe_inspect_session_structure_v2(
+                observed, "cli", self.installation
+            )
+        self.assertNotIn("outside-secret", json.dumps(report))
+        self.assertFalse(report["supported"])
+        self.assertEqual(report["error_code"], "session_transcript_unavailable")
 
     def test_same_inode_rename_resolves_under_fixed_roots(self) -> None:
         renamed = self.sessions / "nested" / "renamed.jsonl"

@@ -1806,37 +1806,112 @@ def _session_event_path(
         raise ValueError("session_binding_unavailable")
     event = observation["event"]
     assert isinstance(event, dict)
-    path = Path(str(event["transcript_path"]))
+    raw_path = event["transcript_path"]
+    assert isinstance(raw_path, str)
+    try:
+        _transcript_relative_path(raw_path, installation)
+    except ValueError as error:
+        raise ValueError("session_binding_unavailable") from error
+    return Path(raw_path)
+
+
+def _transcript_relative_path(
+    path: str | Path, installation: Installation
+) -> tuple[Path, tuple[str, ...]]:
+    raw = path if isinstance(path, str) else str(path)
+    parts = raw.split("/")
     if (
-        not path.is_absolute()
-        or path.is_symlink()
-        or not is_within(path, installation.transcript_roots)
+        not raw.startswith("/")
+        or len(parts) < 2
+        or any(part in {"", ".", ".."} for part in parts[1:])
     ):
         raise ValueError("session_binding_unavailable")
-    return path
+    for root in installation.transcript_roots:
+        root_parts = str(root).split("/")[1:]
+        if (
+            parts[1 : 1 + len(root_parts)] == root_parts
+            and len(parts) > 1 + len(root_parts)
+        ):
+            return root, tuple(parts[1 + len(root_parts) :])
+    raise ValueError("session_binding_unavailable")
+
+
+def _open_transcript_directory(root: Path, components: tuple[str, ...]) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(str(root), flags)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise ValueError("session_binding_unavailable")
+        for component in components:
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+            info = os.fstat(descriptor)
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+                raise ValueError("session_binding_unavailable")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_transcript_file(path: Path, installation: Installation) -> int:
+    root, components = _transcript_relative_path(path, installation)
+    directory = _open_transcript_directory(root, components[:-1])
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(components[-1], flags, dir_fd=directory)
+    finally:
+        os.close(directory)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise ValueError("transcript_changed")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _captured_transcript_values(captured: dict[str, object]) -> tuple[int, int, int, int]:
+    names = ("size", "mtime_ns", "device", "inode")
+    if any(type(captured.get(name)) is not int for name in names):
+        raise ValueError("transcript_changed")
+    size, mtime, device, inode = (int(captured[name]) for name in names)
+    if size < 0 or mtime < 0 or device < 0 or inode < 0:
+        raise ValueError("transcript_changed")
+    return size, mtime, device, inode
 
 
 def _open_session_prefix(
-    path: Path, captured: dict[str, object], same_identity: bool
+    path: Path,
+    captured: dict[str, object],
+    same_identity: bool,
+    installation: Installation,
 ) -> tuple[list[object], int, int]:
-    captured_size = captured["size"]
-    if type(captured_size) is not int or captured_size < 0:
-        raise ValueError("transcript_changed")
+    captured_size, captured_mtime, captured_device, captured_inode = (
+        _captured_transcript_values(captured)
+    )
     if captured_size > MAX_TRANSCRIPT_PROBE_BYTES:
         raise ValueError("oversized_transcript")
-    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(str(path), flags)
+    descriptor = _open_transcript_file(path, installation)
     try:
         before = os.fstat(descriptor)
         if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_uid != os.getuid()
-            or before.st_size < captured_size
+            type(before.st_mtime_ns) is not int
+            or
+            before.st_size < captured_size
             or (
                 same_identity
                 and (
-                    before.st_dev != captured["device"]
-                    or before.st_ino != captured["inode"]
+                    before.st_dev != captured_device
+                    or before.st_ino != captured_inode
+                    or before.st_mtime_ns < captured_mtime
+                    or (
+                        before.st_size == captured_size
+                        and before.st_mtime_ns != captured_mtime
+                    )
                 )
             )
         ):
@@ -1844,9 +1919,14 @@ def _open_session_prefix(
         prefix = read_exact_prefix(descriptor, captured_size)
         after = os.fstat(descriptor)
         if (
+            type(after.st_mtime_ns) is not int
+            or
             after.st_dev != before.st_dev
             or after.st_ino != before.st_ino
-            or after.st_size < captured_size
+            or after.st_size != before.st_size
+            or after.st_mtime_ns != before.st_mtime_ns
+            or after.st_mode != before.st_mode
+            or after.st_uid != before.st_uid
         ):
             raise ValueError("transcript_changed")
     finally:
@@ -1870,11 +1950,15 @@ def _same_inode_path(
     if type(max_entries) is not int or max_entries < 0:
         raise ValueError("session_binding_unavailable")
     visited = 0
-    pending = list(reversed(installation.transcript_roots))
+    pending = [(root, ()) for root in reversed(installation.transcript_roots)]
     while pending:
-        directory = pending.pop()
+        root, components = pending.pop()
         try:
-            with os.scandir(directory) as entries:
+            descriptor = _open_transcript_directory(root, components)
+        except (OSError, ValueError):
+            continue
+        try:
+            with os.scandir(descriptor) as entries:
                 for entry in entries:
                     visited += 1
                     if visited > max_entries:
@@ -1883,7 +1967,7 @@ def _same_inode_path(
                         continue
                     try:
                         if entry.is_dir(follow_symlinks=False):
-                            pending.append(Path(entry.path))
+                            pending.append((root, components + (entry.name,)))
                             continue
                         info = entry.stat(follow_symlinks=False)
                     except OSError:
@@ -1894,9 +1978,9 @@ def _same_inode_path(
                         and info.st_dev == device
                         and info.st_ino == inode
                     ):
-                        return Path(entry.path)
-        except OSError:
-            continue
+                        return root.joinpath(*components, entry.name)
+        finally:
+            os.close(descriptor)
     return None
 
 
@@ -1918,16 +2002,28 @@ def resolve_session_transcript(
     event = observation["event"]
     assert isinstance(captured, dict) and isinstance(event, dict)
     try:
-        _open_session_prefix(original, captured, True)
+        _open_session_prefix(original, captured, True, installation)
     except (FileNotFoundError, OSError, ValueError):
         relocated = _same_inode_path(
             installation, int(captured["device"]), int(captured["inode"]), max_entries
         )
         if relocated is not None:
-            _open_session_prefix(relocated, captured, True)
+            _open_session_prefix(relocated, captured, True, installation)
             return ResolvedSessionTranscript(relocated, "same_inode_lookup", False)
         try:
-            records, _size, _current = _open_session_prefix(original, captured, False)
+            descriptor = _open_transcript_file(original, installation)
+            try:
+                current = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+        except (OSError, ValueError) as error:
+            raise ValueError("session_binding_unavailable") from error
+        if current.st_dev == captured["device"] and current.st_ino == captured["inode"]:
+            raise ValueError("transcript_changed")
+        try:
+            records, _size, _current = _open_session_prefix(
+                original, captured, False, installation
+            )
         except (OSError, ValueError) as error:
             raise ValueError("session_binding_unavailable") from error
         if _has_embedded_session_id(records, str(event["session_id"])):
@@ -1983,7 +2079,10 @@ def inspect_session_structure_v2(
     event = observation["event"]
     assert isinstance(captured, dict) and isinstance(event, dict)
     records, captured_size, current_size = _open_session_prefix(
-        resolved.path, captured, resolved.binding_mode != "embedded_session_id"
+        resolved.path,
+        captured,
+        resolved.binding_mode != "embedded_session_id",
+        installation,
     )
     structure = discover_session_structure(
         records,
