@@ -300,6 +300,43 @@ class SessionStopV2Tests(unittest.TestCase):
                 )
                 self.assertNotIn("private-event-secret", json.dumps(report))
 
+    def test_v2_promotion_rejects_malformed_success_observation_schema(self) -> None:
+        cases = {
+            "extra_top": lambda observation: observation.update(
+                {"private-top-secret": "value"}
+            ),
+            "received_at": lambda observation: observation.update(
+                {"received_at_ns": "private-time-secret"}
+            ),
+            "extra_stat": lambda observation: observation["transcript_stat"].update(
+                {"private-stat-secret": True}
+            ),
+            "missing_stat": lambda observation: observation["transcript_stat"].pop("inode"),
+        }
+        for name, tamper in cases.items():
+            with self.subTest(name=name):
+                self.runtime.mark_session_surface_boundary(self.installation, "cli")
+                first = self.runtime.capture_session_stop(
+                    self.installation, json.dumps(self.payload).encode()
+                )
+                self.capture({**self.payload, "session_id": f"session-secret-{name}"})
+                stored = json.loads(first.read_text(encoding="utf-8"))
+                tamper(stored)
+                self.runtime.atomic_write_json(first, stored)
+                report = self.runtime.promote_session_stop_v2(
+                    self.installation,
+                    "cli",
+                    self.root / f"session-stop-cli-{name}.v2.structure.json",
+                )
+                self.assertFalse(report["capture_supported"])
+                self.assertEqual(
+                    report["capture_error_codes"],
+                    ["session_stop_observation_unavailable"],
+                )
+                self.assertNotIn("private-top-secret", json.dumps(report))
+                self.assertNotIn("private-time-secret", json.dumps(report))
+                self.assertNotIn("private-stat-secret", json.dumps(report))
+
     def test_v2_promotion_sanitizes_deeply_nested_stored_observation(self) -> None:
         self.runtime.mark_session_surface_boundary(self.installation, "cli")
         nested = (

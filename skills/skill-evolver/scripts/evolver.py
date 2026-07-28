@@ -582,6 +582,52 @@ def session_stop_event_session_id(event: object) -> Optional[str]:
     return session_id
 
 
+def valid_session_transcript_stat(transcript_stat: object) -> bool:
+    if not isinstance(transcript_stat, dict) or set(transcript_stat) != {
+        "size",
+        "mtime_ns",
+        "device",
+        "inode",
+        "regular",
+        "owned_by_current_user",
+    }:
+        return False
+    return (
+        type(transcript_stat["size"]) is int
+        and type(transcript_stat["mtime_ns"]) is int
+        and type(transcript_stat["device"]) is int
+        and type(transcript_stat["inode"]) is int
+        and type(transcript_stat["regular"]) is bool
+        and type(transcript_stat["owned_by_current_user"]) is bool
+        and transcript_stat["regular"] is True
+        and transcript_stat["owned_by_current_user"] is True
+    )
+
+
+def valid_session_stop_observation(
+    observation: object, installation: Installation
+) -> bool:
+    if not isinstance(observation, dict) or set(observation) != {
+        "schema_version",
+        "received_at_ns",
+        "installation_nonce",
+        "shape",
+        "event",
+        "transcript_stat",
+    }:
+        return False
+    return (
+        type(observation["schema_version"]) is int
+        and observation["schema_version"] == 2
+        and type(observation["received_at_ns"]) is int
+        and type(observation["installation_nonce"]) is str
+        and observation["installation_nonce"] == installation.nonce
+        and valid_session_hook_shape(observation["shape"])
+        and session_stop_event_session_id(observation["event"]) is not None
+        and valid_session_transcript_stat(observation["transcript_stat"])
+    )
+
+
 def stat_transcript(path: Path) -> dict[str, object]:
     flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(str(path), flags)
@@ -1075,6 +1121,8 @@ def promote_session_stop_v2(
             raise ValueError("session_stop_observation_unavailable") from error
         if not all(isinstance(item, dict) and item.get("schema_version") == 2 for item in observations):
             raise ValueError("invalid_session_stop_observation")
+        if not all(valid_session_stop_observation(item, installation) for item in observations):
+            raise ValueError("session_stop_observation_unavailable")
         nonce_matches = all(
             item.get("installation_nonce") == installation.nonce for item in observations
         )
