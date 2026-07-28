@@ -823,6 +823,49 @@ def validate_observation(path: Path) -> Path:
     return path
 
 
+def read_bounded_private_json(path: Path, limit: int = MAX_STDIN_BYTES) -> object:
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(str(path), flags)
+        try:
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_size > limit
+            ):
+                raise ValueError("session_stop_observation_unavailable")
+            chunks: list[bytes] = []
+            remaining = limit + 1
+            while remaining:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if remaining == 0:
+                raise ValueError("session_stop_observation_unavailable")
+        finally:
+            os.close(descriptor)
+        return json.loads(b"".join(chunks).decode("utf-8"))
+    except Exception as error:
+        raise ValueError("session_stop_observation_unavailable") from error
+
+
+def is_session_observation_name(name: str) -> bool:
+    if len(name) > 128 or not name.endswith(".json"):
+        return False
+    parts = name.removesuffix(".json").split("-")
+    return (
+        len(parts) == 3
+        and all(parts[:2])
+        and all("0" <= character <= "9" for part in parts[:2] for character in part)
+        and len(parts[2]) == 8
+        and all(character in "0123456789abcdef" for character in parts[2])
+    )
+
+
 def observation_paths(installation: Installation) -> list[Path]:
     return [
         validate_observation(path)
@@ -831,9 +874,12 @@ def observation_paths(installation: Installation) -> list[Path]:
 
 
 def session_observation_paths(installation: Installation) -> list[Path]:
+    paths = sorted(session_incoming_directory(installation).glob("*.json"))
+    if any(not is_session_observation_name(path.name) for path in paths):
+        raise ValueError("session_stop_observation_unavailable")
     return [
         validate_observation(path)
-        for path in sorted(session_incoming_directory(installation).glob("*.json"))
+        for path in paths
     ]
 
 
@@ -1008,14 +1054,9 @@ def session_surface_observations(
 ) -> list[Path]:
     surface = validate_surface(surface)
     observations = session_observation_paths(installation)
-    try:
-        marker = json.loads(
-            (
-                installation.data_root / "reports" / f"{surface}-v2-session-boundary.json"
-            ).read_text(encoding="utf-8")
-        )
-    except Exception as error:
-        raise ValueError("session_stop_observation_unavailable") from error
+    marker = read_bounded_private_json(
+        installation.data_root / "reports" / f"{surface}-v2-session-boundary.json"
+    )
     if (
         not isinstance(marker, dict)
         or set(marker) != {"schema_version", "surface", "installation_nonce", "after"}
@@ -1141,7 +1182,7 @@ def promote_session_stop_v2(
     try:
         paths = session_surface_observations(installation, surface)
         try:
-            observations = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+            observations = [read_bounded_private_json(path) for path in paths]
         except Exception as error:
             raise ValueError("session_stop_observation_unavailable") from error
         if not all(isinstance(item, dict) and item.get("schema_version") == 2 for item in observations):

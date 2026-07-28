@@ -387,6 +387,57 @@ class SessionStopV2Tests(unittest.TestCase):
                 )
                 self.assertNotIn("marker-", json.dumps(report))
 
+    def test_v2_promotion_rejects_oversized_marker_and_observation(self) -> None:
+        marker = self.installation.data_root / "reports" / "cli-v2-session-boundary.json"
+        self.runtime.mark_session_surface_boundary(self.installation, "cli")
+        marker.write_bytes(b"x" * 65_537)
+        marker_output = self.root / "session-stop-cli-marker.v2.structure.json"
+        marker_report = self.runtime.promote_session_stop_v2(
+            self.installation, "cli", marker_output
+        )
+        self.assertTrue(marker_output.is_file())
+        self.assertFalse(marker_report["capture_supported"])
+        self.assertEqual(
+            marker_report["capture_error_codes"],
+            ["session_stop_observation_unavailable"],
+        )
+
+        self.runtime.mark_session_surface_boundary(self.installation, "cli")
+        oversized = (
+            self.installation.data_root / "incoming-v2" / "1-1-deadbeef.json"
+        )
+        oversized.write_bytes(b"x" * 65_537)
+        oversized.chmod(0o600)
+        self.capture({**self.payload, "session_id": "session-secret-two"})
+        observation_output = self.root / "session-stop-cli-observation.v2.structure.json"
+        observation_report = self.runtime.promote_session_stop_v2(
+            self.installation, "cli", observation_output
+        )
+        self.assertTrue(observation_output.is_file())
+        self.assertFalse(observation_report["capture_supported"])
+        self.assertEqual(
+            observation_report["capture_error_codes"],
+            ["session_stop_observation_unavailable"],
+        )
+
+    def test_v2_promotion_rejects_non_hook_observation_filename(self) -> None:
+        self.runtime.mark_session_surface_boundary(self.installation, "cli")
+        crafted = self.installation.data_root / "incoming-v2" / "private-name-secret.json"
+        crafted.write_text("{}", encoding="utf-8")
+        crafted.chmod(0o600)
+        output = self.root / "session-stop-cli.v2.structure.json"
+        report = self.runtime.promote_session_stop_v2(self.installation, "cli", output)
+        self.assertTrue(output.is_file())
+        self.assertFalse(report["capture_supported"])
+        self.assertEqual(
+            report["capture_error_codes"],
+            ["session_stop_observation_unavailable"],
+        )
+        self.assertNotIn("private-name-secret", json.dumps(report))
+        self.assertFalse(
+            (self.installation.data_root / "reports" / "cli-v2-session-observation.json").exists()
+        )
+
     def test_v2_promotion_sanitizes_tampered_capture_error(self) -> None:
         self.runtime.mark_session_surface_boundary(self.installation, "cli")
         first = self.runtime.capture_session_stop(
