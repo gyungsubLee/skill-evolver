@@ -3747,16 +3747,23 @@ def scrub_probe_raw(
     incoming = validate_private_child_directory(
         installation.data_root / "incoming"
     )
+    incoming_v2 = validate_private_child_directory(
+        installation.data_root / "incoming-v2"
+    )
     reports = validate_private_child_directory(
         installation.data_root / "reports"
     )
-    observations = sorted(
-        {
-            path
-            for pattern in ("*.json", ".*.json.*")
-            for path in incoming.glob(pattern)
-        }
-    )
+    observations = [
+        validate_scrub_target(path, directory)
+        for directory in (incoming, incoming_v2)
+        for path in sorted(
+            {
+                path
+                for pattern in ("*.json", ".*.json.*")
+                for path in directory.glob(pattern)
+            }
+        )
+    ]
     ephemeral_reports = sorted(
         {
             path
@@ -3769,14 +3776,21 @@ def scrub_probe_raw(
                 ".*-skill-challenge.json.*",
                 "*-skill-response.json",
                 ".*-skill-response.json.*",
+                "*-v2-session-boundary.json",
+                ".*-v2-session-boundary.json.*",
+                "*-v2-session-mapping.json",
+                ".*-v2-session-mapping.json.*",
+                "*-v2-access-challenge.json",
+                ".*-v2-access-challenge.json.*",
+                "*-v2-default-response.json",
+                ".*-v2-default-response.json.*",
+                "*-v2-explicit-response.json",
+                ".*-v2-explicit-response.json.*",
+                "*-v2-access.lock",
             )
             for path in reports.glob(pattern)
         }
     )
-    observations = [
-        validate_scrub_target(path, incoming)
-        for path in observations
-    ]
     ephemeral_reports = [
         validate_scrub_target(path, reports)
         for path in ephemeral_reports
@@ -3786,6 +3800,7 @@ def scrub_probe_raw(
     for path in ephemeral_reports:
         path.unlink()
     fsync_directory(incoming)
+    fsync_directory(incoming_v2)
     fsync_directory(reports)
     return {
         "observations_deleted": len(observations),
@@ -3828,6 +3843,33 @@ def cmd_probe_list(args: argparse.Namespace) -> int:
             "observations": [
                 {"name": path.name, "size": path.stat().st_size}
                 for path in observation_paths(installation)
+            ]
+        }
+    )
+    return 0
+
+
+def cmd_probe_v2_status(args: argparse.Namespace) -> int:
+    installation = load_installation(Path(args.installation))
+    observations = session_observation_paths(installation)
+    write_json_stdout(
+        {
+            "status": "ready",
+            "shared_nonce_present": bool(installation.nonce),
+            "observation_count": len(observations),
+            "latest_observation": observations[-1].name if observations else None,
+        }
+    )
+    return 0
+
+
+def cmd_probe_v2_list(args: argparse.Namespace) -> int:
+    installation = load_installation(Path(args.installation))
+    write_json_stdout(
+        {
+            "observations": [
+                {"name": path.name, "size": path.stat().st_size}
+                for path in session_observation_paths(installation)
             ]
         }
     )
@@ -3999,6 +4041,14 @@ def build_parser() -> argparse.ArgumentParser:
     probe_list = subparsers.add_parser("probe-list")
     probe_list.add_argument("--installation", required=True)
     probe_list.set_defaults(handler=cmd_probe_list)
+
+    probe_v2_status = subparsers.add_parser("probe-v2-status")
+    probe_v2_status.add_argument("--installation", required=True)
+    probe_v2_status.set_defaults(handler=cmd_probe_v2_status)
+
+    probe_v2_list = subparsers.add_parser("probe-v2-list")
+    probe_v2_list.add_argument("--installation", required=True)
+    probe_v2_list.set_defaults(handler=cmd_probe_v2_list)
 
     arm_preflight = subparsers.add_parser("probe-arm-skill-preflight")
     arm_preflight.add_argument("--installation", required=True)

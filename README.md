@@ -29,6 +29,14 @@ codex plugin marketplace add /Users/igyeongseob/Documents/오픈소스 --json
 codex plugin add skill-evolver@skill-evolver-dev --json
 ```
 
+Inspect only validated v2 observation metadata; these commands never open an
+observation or transcript body:
+
+```bash
+/usr/bin/python3 -I "$EVOLVER" probe-v2-status --installation "$INSTALLATION"
+/usr/bin/python3 -I "$EVOLVER" probe-v2-list --installation "$INSTALLATION"
+```
+
 ## Per-surface access evidence
 
 For each `SURFACE` below, run the arm command in the user terminal. Then run the

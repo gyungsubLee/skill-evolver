@@ -21,8 +21,8 @@ Supported user-facing actions:
 Only when the user explicitly names $skill-evolver, support these v2 probe
 actions; status and list do not open transcripts.
 
-- `$skill-evolver probe status` → run `probe-status`.
-- `$skill-evolver probe list` → run `probe-list`.
+- `$skill-evolver probe status` → run `probe-v2-status`.
+- `$skill-evolver probe list` → run `probe-v2-list`.
 - `$skill-evolver probe access default <surface>` → run
   `probe-v2-default-access --surface <surface> --output <caller-safe-output>`.
   The default preflight runs without elevation and writes its sanitized response
