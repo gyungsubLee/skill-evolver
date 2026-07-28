@@ -413,6 +413,87 @@ class GateV2Tests(unittest.TestCase):
         self.assertIn("Decision: **PASS**", markdown_path.read_text(encoding="utf-8"))
         self.assertFalse((output / ".feasibility-report-v2.transaction.json").exists())
 
+    def test_recovery_restarts_after_interrupt_during_first_restore(self) -> None:
+        fixtures = self.root / "fixtures"
+        self.write_fixtures(fixtures)
+        output = self.root / "output"
+        output.mkdir(mode=0o700)
+        json_path = output / "feasibility-report-v2.json"
+        markdown_path = output / "feasibility-report-v2.md"
+        self._simulate_crashed_pair(output, json_path, markdown_path, replace_markdown=True)
+        original_replace = self.runtime.os.replace
+        interrupted = False
+
+        def interrupt_first_restore(source, destination):
+            nonlocal interrupted
+            result = original_replace(source, destination)
+            if Path(destination) == json_path and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt()
+            return result
+
+        with mock.patch.object(self.runtime.os, "replace", side_effect=interrupt_first_restore):
+            with self.assertRaises(KeyboardInterrupt):
+                self.runtime._recover_gate_v2_transaction(output, json_path, markdown_path)
+        self.assertTrue((output / ".feasibility-report-v2.transaction.json").exists())
+
+        report = self.write_report(fixtures, output)
+
+        self.assertEqual(json.loads(json_path.read_text(encoding="utf-8")), report)
+        self.assertIn("Decision: **PASS**", markdown_path.read_text(encoding="utf-8"))
+
+    def test_recovery_with_a_missing_backup_does_not_mutate_either_destination(self) -> None:
+        fixtures = self.root / "fixtures"
+        self.write_fixtures(fixtures)
+        output = self.root / "output"
+        output.mkdir(mode=0o700)
+        json_path = output / "feasibility-report-v2.json"
+        markdown_path = output / "feasibility-report-v2.md"
+        self._simulate_crashed_pair(output, json_path, markdown_path, replace_markdown=False)
+        (output / ".feasibility-report-v2.md.backup.crash").unlink()
+        before_json, before_markdown = json_path.read_bytes(), markdown_path.read_bytes()
+
+        with self.assertRaises(ValueError):
+            self.write_report(fixtures, output)
+
+        self.assertEqual(json_path.read_bytes(), before_json)
+        self.assertEqual(markdown_path.read_bytes(), before_markdown)
+        self.assertTrue((output / ".feasibility-report-v2.transaction.json").exists())
+
+    def test_recovery_restarts_after_interrupt_before_marker_removal(self) -> None:
+        output = self.root / "output"
+        output.mkdir(mode=0o700)
+        json_path = output / "feasibility-report-v2.json"
+        markdown_path = output / "feasibility-report-v2.md"
+        self._simulate_crashed_pair(output, json_path, markdown_path, replace_markdown=True)
+        marker = output / ".feasibility-report-v2.transaction.json"
+        original_unlink = Path.unlink
+        interrupted = False
+
+        def interrupt_marker_unlink(path, *args, **kwargs):
+            nonlocal interrupted
+            if path == marker and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt()
+            return original_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(
+            self.runtime.Path,
+            "unlink",
+            autospec=True,
+            side_effect=interrupt_marker_unlink,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.runtime._recover_gate_v2_transaction(output, json_path, markdown_path)
+        self.assertTrue(marker.exists())
+        self.assertEqual(json_path.read_bytes(), b'{"old":true}\n')
+        self.assertEqual(markdown_path.read_bytes(), b"old markdown\n")
+
+        self.assertTrue(self.runtime._recover_gate_v2_transaction(output, json_path, markdown_path))
+        self.assertFalse(marker.exists())
+        self.assertEqual(json_path.read_bytes(), b'{"old":true}\n')
+        self.assertEqual(markdown_path.read_bytes(), b"old markdown\n")
+
     def test_malformed_or_symlinked_transaction_marker_fails_closed(self) -> None:
         fixtures = self.root / "fixtures"
         self.write_fixtures(fixtures)

@@ -3455,23 +3455,48 @@ def _recover_gate_v2_transaction(
     if entries is None:
         return False
     marker = parent / GATE_V2_TRANSACTION_NAME
-    for name, destination in (("json", json_path), ("markdown", markdown_path)):
-        entry = entries[name]
-        if entry["prior_present"] is True:
-            backup = parent / str(entry["backup"])
-            _stable_private_file_bytes(backup, fixture=False)
-            os.replace(backup, destination)
-            os.chmod(destination, int(entry["prior_mode"]))
-        else:
-            destination.unlink(missing_ok=True)
-    fsync_directory(parent)
-    marker.unlink()
-    fsync_directory(parent)
-    for entry in entries.values():
-        _clean_gate_v2_transaction_file(parent, entry["stage"])
-        _clean_gate_v2_transaction_file(parent, entry["backup"])
-    fsync_directory(parent)
-    return True
+    restore_stages: dict[Path, Path] = {}
+    backups: dict[Path, bytes] = {}
+    destinations = (("json", json_path), ("markdown", markdown_path))
+    try:
+        for name, destination in destinations:
+            entry = entries[name]
+            if entry["prior_present"] is True:
+                backup = parent / str(entry["backup"])
+                info = backup.lstat()
+                if stat.S_IMODE(info.st_mode) != int(entry["prior_mode"]):
+                    raise ValueError("gate_inputs_invalid")
+                backups[destination] = _stable_private_file_bytes(backup, fixture=False)
+        for name, destination in destinations:
+            entry = entries[name]
+            if entry["prior_present"] is True:
+                restore_stages[destination] = _stage_gate_v2_file(
+                    parent,
+                    f"{destination.name}.restore",
+                    backups[destination],
+                    int(entry["prior_mode"]),
+                )
+        fsync_directory(parent)
+        for name, destination in destinations:
+            entry = entries[name]
+            if entry["prior_present"] is True:
+                os.replace(restore_stages[destination], destination)
+                os.chmod(destination, int(entry["prior_mode"]))
+            else:
+                destination.unlink(missing_ok=True)
+        fsync_directory(parent)
+        marker.unlink()
+        fsync_directory(parent)
+        for entry in entries.values():
+            _clean_gate_v2_transaction_file(parent, entry["stage"])
+            _clean_gate_v2_transaction_file(parent, entry["backup"])
+        fsync_directory(parent)
+        return True
+    except OSError:
+        raise ValueError("gate_inputs_invalid") from None
+    finally:
+        for stage in restore_stages.values():
+            stage.unlink(missing_ok=True)
 
 
 def _publish_gate_v2_pair(
