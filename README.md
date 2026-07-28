@@ -37,6 +37,23 @@ observation or transcript body:
 /usr/bin/python3 -I "$EVOLVER" probe-v2-list --installation "$INSTALLATION"
 ```
 
+## Review and trust the Stop Hook before probe sessions
+
+When the plugin Stop Hook code is new or changed, Codex compares its current
+hash with the persisted trust record. An older trusted hash means that Codex
+skips the enabled Hook, which can leave a probe session without an observation.
+Before creating probe evidence, inspect the installed plugin cache and this
+repository's Hook source, then start interactive Codex, use `/hooks`, and review
+and trust exactly `skill-evolver@skill-evolver-dev:hooks/hooks.json:stop:0:0`.
+This is the preferred trust mode for the CLI commands below.
+
+For controlled automation only, after vetting every enabled Hook for that
+invocation, add `--dangerously-bypass-hook-trust` to each `codex exec` command.
+The flag bypasses persisted Hook trust only for that invocation; it is not a
+permanent or broad trust setting. It also does not elevate filesystem access:
+keep the intended `--sandbox workspace-write` (or another explicitly selected
+sandbox) in the command.
+
 ## Per-surface access evidence
 
 For each `SURFACE` below, run the arm command in the user terminal. Then run the
@@ -95,14 +112,17 @@ access to `/Users/igyeongseob/.codex/skill-evolver-feasibility-v2`.
 ## Capture two independent sessions and promote fixtures
 
 For each surface, mark before creating evidence. Run the two CLI commands as
-two separate terminal processes; do not resume, fork, or reuse a session.
+two separate terminal processes; do not resume, fork, or reuse a session. The
+commands use the preferred trusted-handler mode (no bypass flag).
 
 ```bash
 /usr/bin/python3 -I "$EVOLVER" probe-v2-mark-surface \
   --installation "$INSTALLATION" --surface cli
+# Trusted-handler mode (preferred): Hook reviewed and trusted interactively.
 codex exec --sandbox workspace-write \
   -C /Users/igyeongseob/Documents/오픈소스/skill-evolver \
   "Use the shell to run pwd once, then reply with only probe-cli-session-one."
+# Trusted-handler mode (preferred): Hook reviewed and trusted interactively.
 codex exec --sandbox workspace-write \
   -C /Users/igyeongseob/Documents/오픈소스/skill-evolver \
   "Use the shell to run pwd once, then reply with only probe-cli-session-two."
@@ -116,6 +136,19 @@ codex exec --sandbox workspace-write \
   --installation "$INSTALLATION" --surface cli \
   --default-response "$PLUGIN_ROOT/.skill-evolver-default-access-cli.json" \
   --output "$FIXTURE_ROOT/access-cli.v2.structure.json"
+```
+
+For controlled automation that has vetted every enabled Hook, replace each
+trusted-handler `codex exec` above with the corresponding per-invocation
+bypass command (the sandbox remains workspace-write):
+
+```bash
+codex exec --dangerously-bypass-hook-trust --sandbox workspace-write \
+  -C /Users/igyeongseob/Documents/오픈소스/skill-evolver \
+  "Use the shell to run pwd once, then reply with only probe-cli-session-one."
+codex exec --dangerously-bypass-hook-trust --sandbox workspace-write \
+  -C /Users/igyeongseob/Documents/오픈소스/skill-evolver \
+  "Use the shell to run pwd once, then reply with only probe-cli-session-two."
 ```
 
 For Desktop, mark before using two separate new Desktop tasks. In each task,
