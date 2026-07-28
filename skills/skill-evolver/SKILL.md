@@ -41,7 +41,8 @@ actions; status and list do not open transcripts.
   `feasibility-report-v2.md`, while reading the immutable v1 predecessor.
 - `$skill-evolver probe cleanup` → show the exact `probe-scrub` command, then
   require the user to run it externally in a TTY and type the exact
-  `DELETE-FEASIBILITY-RAW` confirmation.
+  `DELETE-FEASIBILITY-RAW` confirmation. Its durable completion marker permits
+  a cleanup retry but permanently disables v2 raw-state writers.
 
 Never invoke after an ordinary task. Do not copy raw observations into chat.
 Do not claim feasibility passed unless `probe-v2-gate` exits 0 and both v2

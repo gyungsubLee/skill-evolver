@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
 from argparse import Namespace
 from pathlib import Path
@@ -167,6 +168,149 @@ class SkeletonTests(unittest.TestCase):
                 runtime.scrub_probe_raw(installation, "DELETE-FEASIBILITY-RAW")
             self.assertTrue(raw.exists())
             self.assertTrue(invalid_v2.exists())
+            invalid_v2.rmdir()
+            self.assertEqual(
+                runtime.scrub_probe_raw(installation, "DELETE-FEASIBILITY-RAW"),
+                {"observations_deleted": 1, "ephemeral_reports_deleted": 0},
+            )
+            self.assertFalse(raw.exists())
+
+    def test_v2_writers_stop_after_the_durable_scrub_marker(self) -> None:
+        runtime = load_runtime()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            sessions.mkdir(mode=0o700)
+            transcript = sessions / "session.jsonl"
+            transcript.write_text("private transcript\n", encoding="utf-8")
+            installation_path = runtime.initialize_probe(
+                root / "probe", (sessions,), Path("/usr/bin/python3")
+            )
+            installation = runtime.load_installation(installation_path)
+            runtime.atomic_write_json(
+                installation.data_root / runtime.V2_SCRUB_MARKER,
+                {"schema_version": 2, "scrubbed": True},
+            )
+            payload = {
+                "hook_event_name": "Stop",
+                "session_id": "private-session",
+                "transcript_path": str(transcript),
+                "cwd": str(root),
+            }
+
+            with self.assertRaisesRegex(ValueError, "v2_probe_scrubbed"):
+                runtime.capture_session_stop(installation, json.dumps(payload).encode())
+            with self.assertRaisesRegex(ValueError, "access_evidence_unavailable"):
+                runtime.arm_access_v2(installation, "cli")
+            result = run_isolated(
+                "probe-v2-stop",
+                "--installation",
+                str(installation_path),
+                stdin=json.dumps(payload).encode(),
+            )
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, b"")
+            self.assertEqual(result.stderr, b"")
+            self.assertEqual(runtime.session_observation_paths(installation), [])
+
+    def test_scrub_holds_the_v2_barrier_and_deletes_through_open_directories(self) -> None:
+        runtime = load_runtime()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            sessions.mkdir(mode=0o700)
+            installation_path = runtime.initialize_probe(
+                root / "probe", (sessions,), Path("/usr/bin/python3")
+            )
+            installation = runtime.load_installation(installation_path)
+            incoming = installation.data_root / "incoming"
+            reports = installation.data_root / "reports"
+            runtime.atomic_write_json(incoming / "raw.json", {"raw": True})
+            runtime.atomic_write_json(
+                reports / "cli-v2-session-boundary.json", {"raw": True}
+            )
+            outside_incoming = root / "outside-incoming"
+            outside_reports = root / "outside-reports"
+            outside_incoming.mkdir(mode=0o700)
+            outside_reports.mkdir(mode=0o700)
+            incoming_sentinel = outside_incoming / "raw.json"
+            report_sentinel = outside_reports / "cli-v2-session-boundary.json"
+            runtime.atomic_write_json(incoming_sentinel, {"outside": True})
+            runtime.atomic_write_json(report_sentinel, {"outside": True})
+            original_listdir = runtime.os.listdir
+            calls = 0
+
+            def swap_after_open(descriptor: int):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    incoming.rename(installation.data_root / "incoming-moved")
+                    incoming.symlink_to(outside_incoming, target_is_directory=True)
+                elif calls == 3:
+                    reports.rename(installation.data_root / "reports-moved")
+                    reports.symlink_to(outside_reports, target_is_directory=True)
+                return original_listdir(descriptor)
+
+            with mock.patch.object(runtime.os, "listdir", side_effect=swap_after_open):
+                self.assertEqual(
+                    runtime.scrub_probe_raw(installation, "DELETE-FEASIBILITY-RAW"),
+                    {"observations_deleted": 1, "ephemeral_reports_deleted": 1},
+                )
+            self.assertTrue(incoming_sentinel.exists())
+            self.assertTrue(report_sentinel.exists())
+
+    def test_scrub_marker_blocks_concurrent_v2_access_recreation(self) -> None:
+        runtime = load_runtime()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            sessions.mkdir(mode=0o700)
+            installation_path = runtime.initialize_probe(
+                root / "probe", (sessions,), Path("/usr/bin/python3")
+            )
+            installation = runtime.load_installation(installation_path)
+            raw = installation.data_root / "incoming-v2" / "1-2-deadbeef.json"
+            runtime.atomic_write_json(raw, {"raw": True})
+            entered = threading.Event()
+            release = threading.Event()
+            original_unlink = runtime.unlink_scrub_target
+
+            def pause_after_validation(*args):
+                entered.set()
+                self.assertTrue(release.wait(2))
+                return original_unlink(*args)
+
+            outcome: list[object] = []
+            with mock.patch.object(runtime, "unlink_scrub_target", side_effect=pause_after_validation):
+                worker = threading.Thread(
+                    target=lambda: outcome.append(
+                        runtime.scrub_probe_raw(installation, "DELETE-FEASIBILITY-RAW")
+                    )
+                )
+                worker.start()
+                self.assertTrue(entered.wait(2))
+                writer_outcome: list[object] = []
+
+                def arm() -> None:
+                    try:
+                        runtime.arm_access_v2(installation, "cli")
+                    except ValueError as error:
+                        writer_outcome.append(str(error))
+
+                writer = threading.Thread(target=arm)
+                writer.start()
+                self.assertTrue(writer.is_alive())
+                release.set()
+                worker.join(2)
+                writer.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertFalse(writer.is_alive())
+            self.assertEqual(writer_outcome, ["access_evidence_unavailable"])
+            self.assertEqual(
+                outcome,
+                [{"observations_deleted": 1, "ephemeral_reports_deleted": 0}],
+            )
+            self.assertFalse(raw.exists())
 
     def test_probe_stop_is_silent_and_fail_open(self) -> None:
         malformed = run_isolated("probe-stop", "--installation", "/missing/file", stdin=b"{")

@@ -163,7 +163,9 @@ only the two v2 output names below.
 ```
 
 Before raw cleanup, remove the plugin and marketplace entry. Finally run scrub
-in a TTY and type exactly `DELETE-FEASIBILITY-RAW` at its prompt.
+in a TTY and type exactly `DELETE-FEASIBILITY-RAW` at its prompt. Scrub leaves
+a durable private completion marker: a retry is allowed if cleanup was
+interrupted, but no v2 capture or access writer can recreate raw state after it.
 
 ```bash
 codex plugin remove skill-evolver@skill-evolver-dev --json

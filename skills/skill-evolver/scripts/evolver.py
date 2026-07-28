@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import fnmatch
 import hashlib
 import json
 import os
@@ -16,6 +17,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Iterator, Optional, Sequence, TextIO
+
+ORIGINAL_FSTAT = os.fstat
 
 VERSION = "skill-evolver feasibility 0.0.2"
 MAX_STDIN_BYTES = 65_536
@@ -50,6 +53,8 @@ MAX_TRANSCRIPT_PROBE_BYTES = 2_097_152
 MAX_TRANSCRIPT_LOOKUP_ENTRIES = 4096
 MAX_GATE_FIXTURE_BYTES = 65_536
 SCRUB_CONFIRMATION = "DELETE-FEASIBILITY-RAW"
+V2_STATE_LOCK = ".v2-state.lock"
+V2_SCRUB_MARKER = ".v2-scrubbed.json"
 REVIEWED_STOP_PAYLOAD_KEYS = frozenset(
     {
         "cwd",
@@ -206,6 +211,65 @@ def fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def ensure_private_regular(path: Path) -> None:
+    descriptor = os.open(
+        str(path),
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        info = ORIGINAL_FSTAT(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise ValueError("v2_lifecycle_lock_unavailable")
+    finally:
+        os.close(descriptor)
+
+
+def ensure_v2_lifecycle_files(root: Path) -> None:
+    ensure_private_regular(root / V2_STATE_LOCK)
+
+
+@contextmanager
+def v2_state_lock(
+    installation: Installation,
+    *,
+    exclusive: bool,
+    allow_scrubbed: bool = False,
+) -> Iterator[None]:
+    root = validate_private_directory(installation.data_root)
+    path = root / V2_STATE_LOCK
+    descriptor = os.open(
+        str(path),
+        (os.O_RDWR if exclusive else os.O_RDONLY) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    locked = False
+    try:
+        info = ORIGINAL_FSTAT(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise ValueError("v2_lifecycle_lock_unavailable")
+        fcntl.flock(descriptor, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        locked = True
+        marker = root / V2_SCRUB_MARKER
+        if not allow_scrubbed and (marker.exists() or marker.is_symlink()):
+            raise ValueError("v2_probe_scrubbed")
+        yield
+    finally:
+        try:
+            if locked:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
 def atomic_write_json(path: Path, payload: dict[str, object], mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -340,6 +404,7 @@ def initialize_probe(
         if not directory.exists():
             directory.mkdir(mode=0o700)
         validate_private_child_directory(directory)
+    ensure_v2_lifecycle_files(root)
     nonce = secrets.token_hex(32)
     atomic_write_json(
         installation_path,
@@ -402,7 +467,7 @@ def load_installation(path: Path) -> Installation:
     validate_transcript_separation(root, transcript_roots)
     if payload.get("python") != "/usr/bin/python3":
         raise ValueError("unsupported_python")
-    for child in ("incoming", "reports"):
+    for child in ("incoming", "incoming-v2", "reports"):
         validate_private_child_directory(root / child)
     nonce_path = validate_private_nonce(root / "nonce.json")
     nonce_payload = json.loads(nonce_path.read_text(encoding="utf-8"))
@@ -782,7 +847,7 @@ def session_incoming_directory(installation: Installation) -> Path:
     return validate_private_child_directory(path)
 
 
-def capture_session_stop(installation: Installation, raw: bytes) -> Path:
+def _capture_session_stop_unlocked(installation: Installation, raw: bytes) -> Path:
     observation: dict[str, object] = {
         "schema_version": 2,
         "received_at_ns": time.time_ns(),
@@ -811,6 +876,11 @@ def capture_session_stop(installation: Installation, raw: bytes) -> Path:
     )
     atomic_write_json(destination, observation)
     return destination
+
+
+def capture_session_stop(installation: Installation, raw: bytes) -> Path:
+    with v2_state_lock(installation, exclusive=True):
+        return _capture_session_stop_unlocked(installation, raw)
 
 
 def cmd_probe_stop(args: argparse.Namespace) -> int:
@@ -1056,22 +1126,23 @@ def load_access_challenge_v2(
 def arm_access_v2(installation: Installation, surface: str) -> dict[str, object]:
     surface = validate_surface(surface)
     try:
-        with access_generation_lock(installation, surface):
-            for path in (
-                access_default_response_path(installation, surface),
-                access_explicit_response_path(installation, surface),
-            ):
-                path.unlink(missing_ok=True)
-            challenge = secrets.token_hex(32)
-            atomic_write_json(
-                access_challenge_path(installation, surface),
-                {
-                    "schema_version": 2,
-                    "surface": surface,
-                    "installation_nonce": installation.nonce,
-                    "challenge": challenge,
-                },
-            )
+        with v2_state_lock(installation, exclusive=True):
+            with access_generation_lock(installation, surface):
+                for path in (
+                    access_default_response_path(installation, surface),
+                    access_explicit_response_path(installation, surface),
+                ):
+                    path.unlink(missing_ok=True)
+                challenge = secrets.token_hex(32)
+                atomic_write_json(
+                    access_challenge_path(installation, surface),
+                    {
+                        "schema_version": 2,
+                        "surface": surface,
+                        "installation_nonce": installation.nonce,
+                        "challenge": challenge,
+                    },
+                )
     except (OSError, ValueError) as error:
         raise ValueError(ACCESS_EVIDENCE_ERROR) from error
     return {
@@ -1119,7 +1190,7 @@ def write_access_result(output: Path, result: dict[str, object]) -> None:
     atomic_write_json(resolve_report_output(output), result)
 
 
-def run_default_access_v2(
+def _run_default_access_v2_locked(
     installation: Installation,
     surface: str,
     output: Path,
@@ -1148,7 +1219,23 @@ def run_default_access_v2(
     return result
 
 
-def run_explicit_access_v2(
+def run_default_access_v2(
+    installation: Installation,
+    surface: str,
+    output: Path,
+) -> dict[str, object]:
+    try:
+        with v2_state_lock(installation, exclusive=False):
+            return _run_default_access_v2_locked(installation, surface, output)
+    except (OSError, ValueError):
+        result = access_result(
+            surface, False, False, False, None, [ACCESS_CHALLENGE_ERROR]
+        )
+        write_access_result(output, result)
+        return result
+
+
+def _run_explicit_access_v2_locked(
     installation: Installation,
     surface: str,
 ) -> dict[str, object]:
@@ -1172,6 +1259,20 @@ def run_explicit_access_v2(
             surface, True, False, False, digest, [ACCESS_GLOBAL_WRITE_ERROR]
         )
     return result
+
+
+def run_explicit_access_v2(
+    installation: Installation,
+    surface: str,
+) -> dict[str, object]:
+    try:
+        with v2_state_lock(installation, exclusive=True):
+            with access_generation_lock(installation, surface):
+                return _run_explicit_access_v2_locked(installation, surface)
+    except (OSError, ValueError):
+        return access_result(
+            surface, False, False, False, None, [ACCESS_CHALLENGE_ERROR]
+        )
 
 
 def has_successful_session_stop_evidence(
@@ -1227,34 +1328,35 @@ def promote_access_v2(
 ) -> dict[str, object]:
     surface = validate_surface(surface)
     try:
-        with access_generation_lock(installation, surface):
-            challenge = load_access_challenge_v2(installation, surface)
-            digest = challenge_digest(str(challenge["challenge"]))
-            default = read_bounded_private_json(resolve_report_output(default_response))
-            explicit = read_bounded_private_json(
-                access_explicit_response_path(installation, surface)
-            )
-            evidence_ok = (
-                valid_access_result(default, surface, digest, False, True)
-                and valid_access_result(explicit, surface, digest, True, False)
-                and has_successful_session_stop_evidence(installation, surface)
-            )
-            if not evidence_ok:
-                return failed_access_promotion(surface, output)
-            report = {
-                "schema_version": 2,
-                "surface": surface,
-                "hook_global_read": True,
-                "hook_global_write": True,
-                "skill_default_read": True,
-                "skill_default_write": False,
-                "skill_default_write_denied": True,
-                "skill_explicit_read": True,
-                "skill_explicit_write": True,
-                "error_codes": [],
-            }
-            write_access_result(output, report)
-            return report
+        with v2_state_lock(installation, exclusive=False):
+            with access_generation_lock(installation, surface):
+                challenge = load_access_challenge_v2(installation, surface)
+                digest = challenge_digest(str(challenge["challenge"]))
+                default = read_bounded_private_json(resolve_report_output(default_response))
+                explicit = read_bounded_private_json(
+                    access_explicit_response_path(installation, surface)
+                )
+                evidence_ok = (
+                    valid_access_result(default, surface, digest, False, True)
+                    and valid_access_result(explicit, surface, digest, True, False)
+                    and has_successful_session_stop_evidence(installation, surface)
+                )
+                if not evidence_ok:
+                    return failed_access_promotion(surface, output)
+                report = {
+                    "schema_version": 2,
+                    "surface": surface,
+                    "hook_global_read": True,
+                    "hook_global_write": True,
+                    "skill_default_read": True,
+                    "skill_default_write": False,
+                    "skill_default_write_denied": True,
+                    "skill_explicit_read": True,
+                    "skill_explicit_write": True,
+                    "error_codes": [],
+                }
+                write_access_result(output, report)
+                return report
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return failed_access_promotion(surface, output)
 
@@ -1404,17 +1506,18 @@ def mark_session_surface_boundary(
     surface: str,
 ) -> dict[str, object]:
     surface = validate_surface(surface)
-    observations = session_observation_paths(installation)
-    boundary = observations[-1].name if observations else None
-    atomic_write_json(
-        installation.data_root / "reports" / f"{surface}-v2-session-boundary.json",
-        {
-            "schema_version": 2,
-            "surface": surface,
-            "installation_nonce": installation.nonce,
-            "after": boundary,
-        },
-    )
+    with v2_state_lock(installation, exclusive=True):
+        observations = session_observation_paths(installation)
+        boundary = observations[-1].name if observations else None
+        atomic_write_json(
+            installation.data_root / "reports" / f"{surface}-v2-session-boundary.json",
+            {
+                "schema_version": 2,
+                "surface": surface,
+                "installation_nonce": installation.nonce,
+                "after": boundary,
+            },
+        )
     return {"surface": surface, "marked": True}
 
 
@@ -1543,7 +1646,7 @@ def failed_session_stop_promotion(
     return report
 
 
-def promote_session_stop_v2(
+def _promote_session_stop_v2_locked(
     installation: Installation,
     surface: str,
     output: Path,
@@ -1628,6 +1731,15 @@ def promote_session_stop_v2(
             and code in SESSION_STOP_PROMOTION_ERROR_CODES
             else "session_stop_observation_unavailable",
         )
+
+
+def promote_session_stop_v2(
+    installation: Installation,
+    surface: str,
+    output: Path,
+) -> dict[str, object]:
+    with v2_state_lock(installation, exclusive=False):
+        return _promote_session_stop_v2_locked(installation, surface, output)
 
 
 def failed_stop_promotion(
@@ -2431,7 +2543,7 @@ def failed_session_transcript_promotion(surface: str, code: str) -> dict[str, ob
     }
 
 
-def promote_session_transcript_v2(
+def _promote_session_transcript_v2_locked(
     installation: Installation,
     surface: str,
     output: Path,
@@ -2536,6 +2648,15 @@ def promote_session_transcript_v2(
     }
     atomic_write_json(output.resolve(), report)
     return report
+
+
+def promote_session_transcript_v2(
+    installation: Installation,
+    surface: str,
+    output: Path,
+) -> dict[str, object]:
+    with v2_state_lock(installation, exclusive=False):
+        return _promote_session_transcript_v2_locked(installation, surface, output)
 
 
 def is_safe_payload_key(value: object) -> bool:
@@ -3737,75 +3858,109 @@ def validate_scrub_target(path: Path, expected_parent: Path) -> Path:
     return path
 
 
+def open_private_directory_descriptor(path: Path) -> int:
+    descriptor = os.open(
+        str(path),
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            raise ValueError("data_child_permissions")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def scrub_directory_targets(
+    descriptor: int, patterns: tuple[str, ...]
+) -> list[tuple[int, str, os.stat_result]]:
+    targets: list[tuple[int, str, os.stat_result]] = []
+    for name in sorted(name for name in os.listdir(descriptor) if any(
+        fnmatch.fnmatch(name, pattern) for pattern in patterns
+    )):
+        info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError("scrub_target_symlink")
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise ValueError(
+                "scrub_target_not_regular"
+                if not stat.S_ISREG(info.st_mode)
+                else "scrub_target_permissions"
+            )
+        targets.append((descriptor, name, info))
+    return targets
+
+
+def unlink_scrub_target(descriptor: int, name: str, expected: os.stat_result) -> None:
+    info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or (info.st_dev, info.st_ino) != (expected.st_dev, expected.st_ino)
+    ):
+        raise ValueError("scrub_target_changed")
+    os.unlink(name, dir_fd=descriptor)
+
+
 def scrub_probe_raw(
     installation: Installation,
     confirmation: str,
 ) -> dict[str, int]:
     if confirmation != SCRUB_CONFIRMATION:
         raise ValueError("confirmation_mismatch")
-    validate_private_directory(installation.data_root)
-    incoming = validate_private_child_directory(
-        installation.data_root / "incoming"
-    )
-    incoming_v2 = validate_private_child_directory(
-        installation.data_root / "incoming-v2"
-    )
-    reports = validate_private_child_directory(
-        installation.data_root / "reports"
-    )
-    observations = [
-        validate_scrub_target(path, directory)
-        for directory in (incoming, incoming_v2)
-        for path in sorted(
-            {
-                path
-                for pattern in ("*.json", ".*.json.*")
-                for path in directory.glob(pattern)
-            }
+    with v2_state_lock(installation, exclusive=True, allow_scrubbed=True):
+        atomic_write_json(
+            installation.data_root / V2_SCRUB_MARKER,
+            {"schema_version": 2, "scrubbed": True},
         )
-    ]
-    ephemeral_reports = sorted(
-        {
-            path
-            for pattern in (
-                "*-observation.json",
-                ".*-observation.json.*",
-                "*-boundary.json",
-                ".*-boundary.json.*",
-                "*-skill-challenge.json",
-                ".*-skill-challenge.json.*",
-                "*-skill-response.json",
-                ".*-skill-response.json.*",
-                "*-v2-session-boundary.json",
-                ".*-v2-session-boundary.json.*",
-                "*-v2-session-mapping.json",
-                ".*-v2-session-mapping.json.*",
-                "*-v2-access-challenge.json",
-                ".*-v2-access-challenge.json.*",
-                "*-v2-default-response.json",
-                ".*-v2-default-response.json.*",
-                "*-v2-explicit-response.json",
-                ".*-v2-explicit-response.json.*",
-                "*-v2-access.lock",
+        descriptors: list[int] = []
+        try:
+            for child in ("incoming", "incoming-v2", "reports"):
+                descriptors.append(
+                    open_private_directory_descriptor(installation.data_root / child)
+                )
+            observations = (
+                scrub_directory_targets(descriptors[0], ("*.json", ".*.json.*"))
+                + scrub_directory_targets(descriptors[1], ("*.json", ".*.json.*"))
             )
-            for path in reports.glob(pattern)
-        }
-    )
-    ephemeral_reports = [
-        validate_scrub_target(path, reports)
-        for path in ephemeral_reports
-    ]
-    for path in observations:
-        path.unlink()
-    for path in ephemeral_reports:
-        path.unlink()
-    fsync_directory(incoming)
-    fsync_directory(incoming_v2)
-    fsync_directory(reports)
-    return {
-        "observations_deleted": len(observations),
-        "ephemeral_reports_deleted": len(ephemeral_reports),
-    }
+            ephemeral_reports = scrub_directory_targets(
+                descriptors[2],
+                (
+                    "*-observation.json", ".*-observation.json.*",
+                    "*-boundary.json", ".*-boundary.json.*",
+                    "*-skill-challenge.json", ".*-skill-challenge.json.*",
+                    "*-skill-response.json", ".*-skill-response.json.*",
+                    "*-v2-session-boundary.json", ".*-v2-session-boundary.json.*",
+                    "*-v2-session-mapping.json", ".*-v2-session-mapping.json.*",
+                    "*-v2-access-challenge.json", ".*-v2-access-challenge.json.*",
+                    "*-v2-default-response.json", ".*-v2-default-response.json.*",
+                    "*-v2-explicit-response.json", ".*-v2-explicit-response.json.*",
+                    "*-v2-access.lock",
+                ),
+            )
+            for descriptor, name, info in observations + ephemeral_reports:
+                unlink_scrub_target(descriptor, name, info)
+            for descriptor in descriptors:
+                os.fsync(descriptor)
+            return {
+                "observations_deleted": len(observations),
+                "ephemeral_reports_deleted": len(ephemeral_reports),
+            }
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
 
 
 def cmd_probe_scrub(args: argparse.Namespace) -> int:
