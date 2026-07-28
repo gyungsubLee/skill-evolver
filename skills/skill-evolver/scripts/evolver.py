@@ -896,9 +896,16 @@ def parse_access_surface(surface: str) -> str:
     raise argparse.ArgumentTypeError("invalid_access_surface")
 
 
+class SanitizedArgumentParser(argparse.ArgumentParser):
+    def error(self, _message: str) -> None:
+        self.print_usage(sys.stderr)
+        self.exit(2, f"{self.prog}: error: invalid_arguments\n")
+
+
 ACCESS_EVIDENCE_ERROR = "access_evidence_unavailable"
 ACCESS_CHALLENGE_ERROR = "access_challenge_unavailable"
 ACCESS_GLOBAL_WRITE_ERROR = "access_global_write_unavailable"
+ACCESS_DEFAULT_WRITE_UNEXPECTED = "access_default_write_unexpected"
 
 
 def challenge_digest(challenge: str) -> str:
@@ -969,7 +976,7 @@ def load_access_challenge_v2(
     surface = validate_surface(surface)
     try:
         payload = read_bounded_private_json(access_challenge_path(installation, surface))
-    except ValueError as error:
+    except (OSError, ValueError) as error:
         raise ValueError(ACCESS_CHALLENGE_ERROR) from error
     if not valid_access_challenge(payload, installation, surface):
         raise ValueError(ACCESS_CHALLENGE_ERROR)
@@ -1046,7 +1053,7 @@ def run_default_access_v2(
     surface = validate_surface(surface)
     try:
         challenge = load_access_challenge_v2(installation, surface)
-    except ValueError:
+    except (OSError, ValueError):
         result = access_result(
             surface, False, False, False, None, [ACCESS_CHALLENGE_ERROR]
         )
@@ -1060,6 +1067,9 @@ def run_default_access_v2(
         result["write_denied"] = True
     except OSError:
         result["error_codes"] = [ACCESS_GLOBAL_WRITE_ERROR]
+    else:
+        result["global_write"] = True
+        result["error_codes"] = [ACCESS_DEFAULT_WRITE_UNEXPECTED]
     write_access_result(output, result)
     return result
 
@@ -1071,7 +1081,7 @@ def run_explicit_access_v2(
     surface = validate_surface(surface)
     try:
         challenge = load_access_challenge_v2(installation, surface)
-    except ValueError:
+    except (OSError, ValueError):
         return access_result(surface, False, False, False, None, [ACCESS_CHALLENGE_ERROR])
     digest = challenge_digest(str(challenge["challenge"]))
     result = access_result(surface, True, True, False, digest, [])
@@ -2758,9 +2768,11 @@ def cmd_probe_promote_transcript(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="evolver.py")
+    parser = SanitizedArgumentParser(prog="evolver.py")
     parser.add_argument("--version", action="version", version=VERSION)
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(
+        dest="command", required=True, parser_class=SanitizedArgumentParser
+    )
     probe_stop = subparsers.add_parser("probe-stop")
     probe_stop.add_argument("--installation", required=True)
     probe_stop.set_defaults(handler=cmd_probe_stop)

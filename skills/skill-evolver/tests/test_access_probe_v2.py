@@ -80,6 +80,35 @@ class AccessProbeV2Tests(unittest.TestCase):
         self.assertEqual(result["error_codes"], ["access_challenge_unavailable"])
         self.assertNotIn(str(self.installation.data_root), json.dumps(result))
 
+    def test_access_challenge_directory_failure_is_sanitized_and_persisted(self) -> None:
+        reports = self.installation.data_root / "reports"
+        reports.rmdir()
+        output = self.output_root / "default.json"
+        default = self.runtime.run_default_access_v2(
+            self.installation, "cli", output
+        )
+        explicit = self.runtime.run_explicit_access_v2(self.installation, "cli")
+        self.assertTrue(output.is_file())
+        self.assertEqual(default["error_codes"], ["access_challenge_unavailable"])
+        self.assertEqual(explicit["error_codes"], ["access_challenge_unavailable"])
+        rendered = json.dumps({"default": default, "explicit": explicit})
+        self.assertNotIn(str(reports), rendered)
+        self.assertNotIn("FileNotFoundError", rendered)
+
+    def test_unexpected_default_global_write_is_reported_and_cannot_promote(self) -> None:
+        self.runtime.arm_access_v2(self.installation, "cli")
+        default = self.output_root / "default.json"
+        result = self.runtime.run_default_access_v2(self.installation, "cli", default)
+        self.assertTrue(result["global_write"])
+        self.assertFalse(result["write_denied"])
+        self.assertEqual(result["error_codes"], ["access_default_write_unexpected"])
+        self.runtime.run_explicit_access_v2(self.installation, "cli")
+        self.capture_two_stops()
+        report = self.runtime.promote_access_v2(
+            self.installation, "cli", default, self.output_root / "access.json"
+        )
+        self.assertEqual(report["error_codes"], ["access_evidence_unavailable"])
+
     def test_explicit_access_writes_and_round_trips_current_challenge(self) -> None:
         armed = self.runtime.arm_access_v2(self.installation, "cli")
         result = self.runtime.run_explicit_access_v2(self.installation, "cli")
@@ -223,7 +252,7 @@ class AccessProbeV2Tests(unittest.TestCase):
         )
         self.assertNotIn("private-installation-secret", json.dumps(write_json.call_args.args[0]))
 
-    def test_access_parsers_hide_invalid_surface_values(self) -> None:
+    def test_access_parsers_hide_invalid_arguments(self) -> None:
         sentinel = "surface-sentinel-secret"
         commands = {
             "probe-v2-arm-access": ("--installation", "/installation-secret"),
@@ -238,11 +267,19 @@ class AccessProbeV2Tests(unittest.TestCase):
         }
         for command, arguments in commands.items():
             with self.subTest(command=command):
-                result = run_isolated(command, *arguments, "--surface", sentinel)
+                result = run_isolated(
+                    command,
+                    *arguments,
+                    "--attacker-input",
+                    sentinel,
+                    "--surface",
+                    sentinel,
+                )
                 output = (result.stdout + result.stderr).decode("utf-8")
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("invalid_access_surface", output)
+                self.assertIn("invalid_arguments", output)
                 self.assertNotIn(sentinel, output)
+                self.assertNotIn("--attacker-input", output)
                 self.assertNotIn("installation-secret", output)
                 self.assertNotIn("output-secret", output)
                 self.assertNotIn("response-secret", output)
