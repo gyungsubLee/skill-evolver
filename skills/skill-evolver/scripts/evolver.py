@@ -487,6 +487,59 @@ def empty_session_hook_shape() -> dict[str, object]:
     }
 
 
+def valid_session_hook_shape(shape: object) -> bool:
+    if not isinstance(shape, dict) or set(shape) != {
+        "payload_keys",
+        "field_types",
+        "required_fields",
+    }:
+        return False
+    payload_keys = shape["payload_keys"]
+    field_types = shape["field_types"]
+    required_fields = shape["required_fields"]
+    if (
+        not isinstance(payload_keys, list)
+        or not all(type(key) is str for key in payload_keys)
+        or not isinstance(field_types, dict)
+        or not isinstance(required_fields, dict)
+    ):
+        return False
+    expected_types = {
+        "cwd": "str",
+        "hook_event_name": "str",
+        "session_id": "str",
+        "transcript_path": "str",
+    }
+    turn_present = "turn_id" in payload_keys
+    if turn_present:
+        expected_types["turn_id"] = "str"
+    if payload_keys != sorted(expected_types) or field_types != expected_types:
+        return False
+    expected_required = {
+        key: {"present": True, "type": "str", "valid": True}
+        for key in expected_types
+        if key != "turn_id"
+    }
+    expected_required["turn_id"] = {
+        "present": turn_present,
+        "type": "str" if turn_present else None,
+        "valid": True,
+    }
+    if set(required_fields) != set(expected_required):
+        return False
+    for key, expected in expected_required.items():
+        field = required_fields[key]
+        if (
+            not isinstance(field, dict)
+            or set(field) != {"present", "type", "valid"}
+            or type(field["present"]) is not bool
+            or type(field["valid"]) is not bool
+            or field != expected
+        ):
+            return False
+    return True
+
+
 def parse_session_stop_envelope(
     raw: bytes, installation: Installation
 ) -> SessionStopEnvelope:
@@ -1002,6 +1055,8 @@ def promote_session_stop_v2(
             item.get("installation_nonce") == installation.nonce for item in observations
         )
         shapes = [item["shape"] for item in observations]
+        if not all(valid_session_hook_shape(shape) for shape in shapes):
+            raise ValueError("session_stop_observation_unavailable")
         transcript_infos = [item.get("transcript_stat") for item in observations]
         required_fields = aggregate_session_required_fields(observations)
         capture_error_codes = sorted(

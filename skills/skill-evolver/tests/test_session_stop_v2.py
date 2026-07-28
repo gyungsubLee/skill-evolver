@@ -227,6 +227,40 @@ class SessionStopV2Tests(unittest.TestCase):
         self.assertEqual(report["capture_error_codes"], ["session_stop_observation_unavailable"])
         self.assertNotIn("private-error-secret", json.dumps(report))
 
+    def test_v2_promotion_sanitizes_tampered_shape_strings(self) -> None:
+        cases = {
+            "payload_keys": ("private-payload-key", lambda shape: shape.update(
+                {"payload_keys": ["private-payload-key"]}
+            )),
+            "field_types": ("private-field-type", lambda shape: shape["field_types"].update(
+                {"session_id": "private-field-type"}
+            )),
+            "required_type": ("private-required-type", lambda shape: shape["required_fields"]["session_id"].update(
+                {"type": "private-required-type"}
+            )),
+        }
+        for name, (secret, tamper) in cases.items():
+            with self.subTest(name=name):
+                self.runtime.mark_session_surface_boundary(self.installation, "cli")
+                first = self.runtime.capture_session_stop(
+                    self.installation, json.dumps(self.payload).encode()
+                )
+                self.capture({**self.payload, "session_id": f"session-secret-{name}"})
+                stored = json.loads(first.read_text(encoding="utf-8"))
+                tamper(stored["shape"])
+                self.runtime.atomic_write_json(first, stored)
+                report = self.runtime.promote_session_stop_v2(
+                    self.installation,
+                    "cli",
+                    self.root / f"session-stop-cli-{name}.v2.structure.json",
+                )
+                self.assertFalse(report["capture_supported"])
+                self.assertEqual(
+                    report["capture_error_codes"],
+                    ["session_stop_observation_unavailable"],
+                )
+                self.assertNotIn(secret, json.dumps(report))
+
     def test_v2_failed_promotion_marks_all_missing_stat_checks_false(self) -> None:
         self.runtime.mark_session_surface_boundary(self.installation, "cli")
         report = self.runtime.promote_session_stop_v2(
