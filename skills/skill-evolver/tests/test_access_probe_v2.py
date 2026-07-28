@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import load_runtime
+from support import load_runtime, run_isolated
 
 
 class AccessProbeV2Tests(unittest.TestCase):
@@ -222,6 +222,30 @@ class AccessProbeV2Tests(unittest.TestCase):
             }
         )
         self.assertNotIn("private-installation-secret", json.dumps(write_json.call_args.args[0]))
+
+    def test_access_parsers_hide_invalid_surface_values(self) -> None:
+        sentinel = "surface-sentinel-secret"
+        commands = {
+            "probe-v2-arm-access": ("--installation", "/installation-secret"),
+            "probe-v2-default-access": (
+                "--installation", "/installation-secret", "--output", "/output-secret",
+            ),
+            "probe-v2-explicit-access": ("--installation", "/installation-secret"),
+            "probe-v2-promote-access": (
+                "--installation", "/installation-secret", "--default-response", "/response-secret",
+                "--output", "/output-secret",
+            ),
+        }
+        for command, arguments in commands.items():
+            with self.subTest(command=command):
+                result = run_isolated(command, *arguments, "--surface", sentinel)
+                output = (result.stdout + result.stderr).decode("utf-8")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("invalid_access_surface", output)
+                self.assertNotIn(sentinel, output)
+                self.assertNotIn("installation-secret", output)
+                self.assertNotIn("output-secret", output)
+                self.assertNotIn("response-secret", output)
 
     def test_promotion_rejects_missing_stop_evidence(self) -> None:
         self.runtime.arm_access_v2(self.installation, "cli")

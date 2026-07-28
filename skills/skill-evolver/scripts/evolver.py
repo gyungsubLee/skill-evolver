@@ -890,6 +890,12 @@ def validate_surface(surface: str) -> str:
     return surface
 
 
+def parse_access_surface(surface: str) -> str:
+    if surface in {"cli", "desktop"}:
+        return surface
+    raise argparse.ArgumentTypeError("invalid_access_surface")
+
+
 ACCESS_EVIDENCE_ERROR = "access_evidence_unavailable"
 ACCESS_CHALLENGE_ERROR = "access_challenge_unavailable"
 ACCESS_GLOBAL_WRITE_ERROR = "access_global_write_unavailable"
@@ -2816,23 +2822,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     arm_v2_access = subparsers.add_parser("probe-v2-arm-access")
     arm_v2_access.add_argument("--installation", required=True)
-    arm_v2_access.add_argument("--surface", choices=("cli", "desktop"), required=True)
+    arm_v2_access.add_argument("--surface", type=parse_access_surface, required=True)
     arm_v2_access.set_defaults(handler=cmd_probe_v2_arm_access)
 
     default_v2_access = subparsers.add_parser("probe-v2-default-access")
     default_v2_access.add_argument("--installation", required=True)
-    default_v2_access.add_argument("--surface", choices=("cli", "desktop"), required=True)
+    default_v2_access.add_argument("--surface", type=parse_access_surface, required=True)
     default_v2_access.add_argument("--output", required=True)
     default_v2_access.set_defaults(handler=cmd_probe_v2_default_access)
 
     explicit_v2_access = subparsers.add_parser("probe-v2-explicit-access")
     explicit_v2_access.add_argument("--installation", required=True)
-    explicit_v2_access.add_argument("--surface", choices=("cli", "desktop"), required=True)
+    explicit_v2_access.add_argument("--surface", type=parse_access_surface, required=True)
     explicit_v2_access.set_defaults(handler=cmd_probe_v2_explicit_access)
 
     promote_v2_access = subparsers.add_parser("probe-v2-promote-access")
     promote_v2_access.add_argument("--installation", required=True)
-    promote_v2_access.add_argument("--surface", choices=("cli", "desktop"), required=True)
+    promote_v2_access.add_argument("--surface", type=parse_access_surface, required=True)
     promote_v2_access.add_argument("--default-response", required=True)
     promote_v2_access.add_argument("--output", required=True)
     promote_v2_access.set_defaults(handler=cmd_probe_v2_promote_access)
