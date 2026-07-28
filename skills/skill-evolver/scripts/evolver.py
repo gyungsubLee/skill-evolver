@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -22,6 +24,9 @@ REQUIRED_SESSION_HOOK_FIELDS = {
     "session_id": str,
     "cwd": str,
 }
+SESSION_STOP_EVENT_FIELDS = frozenset(
+    {"hook_event_name", "session_id", "turn_id", "transcript_path", "cwd"}
+)
 INSTALLATION_SCHEMA = 1
 PROVENANCE_KEYS = {"role", "source_kind"}
 PROVENANCE_VALUES = {
@@ -562,6 +567,31 @@ def parse_session_stop_envelope(
     return SessionStopEnvelope(session_id, turn_id, transcript_path, cwd, shape)
 
 
+def session_id_digest(installation: Installation, session_id: str) -> str:
+    return hmac.new(
+        installation.nonce.encode("ascii"),
+        session_id.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def session_stop_event_session_id(event: object) -> Optional[str]:
+    if not isinstance(event, dict) or set(event) != SESSION_STOP_EVENT_FIELDS:
+        return None
+    if event.get("hook_event_name") != "Stop":
+        return None
+    try:
+        session_id = bounded_text(event, "session_id", 512)
+        bounded_text(event, "cwd", 4_096)
+        bounded_text(event, "transcript_path", 4_096)
+        turn_id = event["turn_id"]
+        if turn_id is not None:
+            bounded_text(event, "turn_id", 512)
+    except ValueError:
+        return None
+    return session_id
+
+
 def stat_transcript(path: Path) -> dict[str, object]:
     flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(str(path), flags)
@@ -691,6 +721,9 @@ def capture_session_stop(installation: Installation, raw: bytes) -> Path:
     except Exception as error:
         observation["capture_error_code"] = safe_session_capture_error_code(error)
     else:
+        observation["session_id_digest"] = session_id_digest(
+            installation, envelope.session_id
+        )
         observation["event"] = {
             "hook_event_name": "Stop",
             "session_id": envelope.session_id,
@@ -1049,7 +1082,10 @@ def promote_session_stop_v2(
     surface = validate_surface(surface)
     try:
         paths = session_surface_observations(installation, surface)
-        observations = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+        try:
+            observations = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+        except Exception as error:
+            raise ValueError("session_stop_observation_unavailable") from error
         if not all(isinstance(item, dict) and item.get("schema_version") == 2 for item in observations):
             raise ValueError("invalid_session_stop_observation")
         nonce_matches = all(
@@ -1070,14 +1106,25 @@ def promote_session_stop_v2(
         )
         if any(code not in SESSION_CAPTURE_ERROR_CODES for code in capture_error_codes):
             raise ValueError("session_stop_observation_unavailable")
-        session_ids = {
-            item["event"]["session_id"]
+        session_ids = [
+            session_stop_event_session_id(item.get("event"))
             for item in observations
-            if isinstance(item.get("event"), dict)
-            and isinstance(item["event"].get("session_id"), str)
-        }
+        ]
+        if (
+            any(session_id is None for session_id in session_ids)
+            or not all(
+                isinstance(item.get("session_id_digest"), str)
+                and hmac.compare_digest(
+                    item["session_id_digest"],
+                    session_id_digest(installation, session_id),
+                )
+                for item, session_id in zip(observations, session_ids)
+                if session_id is not None
+            )
+        ):
+            raise ValueError("session_stop_observation_unavailable")
         payload_shapes_stable = core_shapes[0] == core_shapes[1]
-        distinct_sessions = len(session_ids) == 2
+        distinct_sessions = len(set(session_ids)) == 2
         transcript_stat = session_transcript_stat_report(transcript_infos)
         if not all(transcript_stat.values()):
             raise ValueError("session_stop_observation_unavailable")

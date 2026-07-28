@@ -270,6 +270,74 @@ class SessionStopV2Tests(unittest.TestCase):
                 )
                 self.assertNotIn("session-secret", json.dumps(report))
 
+    def test_v2_promotion_rejects_tampered_event_session_identity(self) -> None:
+        self.runtime.mark_session_surface_boundary(self.installation, "cli")
+        first = self.runtime.capture_session_stop(
+            self.installation, json.dumps(self.payload).encode()
+        )
+        self.capture()
+        stored = json.loads(first.read_text(encoding="utf-8"))
+        stored["event"]["session_id"] = "forged-session-secret"
+        self.runtime.atomic_write_json(first, stored)
+        report = self.runtime.promote_session_stop_v2(
+            self.installation, "cli", self.root / "session-stop-cli.v2.structure.json"
+        )
+        self.assertFalse(report["capture_supported"])
+        self.assertFalse(report["distinct_sessions"])
+        self.assertEqual(
+            report["capture_error_codes"],
+            ["session_stop_observation_unavailable"],
+        )
+        self.assertNotIn("forged-session-secret", json.dumps(report))
+
+    def test_v2_promotion_rejects_malformed_event_schema(self) -> None:
+        cases = {
+            "missing": lambda event: event.pop("session_id"),
+            "extra": lambda event: event.update({"private-event-secret": "value"}),
+            "wrong_event": lambda event: event.update({"hook_event_name": "SubagentStop"}),
+            "long_session": lambda event: event.update({"session_id": "x" * 513}),
+        }
+        for name, tamper in cases.items():
+            with self.subTest(name=name):
+                self.runtime.mark_session_surface_boundary(self.installation, "cli")
+                first = self.runtime.capture_session_stop(
+                    self.installation, json.dumps(self.payload).encode()
+                )
+                self.capture({**self.payload, "session_id": f"session-secret-{name}"})
+                stored = json.loads(first.read_text(encoding="utf-8"))
+                tamper(stored["event"])
+                self.runtime.atomic_write_json(first, stored)
+                report = self.runtime.promote_session_stop_v2(
+                    self.installation,
+                    "cli",
+                    self.root / f"session-stop-cli-{name}.v2.structure.json",
+                )
+                self.assertFalse(report["capture_supported"])
+                self.assertEqual(
+                    report["capture_error_codes"],
+                    ["session_stop_observation_unavailable"],
+                )
+                self.assertNotIn("private-event-secret", json.dumps(report))
+
+    def test_v2_promotion_sanitizes_deeply_nested_stored_observation(self) -> None:
+        self.runtime.mark_session_surface_boundary(self.installation, "cli")
+        nested = (
+            '{"stored-observation-secret":' + "[" * 1_100 + "0" + "]" * 1_100 + "}"
+        )
+        observation = self.installation.data_root / "incoming-v2" / "000-deep.json"
+        observation.write_text(nested, encoding="utf-8")
+        observation.chmod(0o600)
+        self.capture()
+        output = self.root / "session-stop-cli.v2.structure.json"
+        report = self.runtime.promote_session_stop_v2(self.installation, "cli", output)
+        self.assertTrue(output.is_file())
+        self.assertFalse(report["capture_supported"])
+        self.assertEqual(
+            report["capture_error_codes"],
+            ["session_stop_observation_unavailable"],
+        )
+        self.assertNotIn("stored-observation-secret", json.dumps(report))
+
     def test_v2_promotion_sanitizes_tampered_capture_error(self) -> None:
         self.runtime.mark_session_surface_boundary(self.installation, "cli")
         first = self.runtime.capture_session_stop(
