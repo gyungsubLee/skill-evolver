@@ -98,6 +98,8 @@ class SkeletonTests(unittest.TestCase):
             runtime.atomic_write_json(observation, {"session_id": "raw-session-secret"})
             expected_status = {
                 "status": "ready",
+                "probe_version": "0.0.2",
+                "data_root": str(installation.data_root),
                 "shared_nonce_present": True,
                 "observation_count": 1,
                 "latest_observation": observation.name,
@@ -119,6 +121,46 @@ class SkeletonTests(unittest.TestCase):
                     ):
                         self.assertEqual(handler(args), 0)
                     self.assertEqual(captured, [expected])
+
+    def test_v2_status_reports_canonical_root_and_version_without_content_reads(self) -> None:
+        runtime = load_runtime()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            sessions.mkdir(mode=0o700)
+            installation_path = runtime.initialize_probe(
+                root / "probe", (sessions,), Path("/usr/bin/python3")
+            )
+            installation = runtime.load_installation(installation_path)
+            captured: list[dict[str, object]] = []
+
+            with mock.patch.object(
+                runtime,
+                "read_bounded_private_json",
+                side_effect=AssertionError("content read"),
+            ), mock.patch.object(
+                runtime,
+                "read_exact_prefix",
+                side_effect=AssertionError("transcript read"),
+            ), mock.patch.object(runtime, "write_json_stdout", side_effect=captured.append):
+                self.assertEqual(
+                    runtime.cmd_probe_v2_status(Namespace(installation=str(installation_path))),
+                    0,
+                )
+
+            self.assertEqual(
+                captured,
+                [
+                    {
+                        "status": "ready",
+                        "probe_version": "0.0.2",
+                        "data_root": str(installation.data_root),
+                        "shared_nonce_present": True,
+                        "observation_count": 0,
+                        "latest_observation": None,
+                    }
+                ],
+            )
 
     def test_scrub_removes_v2_raw_state_and_validates_it_before_any_deletion(self) -> None:
         runtime = load_runtime()

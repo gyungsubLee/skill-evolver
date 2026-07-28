@@ -4048,9 +4048,19 @@ def cmd_probe_list(args: argparse.Namespace) -> int:
 def cmd_probe_v2_status(args: argparse.Namespace) -> int:
     installation = load_installation(Path(args.installation))
     observations = session_observation_paths(installation)
+    version_prefix = "skill-evolver feasibility "
+    probe_version = VERSION.removeprefix(version_prefix)
+    if (
+        not VERSION.startswith(version_prefix)
+        or len(probe_version.split(".")) != 3
+        or any(not part.isdecimal() for part in probe_version.split("."))
+    ):
+        raise ValueError("invalid_probe_version")
     write_json_stdout(
         {
             "status": "ready",
+            "probe_version": probe_version,
+            "data_root": str(installation.data_root),
             "shared_nonce_present": bool(installation.nonce),
             "observation_count": len(observations),
             "latest_observation": observations[-1].name if observations else None,
