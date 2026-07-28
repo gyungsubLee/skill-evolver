@@ -162,6 +162,63 @@ class SkeletonTests(unittest.TestCase):
                 ],
             )
 
+    def test_v2_status_hides_missing_installation_details_in_a_fixed_error_response(self) -> None:
+        sentinel = "/private/v2-status-private-sentinel.json"
+
+        result = run_isolated("probe-v2-status", "--installation", sentinel)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr, b"")
+        self.assertNotIn(sentinel.encode(), result.stdout)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "status": "error",
+                "probe_version": "0.0.2",
+                "data_root": None,
+                "shared_nonce_present": False,
+                "observation_count": 0,
+                "latest_observation": None,
+                "error_codes": ["v2_status_unavailable"],
+            },
+        )
+
+    def test_v2_status_rejects_unicode_decimal_version_components(self) -> None:
+        runtime = load_runtime()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            sessions.mkdir(mode=0o700)
+            installation_path = runtime.initialize_probe(
+                root / "probe", (sessions,), Path("/usr/bin/python3")
+            )
+            captured: list[dict[str, object]] = []
+
+            with mock.patch.object(
+                runtime, "VERSION", "skill-evolver feasibility ٠.٠.٢"
+            ), mock.patch.object(
+                runtime, "write_json_stdout", side_effect=captured.append
+            ):
+                self.assertEqual(
+                    runtime.cmd_probe_v2_status(Namespace(installation=str(installation_path))),
+                    2,
+                )
+
+            self.assertEqual(
+                captured,
+                [
+                    {
+                        "status": "error",
+                        "probe_version": None,
+                        "data_root": None,
+                        "shared_nonce_present": False,
+                        "observation_count": 0,
+                        "latest_observation": None,
+                        "error_codes": ["v2_status_unavailable"],
+                    }
+                ],
+            )
+
     def test_scrub_removes_v2_raw_state_and_validates_it_before_any_deletion(self) -> None:
         runtime = load_runtime()
         with tempfile.TemporaryDirectory() as temporary:

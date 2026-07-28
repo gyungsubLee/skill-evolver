@@ -4046,16 +4046,38 @@ def cmd_probe_list(args: argparse.Namespace) -> int:
 
 
 def cmd_probe_v2_status(args: argparse.Namespace) -> int:
-    installation = load_installation(Path(args.installation))
-    observations = session_observation_paths(installation)
-    version_prefix = "skill-evolver feasibility "
-    probe_version = VERSION.removeprefix(version_prefix)
-    if (
-        not VERSION.startswith(version_prefix)
-        or len(probe_version.split(".")) != 3
-        or any(not part.isdecimal() for part in probe_version.split("."))
-    ):
-        raise ValueError("invalid_probe_version")
+    probe_version: Optional[str] = None
+    try:
+        version_prefix = "skill-evolver feasibility "
+        candidate_version = VERSION.removeprefix(version_prefix)
+        components = candidate_version.split(".")
+        if (
+            not VERSION.startswith(version_prefix)
+            or len(components) != 3
+            or any(not component for component in components)
+            or any(
+                not ("0" <= character <= "9")
+                for component in components
+                for character in component
+            )
+        ):
+            raise ValueError("invalid_probe_version")
+        probe_version = candidate_version
+        installation = load_installation(Path(args.installation))
+        observations = session_observation_paths(installation)
+    except Exception:
+        write_json_stdout(
+            {
+                "status": "error",
+                "probe_version": probe_version,
+                "data_root": None,
+                "shared_nonce_present": False,
+                "observation_count": 0,
+                "latest_observation": None,
+                "error_codes": ["v2_status_unavailable"],
+            }
+        )
+        return 2
     write_json_stdout(
         {
             "status": "ready",
