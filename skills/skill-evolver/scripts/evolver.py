@@ -96,6 +96,9 @@ V2_TRANSCRIPT_BINDING_MODES = frozenset(
 )
 V2_PREDECESSOR_PATH = "docs/feasibility-report.json"
 V2_PREDECESSOR_SHA256 = "ced4503adb44bd041de063c04e0c6c64d0831370fc12e96a920fe97244d8ae15"
+GATE_V2_JSON_NAME = "feasibility-report-v2.json"
+GATE_V2_MARKDOWN_NAME = "feasibility-report-v2.md"
+GATE_V2_TRANSACTION_NAME = ".feasibility-report-v2.transaction.json"
 V1_PREDECESSOR_CHECKS = {
     "cli_shared_data_root": True,
     "cli_skill_data_root": False,
@@ -3325,6 +3328,152 @@ def _stage_gate_v2_backup(path: Path, parent: Path) -> tuple[Optional[Path], Opt
     )
 
 
+def _gate_v2_transaction_name(value: object, destination: Path, kind: str) -> bool:
+    return (
+        type(value) is str
+        and Path(value).name == value
+        and value.startswith(f".{destination.name}.{kind}.")
+        and len(value) <= 255
+    )
+
+
+def _gate_v2_parent_lock(parent: Path):
+    descriptor = os.open(
+        str(parent),
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) & 0o022
+        ):
+            raise ValueError("gate_inputs_invalid")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _gate_v2_transaction_payload(
+    json_path: Path,
+    markdown_path: Path,
+    stages: dict[Path, Path],
+    backups: dict[Path, tuple[Optional[Path], Optional[int]]],
+) -> dict[str, object]:
+    def entry(path: Path) -> dict[str, object]:
+        backup, prior_mode = backups[path]
+        return {
+            "stage": stages[path].name,
+            "backup": backup.name if backup is not None else None,
+            "prior_present": backup is not None,
+            "prior_mode": prior_mode,
+        }
+
+    return {
+        "schema_version": 1,
+        "kind": "gate_v2_pair_transaction",
+        "json": entry(json_path),
+        "markdown": entry(markdown_path),
+    }
+
+
+def _load_gate_v2_transaction(
+    parent: Path,
+    json_path: Path,
+    markdown_path: Path,
+) -> Optional[dict[str, dict[str, object]]]:
+    marker = parent / GATE_V2_TRANSACTION_NAME
+    if not marker.exists() and not marker.is_symlink():
+        return None
+    try:
+        value = json.loads(_stable_private_file_bytes(marker, fixture=True).decode("utf-8"))
+        if (
+            type(value) is not dict
+            or set(value) != {"schema_version", "kind", "json", "markdown"}
+            or type(value.get("schema_version")) is not int
+            or value["schema_version"] != 1
+            or value.get("kind") != "gate_v2_pair_transaction"
+        ):
+            raise ValueError("gate_inputs_invalid")
+        entries: dict[str, dict[str, object]] = {}
+        for name, destination in (("json", json_path), ("markdown", markdown_path)):
+            entry = value.get(name)
+            if (
+                type(entry) is not dict
+                or set(entry) != {"stage", "backup", "prior_present", "prior_mode"}
+                or not _gate_v2_transaction_name(entry.get("stage"), destination, "stage")
+                or type(entry.get("prior_present")) is not bool
+            ):
+                raise ValueError("gate_inputs_invalid")
+            prior_present = entry["prior_present"]
+            backup = entry.get("backup")
+            prior_mode = entry.get("prior_mode")
+            if prior_present:
+                if (
+                    not _gate_v2_transaction_name(backup, destination, "backup")
+                    or type(prior_mode) is not int
+                    or prior_mode & 0o022
+                    or prior_mode < 0
+                    or prior_mode > 0o777
+                ):
+                    raise ValueError("gate_inputs_invalid")
+            elif backup is not None or prior_mode is not None:
+                raise ValueError("gate_inputs_invalid")
+            entries[name] = entry
+        return entries
+    except (OSError, RecursionError, TypeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        raise ValueError("gate_inputs_invalid") from None
+
+
+def _clean_gate_v2_transaction_file(parent: Path, name: object) -> None:
+    if type(name) is not str:
+        return
+    path = parent / name
+    if not path.exists() and not path.is_symlink():
+        return
+    info = path.lstat()
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) & 0o022
+    ):
+        raise ValueError("gate_inputs_invalid")
+    path.unlink()
+
+
+def _recover_gate_v2_transaction(
+    parent: Path,
+    json_path: Path,
+    markdown_path: Path,
+) -> bool:
+    entries = _load_gate_v2_transaction(parent, json_path, markdown_path)
+    if entries is None:
+        return False
+    marker = parent / GATE_V2_TRANSACTION_NAME
+    for name, destination in (("json", json_path), ("markdown", markdown_path)):
+        entry = entries[name]
+        if entry["prior_present"] is True:
+            backup = parent / str(entry["backup"])
+            _stable_private_file_bytes(backup, fixture=False)
+            os.replace(backup, destination)
+            os.chmod(destination, int(entry["prior_mode"]))
+        else:
+            destination.unlink(missing_ok=True)
+    fsync_directory(parent)
+    marker.unlink()
+    fsync_directory(parent)
+    for entry in entries.values():
+        _clean_gate_v2_transaction_file(parent, entry["stage"])
+        _clean_gate_v2_transaction_file(parent, entry["backup"])
+    fsync_directory(parent)
+    return True
+
+
 def _publish_gate_v2_pair(
     json_path: Path,
     json_raw: bytes,
@@ -3334,45 +3483,44 @@ def _publish_gate_v2_pair(
     parent = json_path.parent
     stages: dict[Path, Path] = {}
     backups: dict[Path, tuple[Optional[Path], Optional[int]]] = {}
-    published: set[Path] = set()
     modes = {json_path: 0o600, markdown_path: 0o644}
+    lock = _gate_v2_parent_lock(parent)
     try:
+        _recover_gate_v2_transaction(parent, json_path, markdown_path)
         stages[json_path] = _stage_gate_v2_file(
-            parent, json_path.name, json_raw, modes[json_path]
+            parent, f"{json_path.name}.stage", json_raw, modes[json_path]
         )
         stages[markdown_path] = _stage_gate_v2_file(
-            parent, markdown_path.name, markdown_raw, modes[markdown_path]
+            parent, f"{markdown_path.name}.stage", markdown_raw, modes[markdown_path]
         )
         fsync_directory(parent)
         backups[json_path] = _stage_gate_v2_backup(json_path, parent)
         backups[markdown_path] = _stage_gate_v2_backup(markdown_path, parent)
+        fsync_directory(parent)
+        atomic_write_json(
+            parent / GATE_V2_TRANSACTION_NAME,
+            _gate_v2_transaction_payload(json_path, markdown_path, stages, backups),
+            mode=0o600,
+        )
         for destination in (json_path, markdown_path):
             os.replace(stages[destination], destination)
-            published.add(destination)
             os.chmod(destination, modes[destination])
             fsync_directory(parent)
+        (parent / GATE_V2_TRANSACTION_NAME).unlink()
+        fsync_directory(parent)
+        for backup, _mode in backups.values():
+            if backup is not None:
+                _clean_gate_v2_transaction_file(parent, backup.name)
+        fsync_directory(parent)
     except BaseException:
-        for destination in reversed((json_path, markdown_path)):
-            if destination not in published:
-                continue
-            backup, prior_mode = backups.get(destination, (None, None))
-            try:
-                if backup is None:
-                    destination.unlink(missing_ok=True)
-                else:
-                    os.replace(backup, destination)
-                    if prior_mode is not None:
-                        os.chmod(destination, prior_mode)
-            except OSError:
-                pass
-        try:
-            fsync_directory(parent)
-        except OSError:
-            pass
+        if (parent / GATE_V2_TRANSACTION_NAME).exists() or (parent / GATE_V2_TRANSACTION_NAME).is_symlink():
+            _recover_gate_v2_transaction(parent, json_path, markdown_path)
         raise
     finally:
-        for staged in (*stages.values(), *(backup for backup, _mode in backups.values() if backup is not None)):
+        for staged in stages.values():
             staged.unlink(missing_ok=True)
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        os.close(lock)
 
 
 def write_gate_report_v2(
@@ -3386,6 +3534,8 @@ def write_gate_report_v2(
     if (
         paths_alias(json_path, markdown_path)
         or path_identity(json_path.parent) != path_identity(markdown_path.parent)
+        or json_path.name != GATE_V2_JSON_NAME
+        or markdown_path.name != GATE_V2_MARKDOWN_NAME
     ):
         raise ValueError("gate_inputs_invalid")
     root, fixtures = _v2_fixture_inventory(fixture_root)

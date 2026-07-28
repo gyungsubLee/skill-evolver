@@ -353,6 +353,131 @@ class GateV2Tests(unittest.TestCase):
     def test_pair_publication_restores_prior_outputs_when_markdown_sync_fails(self) -> None:
         self._assert_publication_failure_rolls_back("sync_markdown")
 
+    def test_keyboard_interrupt_after_first_replace_recovers_the_prior_pair(self) -> None:
+        fixtures = self.root / "fixtures"
+        self.write_fixtures(fixtures)
+        output = self.root / "output"
+        output.mkdir(mode=0o700)
+        json_path = output / "feasibility-report-v2.json"
+        markdown_path = output / "feasibility-report-v2.md"
+        old_json, old_markdown = b'{"old":true}\n', b"old markdown\n"
+        json_path.write_bytes(old_json)
+        json_path.chmod(0o600)
+        markdown_path.write_bytes(old_markdown)
+        markdown_path.chmod(0o640)
+        original_replace = self.runtime.os.replace
+        crashed = False
+
+        def crash_after_json(source, destination):
+            nonlocal crashed
+            result = original_replace(source, destination)
+            if Path(destination) == json_path and not crashed:
+                crashed = True
+                raise KeyboardInterrupt()
+            return result
+
+        with mock.patch.object(self.runtime.os, "replace", side_effect=crash_after_json):
+            with self.assertRaises(KeyboardInterrupt):
+                self.write_report(fixtures, output)
+        self.assertEqual(json_path.read_bytes(), old_json)
+        self.assertEqual(markdown_path.read_bytes(), old_markdown)
+        self.assertFalse((output / ".feasibility-report-v2.transaction.json").exists())
+
+    def test_next_publish_recovers_a_crashed_half_pair_before_committing(self) -> None:
+        fixtures = self.root / "fixtures"
+        self.write_fixtures(fixtures)
+        output = self.root / "output"
+        output.mkdir(mode=0o700)
+        json_path = output / "feasibility-report-v2.json"
+        markdown_path = output / "feasibility-report-v2.md"
+        self._simulate_crashed_pair(output, json_path, markdown_path, replace_markdown=False)
+
+        report = self.write_report(fixtures, output)
+
+        self.assertEqual(json.loads(json_path.read_text(encoding="utf-8")), report)
+        self.assertIn("Decision: **PASS**", markdown_path.read_text(encoding="utf-8"))
+        self.assertFalse((output / ".feasibility-report-v2.transaction.json").exists())
+
+    def test_next_publish_rolls_back_a_crash_after_both_replaces(self) -> None:
+        fixtures = self.root / "fixtures"
+        self.write_fixtures(fixtures)
+        output = self.root / "output"
+        output.mkdir(mode=0o700)
+        json_path = output / "feasibility-report-v2.json"
+        markdown_path = output / "feasibility-report-v2.md"
+        self._simulate_crashed_pair(output, json_path, markdown_path, replace_markdown=True)
+
+        report = self.write_report(fixtures, output)
+
+        self.assertEqual(json.loads(json_path.read_text(encoding="utf-8")), report)
+        self.assertIn("Decision: **PASS**", markdown_path.read_text(encoding="utf-8"))
+        self.assertFalse((output / ".feasibility-report-v2.transaction.json").exists())
+
+    def test_malformed_or_symlinked_transaction_marker_fails_closed(self) -> None:
+        fixtures = self.root / "fixtures"
+        self.write_fixtures(fixtures)
+        for name in ("malformed", "symlink"):
+            with self.subTest(name=name):
+                output = self.root / name
+                output.mkdir(mode=0o700)
+                marker = output / ".feasibility-report-v2.transaction.json"
+                if name == "malformed":
+                    marker.write_text("{}", encoding="utf-8")
+                    marker.chmod(0o600)
+                else:
+                    target = self.root / "marker-secret"
+                    target.write_text("secret", encoding="utf-8")
+                    target.chmod(0o600)
+                    marker.symlink_to(target)
+                with self.assertRaises(ValueError):
+                    self.write_report(fixtures, output)
+                self.assertFalse((output / "feasibility-report-v2.json").exists())
+                self.assertFalse((output / "feasibility-report-v2.md").exists())
+
+    def _simulate_crashed_pair(
+        self,
+        output: Path,
+        json_path: Path,
+        markdown_path: Path,
+        *,
+        replace_markdown: bool,
+    ) -> None:
+        old_json, old_markdown = b'{"old":true}\n', b"old markdown\n"
+        json_path.write_bytes(old_json)
+        json_path.chmod(0o600)
+        markdown_path.write_bytes(old_markdown)
+        markdown_path.chmod(0o640)
+        json_backup = output / ".feasibility-report-v2.json.backup.crash"
+        markdown_backup = output / ".feasibility-report-v2.md.backup.crash"
+        json_backup.write_bytes(old_json)
+        json_backup.chmod(0o600)
+        markdown_backup.write_bytes(old_markdown)
+        markdown_backup.chmod(0o640)
+        json_path.write_text('{"new":true}\n', encoding="utf-8")
+        json_path.chmod(0o600)
+        if replace_markdown:
+            markdown_path.write_text("new markdown\n", encoding="utf-8")
+            markdown_path.chmod(0o644)
+        marker = {
+            "schema_version": 1,
+            "kind": "gate_v2_pair_transaction",
+            "json": {
+                "stage": ".feasibility-report-v2.json.stage.crash",
+                "backup": json_backup.name,
+                "prior_present": True,
+                "prior_mode": 0o600,
+            },
+            "markdown": {
+                "stage": ".feasibility-report-v2.md.stage.crash",
+                "backup": markdown_backup.name,
+                "prior_present": True,
+                "prior_mode": 0o640,
+            },
+        }
+        marker_path = output / ".feasibility-report-v2.transaction.json"
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+        marker_path.chmod(0o600)
+
     def _assert_publication_failure_rolls_back(self, point: str) -> None:
         for existing in (False, True):
             with self.subTest(point=point, existing=existing):
@@ -373,9 +498,12 @@ class GateV2Tests(unittest.TestCase):
                     markdown_path.chmod(0o640)
                 if point == "replace_markdown":
                     original_replace = self.runtime.os.replace
+                    failed = False
 
                     def fail_markdown(source, destination):
-                        if Path(destination) == markdown_path:
+                        nonlocal failed
+                        if Path(destination) == markdown_path and not failed:
+                            failed = True
                             raise OSError("publish secret path")
                         return original_replace(source, destination)
 
