@@ -992,7 +992,12 @@ def mark_session_surface_boundary(
     boundary = observations[-1].name if observations else None
     atomic_write_json(
         installation.data_root / "reports" / f"{surface}-v2-session-boundary.json",
-        {"schema_version": 2, "surface": surface, "after": boundary},
+        {
+            "schema_version": 2,
+            "surface": surface,
+            "installation_nonce": installation.nonce,
+            "after": boundary,
+        },
     )
     return {"surface": surface, "marked": True}
 
@@ -1003,14 +1008,34 @@ def session_surface_observations(
 ) -> list[Path]:
     surface = validate_surface(surface)
     observations = session_observation_paths(installation)
-    marker = json.loads(
-        (
-            installation.data_root / "reports" / f"{surface}-v2-session-boundary.json"
-        ).read_text(encoding="utf-8")
-    )
-    if marker.get("schema_version") != 2 or marker.get("surface") != surface:
-        raise ValueError("session_surface_boundary_mismatch")
-    after = marker.get("after")
+    try:
+        marker = json.loads(
+            (
+                installation.data_root / "reports" / f"{surface}-v2-session-boundary.json"
+            ).read_text(encoding="utf-8")
+        )
+    except Exception as error:
+        raise ValueError("session_stop_observation_unavailable") from error
+    if (
+        not isinstance(marker, dict)
+        or set(marker) != {"schema_version", "surface", "installation_nonce", "after"}
+        or type(marker["schema_version"]) is not int
+        or marker["schema_version"] != 2
+        or type(marker["surface"]) is not str
+        or marker["surface"] != surface
+        or type(marker["installation_nonce"]) is not str
+        or marker["installation_nonce"] != installation.nonce
+        or (
+            marker["after"] is not None
+            and (
+                type(marker["after"]) is not str
+                or Path(marker["after"]).name != marker["after"]
+                or not marker["after"].endswith(".json")
+            )
+        )
+    ):
+        raise ValueError("session_stop_observation_unavailable")
+    after = marker["after"]
     if after is None:
         selected = observations
     else:

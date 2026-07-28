@@ -356,6 +356,37 @@ class SessionStopV2Tests(unittest.TestCase):
         )
         self.assertNotIn("stored-observation-secret", json.dumps(report))
 
+    def test_v2_promotion_sanitizes_untrusted_session_marker(self) -> None:
+        nested = '{"marker-deep-secret":' + "[" * 1_100 + "0" + "]" * 1_100 + "}"
+        cases = {
+            "scalar": '"marker-scalar-secret"',
+            "list": '["marker-list-secret"]',
+            "nested": nested,
+            "extra": json.dumps(
+                {
+                    "schema_version": 2,
+                    "surface": "cli",
+                    "installation_nonce": self.installation.nonce,
+                    "after": None,
+                    "marker-extra-secret": True,
+                }
+            ),
+        }
+        marker = self.installation.data_root / "reports" / "cli-v2-session-boundary.json"
+        for name, raw in cases.items():
+            with self.subTest(name=name):
+                self.runtime.mark_session_surface_boundary(self.installation, "cli")
+                marker.write_text(raw, encoding="utf-8")
+                output = self.root / f"session-stop-cli-{name}.v2.structure.json"
+                report = self.runtime.promote_session_stop_v2(self.installation, "cli", output)
+                self.assertTrue(output.is_file())
+                self.assertFalse(report["capture_supported"])
+                self.assertEqual(
+                    report["capture_error_codes"],
+                    ["session_stop_observation_unavailable"],
+                )
+                self.assertNotIn("marker-", json.dumps(report))
+
     def test_v2_promotion_sanitizes_tampered_capture_error(self) -> None:
         self.runtime.mark_session_surface_boundary(self.installation, "cli")
         first = self.runtime.capture_session_stop(
