@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import stat
@@ -118,6 +120,72 @@ class SessionStopV2Tests(unittest.TestCase):
             self.assertEqual(result.stdout, b"")
             self.assertEqual(result.stderr, b"")
 
+    def test_v2_stop_command_is_silent_and_sanitizes_unsafe_transcripts(self) -> None:
+        fifo = self.sessions / "blocked.fifo"
+        os.mkfifo(fifo, 0o600)
+        target = self.sessions / "target.jsonl"
+        target.write_text("target-secret\n", encoding="utf-8")
+        symlink = self.sessions / "linked.jsonl"
+        symlink.symlink_to(target)
+        outside = self.root / "outside.jsonl"
+        outside.write_text("outside-secret\n", encoding="utf-8")
+        cases = {
+            "fifo": (fifo, "transcript_not_regular"),
+            "symlink": (symlink, "transcript_symlink"),
+            "outside": (outside, "transcript_outside_roots"),
+        }
+        for name, (transcript, expected) in cases.items():
+            with self.subTest(name=name):
+                before = {path.name for path in self.runtime.session_observation_paths(self.installation)}
+                result = run_isolated(
+                    "probe-v2-stop",
+                    "--installation",
+                    str(self.installation.data_root / "installation.json"),
+                    stdin=json.dumps({**self.payload, "transcript_path": str(transcript)}).encode(),
+                )
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(result.stderr, b"")
+                observed = [
+                    path for path in self.runtime.session_observation_paths(self.installation)
+                    if path.name not in before
+                ]
+                self.assertEqual(len(observed), 1)
+                stored = json.loads(observed[0].read_text(encoding="utf-8"))
+                self.assertEqual(stored["capture_error_code"], expected)
+                self.assertNotIn("outside-secret", json.dumps(stored))
+
+    def test_v2_stop_command_is_silent_and_sanitizes_wrong_owner(self) -> None:
+        original_fstat = self.runtime.os.fstat
+
+        def foreign_owner(descriptor: int) -> os.stat_result:
+            info = original_fstat(descriptor)
+            return os.stat_result((
+                info.st_mode, info.st_ino, info.st_dev, info.st_nlink,
+                os.getuid() + 1, info.st_gid, info.st_size, info.st_atime,
+                info.st_mtime, info.st_ctime,
+            ))
+
+        stdin = mock.Mock(buffer=io.BytesIO(json.dumps(self.payload).encode()))
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(self.runtime.os, "fstat", side_effect=foreign_owner), mock.patch.object(
+            self.runtime.sys, "stdin", stdin
+        ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result = self.runtime.cmd_probe_v2_stop(
+                argparse.Namespace(
+                    installation=str(self.installation.data_root / "installation.json")
+                )
+            )
+        stored = json.loads(
+            self.runtime.session_observation_paths(self.installation)[-1].read_text(encoding="utf-8")
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(stored["capture_error_code"], "transcript_owner")
+        self.assertNotIn("session-secret", json.dumps(stored))
+
     def test_v2_promotion_accepts_distinct_sessions_without_raw_ids(self) -> None:
         self.runtime.mark_session_surface_boundary(self.installation, "cli")
         self.capture()
@@ -141,6 +209,30 @@ class SessionStopV2Tests(unittest.TestCase):
         )
         self.assertFalse(report["distinct_sessions"])
         self.assertFalse(report["capture_supported"])
+
+    def test_v2_promotion_sanitizes_tampered_capture_error(self) -> None:
+        self.runtime.mark_session_surface_boundary(self.installation, "cli")
+        first = self.runtime.capture_session_stop(
+            self.installation, json.dumps(self.payload).encode()
+        )
+        self.capture({**self.payload, "session_id": "session-secret-two"})
+        stored = json.loads(first.read_text(encoding="utf-8"))
+        self.runtime.atomic_write_json(
+            first, {**stored, "capture_error_code": "private-error-secret"}
+        )
+        report = self.runtime.promote_session_stop_v2(
+            self.installation, "cli", self.root / "session-stop-cli.v2.structure.json"
+        )
+        self.assertFalse(report["capture_supported"])
+        self.assertEqual(report["capture_error_codes"], ["session_stop_observation_unavailable"])
+        self.assertNotIn("private-error-secret", json.dumps(report))
+
+    def test_v2_failed_promotion_marks_all_missing_stat_checks_false(self) -> None:
+        self.runtime.mark_session_surface_boundary(self.installation, "cli")
+        report = self.runtime.promote_session_stop_v2(
+            self.installation, "cli", self.root / "session-stop-cli.v2.structure.json"
+        )
+        self.assertTrue(all(value is False for value in report["transcript_stat"].values()))
 
     def test_v2_promotion_command_returns_two_for_an_incomplete_fixture(self) -> None:
         self.runtime.mark_session_surface_boundary(self.installation, "cli")

@@ -939,7 +939,9 @@ def aggregate_session_required_fields(
 def session_transcript_stat_report(
     transcript_infos: list[object],
 ) -> dict[str, object]:
-    present = all(isinstance(item, dict) for item in transcript_infos)
+    present = bool(transcript_infos) and all(
+        isinstance(item, dict) for item in transcript_infos
+    )
     infos = [item for item in transcript_infos if isinstance(item, dict)]
     return {
         "present": present,
@@ -1009,6 +1011,8 @@ def promote_session_stop_v2(
                 if "capture_error_code" in item
             }
         )
+        if any(code not in SESSION_CAPTURE_ERROR_CODES for code in capture_error_codes):
+            raise ValueError("session_stop_observation_unavailable")
         session_ids = {
             item["event"]["session_id"]
             for item in observations
