@@ -192,7 +192,7 @@ intentionally also contains v1 and synthetic fixtures, so stage only the six v2
 structure files into a fresh private directory before running the gate:
 
 ```bash
-GATE_FIXTURE_ROOT="$(mktemp -d)"
+GATE_FIXTURE_ROOT="$(mktemp -d /private/tmp/skill-evolver-v2-gate.XXXXXX)"
 cp "$FIXTURE_ROOT/session-stop-cli.v2.structure.json" "$GATE_FIXTURE_ROOT/session-stop-cli.v2.structure.json"
 cp "$FIXTURE_ROOT/session-stop-desktop.v2.structure.json" "$GATE_FIXTURE_ROOT/session-stop-desktop.v2.structure.json"
 cp "$FIXTURE_ROOT/session-transcript-cli.v2.structure.json" "$GATE_FIXTURE_ROOT/session-transcript-cli.v2.structure.json"

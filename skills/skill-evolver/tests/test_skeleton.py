@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shlex
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -67,7 +69,27 @@ class SkeletonTests(unittest.TestCase):
     def test_readme_stages_exact_private_v2_gate_inventory(self) -> None:
         readme = (PLUGIN_ROOT / "README.md").read_text(encoding="utf-8")
 
-        self.assertIn('GATE_FIXTURE_ROOT="$(mktemp -d)"', readme)
+        creation = next(
+            line for line in readme.splitlines() if line.startswith("GATE_FIXTURE_ROOT=")
+        )
+        self.assertEqual(
+            creation,
+            'GATE_FIXTURE_ROOT="$(mktemp -d /private/tmp/skill-evolver-v2-gate.XXXXXX)"',
+        )
+        command = creation.removeprefix('GATE_FIXTURE_ROOT="$(').removesuffix(')"')
+        result = subprocess.run(
+            shlex.split(command),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        staging_root = Path(result.stdout.strip())
+        try:
+            self.assertEqual(staging_root.parent, Path("/private/tmp"))
+            load_runtime().reject_symlink_components(staging_root, "gate_inputs_invalid")
+        finally:
+            staging_root.rmdir()
+
         self.assertIn('--fixture-root "$GATE_FIXTURE_ROOT"', readme)
         self.assertIn('chmod 0600 "$GATE_FIXTURE_ROOT"/*.v2.structure.json', readme)
         for name in (
