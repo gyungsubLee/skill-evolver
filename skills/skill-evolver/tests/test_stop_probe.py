@@ -10,12 +10,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import SCRIPT, load_runtime, run_isolated
+from support import PROBE_SCRIPT, load_probe_runtime, run_probe_isolated
 
 
 class StopProbeTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.runtime = load_runtime()
+        self.runtime = load_probe_runtime()
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
@@ -97,13 +97,13 @@ class StopProbeTests(unittest.TestCase):
         self.assertNotIn(str(outside), observation.read_text(encoding="utf-8"))
 
     def test_hook_command_is_silent_for_valid_and_oversized_input(self) -> None:
-        valid = run_isolated(
+        valid = run_probe_isolated(
             "probe-stop",
             "--installation",
             str(self.installation_path),
             stdin=json.dumps(self.payload).encode(),
         )
-        oversized = run_isolated(
+        oversized = run_probe_isolated(
             "probe-stop",
             "--installation",
             str(self.installation_path),
@@ -123,7 +123,7 @@ class StopProbeTests(unittest.TestCase):
             [
                 "/usr/bin/python3",
                 "-I",
-                str(SCRIPT),
+                str(PROBE_SCRIPT),
                 "probe-stop",
                 "--installation",
                 str(self.installation_path),

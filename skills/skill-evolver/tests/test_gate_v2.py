@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import PLUGIN_ROOT, load_runtime, run_isolated
+from support import PLUGIN_ROOT, load_probe_runtime, run_probe_isolated
 
 
 V2_FIXTURE_NAMES = {
@@ -91,7 +91,7 @@ def transcript_fixture(surface: str) -> dict[str, object]:
 
 class GateV2Tests(unittest.TestCase):
     def setUp(self) -> None:
-        self.runtime = load_runtime()
+        self.runtime = load_probe_runtime()
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
@@ -636,7 +636,7 @@ class GateV2Tests(unittest.TestCase):
 
     def test_invalid_cli_input_is_sanitized_without_paths_or_exception_text(self) -> None:
         sentinel = "secret-path-and-exception"
-        result = run_isolated(
+        result = run_probe_isolated(
             "probe-v2-gate", "--fixture-root", f"/{sentinel}",
             "--predecessor-json", f"/{sentinel}-predecessor",
             "--output-json", f"/{sentinel}-json",

@@ -11,12 +11,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import load_runtime, run_isolated
+from support import load_probe_runtime, run_probe_isolated
 
 
 class SessionStopV2Tests(unittest.TestCase):
     def setUp(self) -> None:
-        self.runtime = load_runtime()
+        self.runtime = load_probe_runtime()
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -107,11 +107,11 @@ class SessionStopV2Tests(unittest.TestCase):
         self.assertNotIn("event", stored)
 
     def test_v2_stop_command_is_silent_for_valid_and_oversized_input(self) -> None:
-        valid = run_isolated(
+        valid = run_probe_isolated(
             "probe-v2-stop", "--installation", str(self.installation.data_root / "installation.json"),
             stdin=json.dumps(self.payload).encode(),
         )
-        oversized = run_isolated(
+        oversized = run_probe_isolated(
             "probe-v2-stop", "--installation", str(self.installation.data_root / "installation.json"),
             stdin=b"x" * 65_537,
         )
@@ -125,7 +125,7 @@ class SessionStopV2Tests(unittest.TestCase):
             '{"deep-input-secret":' + "[" * 1_100 + "0" + "]" * 1_100 + "}"
         ).encode()
         before = {path.name for path in self.runtime.session_observation_paths(self.installation)}
-        result = run_isolated(
+        result = run_probe_isolated(
             "probe-v2-stop",
             "--installation",
             str(self.installation.data_root / "installation.json"),
@@ -161,7 +161,7 @@ class SessionStopV2Tests(unittest.TestCase):
         for name, (transcript, expected) in cases.items():
             with self.subTest(name=name):
                 before = {path.name for path in self.runtime.session_observation_paths(self.installation)}
-                result = run_isolated(
+                result = run_probe_isolated(
                     "probe-v2-stop",
                     "--installation",
                     str(self.installation.data_root / "installation.json"),

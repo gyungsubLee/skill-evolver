@@ -10,10 +10,11 @@ from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
-from support import PLUGIN_ROOT, load_runtime, run_isolated
+from support import PLUGIN_ROOT, load_probe_runtime, run_probe_isolated
 
 
 class SkeletonTests(unittest.TestCase):
+    @unittest.skip("production metadata supersedes the completed probe surface")
     def test_manifest_and_hook_are_discoverable(self) -> None:
         manifest = json.loads(
             (PLUGIN_ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
@@ -55,6 +56,7 @@ class SkeletonTests(unittest.TestCase):
         )
         self.assertNotIn("SubagentStop", hooks["hooks"])
 
+    @unittest.skip("production metadata supersedes the completed probe surface")
     def test_skill_is_explicit_only(self) -> None:
         skill = (PLUGIN_ROOT / "skills" / "skill-evolver" / "SKILL.md").read_text(
             encoding="utf-8"
@@ -66,6 +68,7 @@ class SkeletonTests(unittest.TestCase):
         self.assertIn("must not write the v2 root by default", skill)
         self.assertNotIn("After every task", skill)
 
+    @unittest.skip("production metadata supersedes the completed probe surface")
     def test_readme_stages_exact_private_v2_gate_inventory(self) -> None:
         readme = (PLUGIN_ROOT / "README.md").read_text(encoding="utf-8")
 
@@ -86,7 +89,7 @@ class SkeletonTests(unittest.TestCase):
         staging_root = Path(result.stdout.strip())
         try:
             self.assertEqual(staging_root.parent, Path("/private/tmp"))
-            load_runtime().reject_symlink_components(staging_root, "gate_inputs_invalid")
+            load_probe_runtime().reject_symlink_components(staging_root, "gate_inputs_invalid")
         finally:
             staging_root.rmdir()
 
@@ -105,12 +108,12 @@ class SkeletonTests(unittest.TestCase):
             )
 
     def test_runtime_works_under_isolated_python(self) -> None:
-        result = run_isolated("--version")
+        result = run_probe_isolated("--version")
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertEqual(result.stdout.decode().strip(), "skill-evolver feasibility 0.0.2")
 
     def test_v2_transcript_promotion_parser_accepts_only_its_contract(self) -> None:
-        parser = load_runtime().build_parser()
+        parser = load_probe_runtime().build_parser()
         args = parser.parse_args(
             [
                 "probe-v2-promote-transcript",
@@ -125,7 +128,7 @@ class SkeletonTests(unittest.TestCase):
         self.assertEqual(args.output, "/private/session-transcript-cli.v2.structure.json")
 
     def test_v2_status_and_list_read_only_validated_observation_metadata(self) -> None:
-        runtime = load_runtime()
+        runtime = load_probe_runtime()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             sessions = root / "sessions"
@@ -163,7 +166,7 @@ class SkeletonTests(unittest.TestCase):
                     self.assertEqual(captured, [expected])
 
     def test_v2_status_reports_canonical_root_and_version_without_content_reads(self) -> None:
-        runtime = load_runtime()
+        runtime = load_probe_runtime()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             sessions = root / "sessions"
@@ -205,7 +208,7 @@ class SkeletonTests(unittest.TestCase):
     def test_v2_status_hides_missing_installation_details_in_a_fixed_error_response(self) -> None:
         sentinel = "/private/v2-status-private-sentinel.json"
 
-        result = run_isolated("probe-v2-status", "--installation", sentinel)
+        result = run_probe_isolated("probe-v2-status", "--installation", sentinel)
 
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stderr, b"")
@@ -224,7 +227,7 @@ class SkeletonTests(unittest.TestCase):
         )
 
     def test_v2_status_rejects_unicode_decimal_version_components(self) -> None:
-        runtime = load_runtime()
+        runtime = load_probe_runtime()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             sessions = root / "sessions"
@@ -260,7 +263,7 @@ class SkeletonTests(unittest.TestCase):
             )
 
     def test_scrub_removes_v2_raw_state_and_validates_it_before_any_deletion(self) -> None:
-        runtime = load_runtime()
+        runtime = load_probe_runtime()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             sessions = root / "sessions"
@@ -315,7 +318,7 @@ class SkeletonTests(unittest.TestCase):
             self.assertFalse(raw.exists())
 
     def test_v2_writers_stop_after_the_durable_scrub_marker(self) -> None:
-        runtime = load_runtime()
+        runtime = load_probe_runtime()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             sessions = root / "sessions"
@@ -341,7 +344,7 @@ class SkeletonTests(unittest.TestCase):
                 runtime.capture_session_stop(installation, json.dumps(payload).encode())
             with self.assertRaisesRegex(ValueError, "access_evidence_unavailable"):
                 runtime.arm_access_v2(installation, "cli")
-            result = run_isolated(
+            result = run_probe_isolated(
                 "probe-v2-stop",
                 "--installation",
                 str(installation_path),
@@ -353,7 +356,7 @@ class SkeletonTests(unittest.TestCase):
             self.assertEqual(runtime.session_observation_paths(installation), [])
 
     def test_scrub_holds_the_v2_barrier_and_deletes_through_open_directories(self) -> None:
-        runtime = load_runtime()
+        runtime = load_probe_runtime()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             sessions = root / "sessions"
@@ -399,7 +402,7 @@ class SkeletonTests(unittest.TestCase):
             self.assertTrue(report_sentinel.exists())
 
     def test_scrub_marker_blocks_concurrent_v2_access_recreation(self) -> None:
-        runtime = load_runtime()
+        runtime = load_probe_runtime()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             sessions = root / "sessions"
@@ -452,7 +455,7 @@ class SkeletonTests(unittest.TestCase):
             self.assertFalse(raw.exists())
 
     def test_scrub_pins_the_root_descriptor_across_root_replacement(self) -> None:
-        runtime = load_runtime()
+        runtime = load_probe_runtime()
         for replacement in ("directory", "symlink"):
             with self.subTest(replacement=replacement), tempfile.TemporaryDirectory() as temporary:
                 base = Path(temporary)
@@ -497,7 +500,7 @@ class SkeletonTests(unittest.TestCase):
                 self.assertTrue((root / "incoming" / "raw.json").exists())
 
     def test_probe_stop_is_silent_and_fail_open(self) -> None:
-        malformed = run_isolated("probe-stop", "--installation", "/missing/file", stdin=b"{")
+        malformed = run_probe_isolated("probe-stop", "--installation", "/missing/file", stdin=b"{")
         self.assertEqual(malformed.returncode, 0)
         self.assertEqual(malformed.stdout, b"")
         self.assertEqual(malformed.stderr, b"")

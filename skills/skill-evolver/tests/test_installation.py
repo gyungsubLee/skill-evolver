@@ -8,12 +8,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import load_runtime
+from support import load_probe_runtime
 
 
 class InstallationTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.runtime = load_runtime()
+        self.runtime = load_probe_runtime()
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / "probe"

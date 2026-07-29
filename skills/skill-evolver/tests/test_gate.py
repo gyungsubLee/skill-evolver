@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import PLUGIN_ROOT, load_runtime
+from support import PLUGIN_ROOT, load_probe_runtime
 
 
 class TtyInput(io.StringIO):
@@ -93,7 +93,7 @@ def transcript_fixture(surface: str, supported: bool = True) -> dict[str, object
 
 class GateTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.runtime = load_runtime()
+        self.runtime = load_probe_runtime()
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()

@@ -8,12 +8,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import load_runtime, run_isolated
+from support import load_probe_runtime, run_probe_isolated
 
 
 class AccessProbeV2Tests(unittest.TestCase):
     def setUp(self) -> None:
-        self.runtime = load_runtime()
+        self.runtime = load_probe_runtime()
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -348,7 +348,7 @@ class AccessProbeV2Tests(unittest.TestCase):
         }
         for command, arguments in commands.items():
             with self.subTest(command=command):
-                result = run_isolated(
+                result = run_probe_isolated(
                     command,
                     *arguments,
                     "--attacker-input",
