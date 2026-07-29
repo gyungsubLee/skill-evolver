@@ -1,5 +1,27 @@
 {
   "schema_version": 1,
   "version": "0.1.0",
-  "installation": "/Users/igyeongseob/.codex/skill-evolver/installation.json"
+  "installation": "/Users/igyeongseob/.codex/skill-evolver/installation.json",
+  "mutable_skill_roots": [
+    "/Users/igyeongseob/.codex/skills"
+  ],
+  "review_limits": {
+    "review_batch_sessions": 5,
+    "max_transcript_bytes": 2097152,
+    "max_transcript_records": 100,
+    "max_review_batch_bytes": 8388608,
+    "max_candidates_per_session": 1,
+    "max_candidates_per_batch": 3,
+    "model_envelope_max_bytes": 131072,
+    "catalog_max_skills": 512,
+    "catalog_frontmatter_max_bytes": 65536,
+    "catalog_inspect_max_bytes": 65536,
+    "catalog_export_max_bytes": 49152,
+    "catalog_identity_max_bytes": 272,
+    "catalog_display_name_max_bytes": 128,
+    "catalog_description_max_bytes": 384,
+    "policy_max_bytes": 8192,
+    "result_schema_instructions_max_bytes": 8192,
+    "claim_contract_overhead_max_bytes": 8192
+  }
 }

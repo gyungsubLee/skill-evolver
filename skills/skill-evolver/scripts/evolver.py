@@ -27,6 +27,51 @@ SCHEMA_VERSION = 1
 MAX_HOOK_BYTES = 65_536
 SQLITE_INTEGER_MAX = 9_223_372_036_854_775_807
 
+SKILL_ROOT = Path(__file__).resolve().parent.parent
+RUNTIME_REFERENCE_PATH = SKILL_ROOT / "references/runtime.json"
+POLICY_PATH = SKILL_ROOT / "references/improvement-policy.md"
+
+REVIEW_BATCH_SESSIONS_MAX = 5
+TRANSCRIPT_SESSION_MAX_BYTES = 2_097_152
+TRANSCRIPT_SESSION_MAX_RECORDS = 100
+REVIEW_BATCH_MAX_BYTES = 8_388_608
+MODEL_ENVELOPE_MAX_BYTES = 131_072
+CATALOG_MAX_SKILLS = 512
+CATALOG_FRONTMATTER_MAX_BYTES = 65_536
+CATALOG_INSPECT_MAX_BYTES = 65_536
+CATALOG_EXPORT_MAX_BYTES = 49_152
+CATALOG_IDENTITY_MAX_BYTES = 272
+CATALOG_DISPLAY_NAME_MAX_BYTES = 128
+CATALOG_DESCRIPTION_MAX_BYTES = 384
+POLICY_MAX_BYTES = 8_192
+RESULT_SCHEMA_INSTRUCTIONS_MAX_BYTES = 8_192
+CLAIM_CONTRACT_OVERHEAD_MAX_BYTES = 8_192
+FIXED_MUTABLE_SKILL_ROOTS = (Path("/Users/igyeongseob/.codex/skills"),)
+
+REVIEW_RUNTIME_FIXED = {
+    "review_batch_sessions": REVIEW_BATCH_SESSIONS_MAX,
+    "max_transcript_bytes": TRANSCRIPT_SESSION_MAX_BYTES,
+    "max_transcript_records": TRANSCRIPT_SESSION_MAX_RECORDS,
+    "max_review_batch_bytes": REVIEW_BATCH_MAX_BYTES,
+    "max_candidates_per_session": 1,
+    "max_candidates_per_batch": 3,
+    "model_envelope_max_bytes": MODEL_ENVELOPE_MAX_BYTES,
+    "catalog_max_skills": CATALOG_MAX_SKILLS,
+    "catalog_frontmatter_max_bytes": CATALOG_FRONTMATTER_MAX_BYTES,
+    "catalog_inspect_max_bytes": CATALOG_INSPECT_MAX_BYTES,
+    "catalog_export_max_bytes": CATALOG_EXPORT_MAX_BYTES,
+    "catalog_identity_max_bytes": CATALOG_IDENTITY_MAX_BYTES,
+    "catalog_display_name_max_bytes": CATALOG_DISPLAY_NAME_MAX_BYTES,
+    "catalog_description_max_bytes": CATALOG_DESCRIPTION_MAX_BYTES,
+    "policy_max_bytes": POLICY_MAX_BYTES,
+    "result_schema_instructions_max_bytes": (
+        RESULT_SCHEMA_INSTRUCTIONS_MAX_BYTES
+    ),
+    "claim_contract_overhead_max_bytes": (
+        CLAIM_CONTRACT_OVERHEAD_MAX_BYTES
+    ),
+}
+
 DEFAULTS = {
     "pending_retention_days": 14,
     "pending_limit_sessions": 200,
@@ -46,6 +91,12 @@ DEFAULTS = {
 HARD_LIMITS = {
     "spool_limit_files": 200,
     "spool_limit_bytes": 10_485_760,
+    "review_batch_sessions": REVIEW_BATCH_SESSIONS_MAX,
+    "max_transcript_bytes": TRANSCRIPT_SESSION_MAX_BYTES,
+    "max_transcript_records": TRANSCRIPT_SESSION_MAX_RECORDS,
+    "max_review_batch_bytes": REVIEW_BATCH_MAX_BYTES,
+    "max_candidates_per_session": 1,
+    "max_candidates_per_batch": 3,
 }
 
 SCHEMA_SQL = """
@@ -174,6 +225,28 @@ class Config:
 
 
 @dataclass(frozen=True)
+class ReviewRuntime:
+    mutable_skill_roots: tuple[Path, ...]
+    review_batch_sessions: int
+    max_transcript_bytes: int
+    max_transcript_records: int
+    max_review_batch_bytes: int
+    max_candidates_per_session: int
+    max_candidates_per_batch: int
+    model_envelope_max_bytes: int
+    catalog_max_skills: int
+    catalog_frontmatter_max_bytes: int
+    catalog_inspect_max_bytes: int
+    catalog_export_max_bytes: int
+    catalog_identity_max_bytes: int
+    catalog_display_name_max_bytes: int
+    catalog_description_max_bytes: int
+    policy_max_bytes: int
+    result_schema_instructions_max_bytes: int
+    claim_contract_overhead_max_bytes: int
+
+
+@dataclass(frozen=True)
 class CapturedSessionStop:
     session_id: str
     diagnostic_turn_id: Optional[str]
@@ -194,6 +267,51 @@ def canonical_json_bytes(value: object) -> bytes:
 
 def sha256_json(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def load_review_runtime() -> ReviewRuntime:
+    payload = json.loads(RUNTIME_REFERENCE_PATH.read_text(encoding="utf-8"))
+    if (
+        not isinstance(payload, dict)
+        or set(payload)
+        != {
+            "schema_version",
+            "version",
+            "installation",
+            "mutable_skill_roots",
+            "review_limits",
+        }
+        or payload["schema_version"] != 1
+        or payload["version"] != "0.1.0"
+        or payload["installation"]
+        != "/Users/igyeongseob/.codex/skill-evolver/installation.json"
+        or payload["mutable_skill_roots"]
+        != [str(path) for path in FIXED_MUTABLE_SKILL_ROOTS]
+        or payload["review_limits"] != REVIEW_RUNTIME_FIXED
+    ):
+        raise ValueError("invalid_review_runtime")
+    return ReviewRuntime(
+        mutable_skill_roots=FIXED_MUTABLE_SKILL_ROOTS,
+        **REVIEW_RUNTIME_FIXED,
+    )
+
+
+def load_improvement_policy(runtime: ReviewRuntime) -> bytes:
+    with POLICY_PATH.open("rb") as stream:
+        encoded = stream.read(runtime.policy_max_bytes + 1)
+    if len(encoded) > runtime.policy_max_bytes:
+        raise ValueError("improvement_policy_too_large")
+    try:
+        text = encoded.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("invalid_improvement_policy") from None
+    if not text.strip():
+        raise ValueError("invalid_improvement_policy")
+    return encoded
+
+
+def improvement_policy_digest(policy: bytes) -> str:
+    return hashlib.sha256(policy).hexdigest()
 
 
 def fsync_directory(path: Path) -> None:
