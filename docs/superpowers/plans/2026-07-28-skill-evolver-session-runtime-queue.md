@@ -53,13 +53,18 @@
   skill, emits no stdout/stderr, and exits `0` on every path.
 - Bare `$skill-evolver` and `$skill-evolver status` use SQLite read-only mode,
   do not import or clean the spool, and do not open transcripts.
+- Initialization creates the staged schema in rollback-journal mode, atomically
+  places the complete root, then uses one controlled final-path writer to
+  switch to WAL and create its private sidecars before an immediate read-only
+  status open.
 - Review and maintenance mutations require approval scoped to the exact command
   and global data root for that invocation. No permanent writable-root grant is
   requested or documented.
 - Defaults are 5 review sessions, 200 pending sessions, 14-day pending
   retention, 30-day raw-metadata TTL, 180-day session-key dedupe, and a spool
   capped at 200 files or 10 MiB. Hook-side spool locking waits at most 50 ms;
-  overflow uses a bounded 64-KiB append-only counter and reports saturation.
+  fallback scans at most 201 directory entries, and overflow uses a separately
+  locked, bounded 64-KiB append-only counter that reports saturation.
 - Transcript limits remain 2 MiB and 100 complete JSONL records per session and
   8 MiB per review batch. Candidate limits remain one per session and three new
   fingerprints per batch.
@@ -354,7 +359,9 @@ Expected: only the eleven listed test/harness paths are committed.
   `initialize_runtime(data_root, transcript_roots, config) -> Path`,
   `load_installation(path) -> Installation`,
   `load_config(installation) -> Config`, and
-  `open_database(installation, busy_ms=1000, read_only=False) -> sqlite3.Connection`.
+  `open_database(installation, busy_ms=1000, read_only=False, *,
+  enable_wal=True) -> sqlite3.Connection`. `enable_wal=False` is used only for
+  the staged schema before final placement.
 - SQLite produces one unique `review_items.session_key`, session generation and
   epoch boundaries, frozen locator state, batch/evidence tables, and no
   turn-count or event-key columns.
@@ -451,17 +458,44 @@ class RuntimeStoreTests(unittest.TestCase):
         )
         self.assertEqual(len(installation.identity_key.read_bytes()), 32)
 
-    def test_read_only_database_connection_rejects_mutation(self) -> None:
+    def test_status_database_is_read_only_openable_immediately_after_init(self) -> None:
         installation_path = self.runtime.initialize_runtime(
             self.base / "data", (self.sessions,), self.config
         )
         installation = self.runtime.load_installation(installation_path)
-        connection = self.runtime.open_database(installation, read_only=True)
-        with self.assertRaises(sqlite3.OperationalError):
-            connection.execute(
-                "INSERT INTO metadata(key,value) VALUES('forbidden','write')"
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{installation.database}{suffix}")
+            self.assertTrue(sidecar.is_file())
+            self.assertEqual(stat.S_IMODE(sidecar.stat().st_mode), 0o600)
+        connection = None
+        installation.data_root.chmod(0o500)
+        try:
+            connection = self.runtime.open_database(
+                installation, read_only=True
             )
-        connection.close()
+            self.assertEqual(
+                str(
+                    connection.execute(
+                        "PRAGMA journal_mode"
+                    ).fetchone()[0]
+                ).lower(),
+                "wal",
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT value FROM metadata WHERE key='journal_mode'"
+                ).fetchone()[0],
+                "wal",
+            )
+            with self.assertRaises(sqlite3.OperationalError):
+                connection.execute(
+                    "INSERT INTO metadata(key,value) "
+                    "VALUES('forbidden','write')"
+                )
+        finally:
+            if connection is not None:
+                connection.close()
+            installation.data_root.chmod(0o700)
 
     def test_environment_cannot_redirect_installation(self) -> None:
         installation_path = self.runtime.initialize_runtime(
@@ -558,7 +592,10 @@ class RuntimeStoreTests(unittest.TestCase):
         installation_path = self.runtime.initialize_runtime(
             root, (self.sessions,), self.config
         )
-        self.assertEqual(installation_path, root / "installation.json")
+        self.assertEqual(
+            installation_path.resolve(),
+            (root / "installation.json").resolve(),
+        )
 
 
 if __name__ == "__main__":
@@ -871,6 +908,7 @@ def initialize_runtime(
     staging = Path(
         tempfile.mkdtemp(prefix=f".{root.name}.", dir=root.parent)
     )
+    placed = False
     try:
         staging = private_directory(staging)
         spool = staging / "spool"
@@ -891,18 +929,37 @@ def initialize_runtime(
             staging / "identity.key", secrets.token_bytes(32)
         )
         installation = load_installation(staging_installation)
-        connection = open_database(installation)
+        connection = open_database(installation, enable_wal=False)
         connection.close()
         atomic_write_json(
             staging_installation,
             {**installation_payload, "data_root": str(root)},
         )
         os.replace(staging, root)
+        placed = True
+        fsync_directory(root.parent)
+
+        installation = load_installation(root / "installation.json")
+        connection = open_database(installation)
+        try:
+            # This final-path write creates the WAL/SHM sidecars required by a
+            # read-only SQLite status process after the writer closes.
+            connection.execute(
+                "INSERT INTO metadata(key,value) VALUES('journal_mode','wal')"
+            )
+        finally:
+            connection.close()
+        for suffix in ("-wal", "-shm"):
+            private_file(Path(f"{installation.database}{suffix}"))
+        status_connection = open_database(installation, read_only=True)
+        status_connection.close()
+        fsync_directory(root)
     except BaseException:
-        if staging.exists():
-            shutil.rmtree(staging)
+        partial = root if placed else staging
+        if partial.exists():
+            shutil.rmtree(partial)
+        fsync_directory(root.parent)
         raise
-    fsync_directory(root.parent)
     return root / "installation.json"
 
 
@@ -961,6 +1018,8 @@ def open_database(
     installation: Installation,
     busy_ms: int = 1_000,
     read_only: bool = False,
+    *,
+    enable_wal: bool = True,
 ) -> sqlite3.Connection:
     if installation.database.exists():
         private_file(installation.database)
@@ -1008,10 +1067,19 @@ def open_database(
             connection.close()
             raise
     if not read_only:
-        mode = str(connection.execute("PRAGMA journal_mode = WAL").fetchone()[0])
-        if mode.lower() != "wal":
+        requested_mode = "WAL" if enable_wal else "DELETE"
+        mode = str(
+            connection.execute(
+                f"PRAGMA journal_mode = {requested_mode}"
+            ).fetchone()[0]
+        )
+        if mode.lower() != requested_mode.lower():
             connection.close()
-            raise ValueError("wal_unavailable")
+            raise ValueError(
+                "wal_unavailable"
+                if enable_wal
+                else "delete_journal_unavailable"
+            )
         os.chmod(installation.database, 0o600)
     return connection
 
@@ -1063,9 +1131,11 @@ Run:
   -v
 ```
 
-Expected: all store tests PASS, including read-only SQLite rejecting a write,
-an unsafe pre-existing root remaining untouched, exact private-file modes, and
-a failed schema transaction leaving `user_version == 0`.
+Expected: all store tests PASS, including DELETE-mode staged schema creation,
+the controlled final-path WAL transition, an immediate `mode=ro` open after
+initialization, read-only SQLite rejecting a write, an unsafe pre-existing root
+remaining untouched, exact private-file modes, and a failed schema transaction
+leaving `user_version == 0`.
 
 - [ ] **Step 5: Commit the store**
 
@@ -1098,6 +1168,9 @@ Expected: only the runtime and focused test file are committed.
   silent `enqueue-stop` command.
 - The Hook observes transcript path/stat only. It never reads transcript bytes
   and never increments `transcript_epoch`.
+- Spool fallback streams at most 201 directory entries before failing
+  conservatively, validates only the bounded selected JSON files, and records
+  overflow under a separate bounded nonblocking lock on the counter itself.
 
 - [ ] **Step 1: Add failing identity, upsert, capacity, spool, and Hook tests**
 
@@ -1373,6 +1446,98 @@ class SessionCaptureTests(unittest.TestCase):
             ),
             "1\n",
         )
+
+    def test_overflow_counter_never_exceeds_hard_cap(self) -> None:
+        counter = self.installation.spool / "overflow.events"
+        counter.write_bytes(
+            b"1\n" * (self.runtime.MAX_OVERFLOW_EVENT_BYTES // 2 - 1)
+            + b"1"
+        )
+        counter.chmod(0o600)
+        self.runtime.record_spool_overflow(self.installation)
+        self.assertEqual(
+            counter.stat().st_size,
+            self.runtime.MAX_OVERFLOW_EVENT_BYTES - 1,
+        )
+
+    def test_concurrent_overflow_appends_share_one_hard_cap_decision(self) -> None:
+        counter = self.installation.spool / "overflow.events"
+        counter.write_bytes(
+            b"1\n" * (self.runtime.MAX_OVERFLOW_EVENT_BYTES // 2 - 1)
+        )
+        counter.chmod(0o600)
+        barrier = threading.Barrier(16)
+        failures: list[BaseException] = []
+
+        def overflow() -> None:
+            try:
+                barrier.wait(timeout=2)
+                self.runtime.record_spool_overflow(self.installation)
+            except BaseException as error:
+                failures.append(error)
+
+        workers = [
+            threading.Thread(target=overflow, daemon=True) for _ in range(16)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=4)
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(failures, [])
+        self.assertEqual(
+            counter.stat().st_size,
+            self.runtime.MAX_OVERFLOW_EVENT_BYTES,
+        )
+
+    def test_spool_directory_scan_fails_boundedly_at_entry_limit(self) -> None:
+        event = self.runtime.parse_session_stop(
+            json.dumps(self.payload).encode(),
+            self.installation,
+            self.runtime_config,
+        )
+        assert event is not None
+        key = self.runtime.session_key(self.installation, event.session_id)
+        for index in range(self.runtime.MAX_SPOOL_SCAN_ENTRIES):
+            path = self.installation.spool / f"junk-{index:03d}"
+            path.write_bytes(b"")
+            path.chmod(0o600)
+        started = time.monotonic()
+        spooled = self.runtime.spool_session_stop(
+            self.installation,
+            self.runtime_config,
+            event,
+            key,
+            2_000_000_000.0,
+        )
+        self.assertFalse(spooled)
+        self.assertLess(time.monotonic() - started, 0.25)
+        self.assertEqual(
+            list(self.installation.spool.glob("*.json")),
+            [],
+        )
+
+    def test_spool_size_scan_rejects_nonprivate_json_file(self) -> None:
+        event = self.runtime.parse_session_stop(
+            json.dumps(self.payload).encode(),
+            self.installation,
+            self.runtime_config,
+        )
+        assert event is not None
+        key = self.runtime.session_key(self.installation, event.session_id)
+        unsafe = self.installation.spool / "unsafe.json"
+        unsafe.write_bytes(b"{}\n")
+        unsafe.chmod(0o644)
+        with self.assertRaisesRegex(
+            ValueError, "private_file_permissions"
+        ):
+            self.runtime.spool_session_stop(
+                self.installation,
+                self.runtime_config,
+                event,
+                key,
+                2_000_000_000.0,
+            )
 
     def test_spool_lock_contention_returns_within_hook_budget(self) -> None:
         event = self.runtime.parse_session_stop(
@@ -1843,7 +2008,9 @@ def spooled_stop_payload(
     }
 
 
+OVERFLOW_EVENT = b"1\n"
 MAX_OVERFLOW_EVENT_BYTES = 65_536
+MAX_SPOOL_SCAN_ENTRIES = 201
 
 
 def record_spool_overflow(installation: Installation) -> None:
@@ -1864,10 +2031,11 @@ def record_spool_overflow(installation: Installation) -> None:
             or stat.S_IMODE(info.st_mode) != 0o600
         ):
             raise ValueError("spool_overflow_permissions")
-        if info.st_size < MAX_OVERFLOW_EVENT_BYTES:
-            # One O_APPEND write is atomic for this two-byte record. Status
-            # reports saturation once the bounded counter reaches its cap.
-            os.write(descriptor, b"1\n")
+        if not acquire_spool_lock(descriptor, timeout_seconds=0.005):
+            return
+        info = os.fstat(descriptor)
+        if info.st_size + len(OVERFLOW_EVENT) <= MAX_OVERFLOW_EVENT_BYTES:
+            os.write(descriptor, OVERFLOW_EVENT)
             os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -1905,8 +2073,25 @@ def spool_session_stop(
         if not acquire_spool_lock(lock.fileno()):
             record_spool_overflow(installation)
             return False
-        files = list(installation.spool.glob("*.json"))
-        total = sum(path.stat().st_size for path in files)
+        files: list[Path] = []
+        with os.scandir(installation.spool) as entries:
+            for scanned, entry in enumerate(entries, start=1):
+                # Seeing the 201st entry is enough to fail conservatively; do
+                # not stat it or continue through an attacker-inflated spool.
+                if scanned >= MAX_SPOOL_SCAN_ENTRIES:
+                    record_spool_overflow(installation)
+                    return False
+                if not entry.name.endswith(".json"):
+                    continue
+                files.append(Path(entry.path))
+                if len(files) >= config.spool_limit_files:
+                    record_spool_overflow(installation)
+                    return False
+        total = 0
+        for path in files:
+            if path.is_symlink():
+                raise ValueError("spool_payload_symlink")
+            total += private_file(path).stat().st_size
         encoded = (
             canonical_json_bytes(
                 spooled_stop_payload(event, key, config, now)
@@ -1994,8 +2179,10 @@ Run:
 
 Expected: all tests PASS. Missing `turn_id` queues successfully, repeated Stops
 produce one session row, capacity is one pending session in the focused test,
-the spool caps at one file there, invalid JSONL transcript content is never
-parsed, and every Hook subprocess is silent with exit code `0`.
+the spool caps at one file there, its directory scan stops at entry 201, unsafe
+spool files fail closed, concurrent overflow appends never exceed 64 KiB,
+invalid JSONL transcript content is never parsed, and every Hook subprocess is
+silent with exit code `0`.
 
 - [ ] **Step 7: Commit session capture**
 
@@ -2912,6 +3099,23 @@ class MaintenanceStatusTests(unittest.TestCase):
         assert event is not None
         return event
 
+    def test_status_command_opens_read_only_immediately_after_init(self) -> None:
+        database_before = self.installation.database.read_bytes()
+        process = run_isolated(
+            "status",
+            "--installation",
+            str(self.installation_path),
+        )
+        self.assertEqual(process.returncode, 0)
+        self.assertEqual(process.stderr, b"")
+        status = json.loads(process.stdout)
+        self.assertEqual(status["pending_sessions"], 0)
+        self.assertEqual(status["spool"]["files"], 0)
+        self.assertEqual(
+            self.installation.database.read_bytes(),
+            database_before,
+        )
+
     def test_spool_import_converges_by_session_and_deletes_invalid_payload(self) -> None:
         now = 2_000_000_000.0
         event = self.event()
@@ -3099,6 +3303,12 @@ class MaintenanceStatusTests(unittest.TestCase):
         waiting = self.installation.spool / "waiting.json"
         waiting.write_text("{}\n", encoding="utf-8")
         waiting.chmod(0o600)
+        overflow = self.installation.spool / "overflow.events"
+        overflow.write_bytes(
+            b"1\n" * (self.runtime.MAX_OVERFLOW_EVENT_BYTES // 2 - 1)
+            + b"1"
+        )
+        overflow.chmod(0o600)
         self.transcript.unlink()
 
         read_only = self.runtime.open_database(
@@ -3114,6 +3324,8 @@ class MaintenanceStatusTests(unittest.TestCase):
         self.assertEqual(status["leases"], {"active": 0, "expired": 0})
         self.assertEqual(status["spool"]["files"], 1)
         self.assertEqual(status["spool"]["bytes"], waiting.stat().st_size)
+        self.assertEqual(status["spool"]["overflow_total"], 32_767)
+        self.assertTrue(status["spool"]["overflow_counter_saturated"])
         self.assertTrue(waiting.exists())
 
         captured: list[dict[str, object]] = []
@@ -3546,9 +3758,10 @@ def queue_status(
         "spool": {
             "files": spool_files,
             "bytes": spool_bytes,
-            "overflow_total": overflow_bytes // 2,
+            "overflow_total": overflow_bytes // len(OVERFLOW_EVENT),
             "overflow_counter_saturated": (
-                overflow_bytes >= MAX_OVERFLOW_EVENT_BYTES
+                overflow_bytes + len(OVERFLOW_EVENT)
+                > MAX_OVERFLOW_EVENT_BYTES
             ),
         },
         "last_hook_success_at": metadata.get("last_hook_success_at"),
@@ -3612,8 +3825,10 @@ Run:
 
 Expected: all tests PASS. Two spooled Stops converge to one session, malformed
 spool JSON is deleted, 14-day pending/spool data is removed, 180-day dedupe is
-removed, and status reports session/generation/lease/spool/privacy health after
-the transcript file itself has been deleted.
+removed, status succeeds read-only immediately after initialization, and status
+reports session/generation/lease/spool/privacy health after the transcript file
+itself has been deleted, including saturation when no complete overflow record
+fits below the 64-KiB cap.
 
 - [ ] **Step 7: Commit maintenance and status**
 
@@ -4094,14 +4309,17 @@ Expected:
   from becoming a second independent occurrence.
 - Capacity, retention, batch, health, and completion evidence are expressed in
   sessions and generations, never Stop/turn counts.
-- Spool is bounded at 200 files/10 MiB, its lock wait is bounded, and its
-  64-KiB overflow counter discloses saturation. Malformed and 14-day-expired
-  raw spool payloads are deleted, raw row metadata is cleared by 30 days, and
-  HMAC dedupe rows are removed after 180 days.
-- Status uses SQLite `mode=ro`, stats but does not import the spool, opens no
-  transcript, and reports pending sessions/generations, oldest age, leases,
-  excluded/expired/binding failures, spool count/bytes/overflow, last Hook
-  success, and raw cleanup health.
+- Spool is bounded at 200 files/10 MiB, its fallback scans no more than 201
+  directory entries, its lock wait is bounded, and its separately serialized
+  64-KiB overflow counter cannot exceed its cap and discloses saturation.
+  Malformed and 14-day-expired raw spool payloads are deleted, raw row metadata
+  is cleared by 30 days, and HMAC dedupe rows are removed after 180 days.
+- Initialization builds the staged schema in DELETE mode, switches to WAL only
+  after final placement under a controlled writer, and proves an immediate
+  read-only status open. Status uses SQLite `mode=ro`, stats but does not import
+  the spool, opens no transcript, and reports pending sessions/generations,
+  oldest age, leases, excluded/expired/binding failures, spool
+  count/bytes/overflow, last Hook success, and raw cleanup health.
 - Review and maintenance writes require approval for the exact invocation and
   global root. No persistent write grant is created.
 - The Hook has no model call, transcript parsing/read, network access, skill
