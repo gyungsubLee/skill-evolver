@@ -240,3 +240,269 @@ class ReviewConfigLimitTests(unittest.TestCase):
         self.installation.config_path.chmod(0o600)
         with self.assertRaisesRegex(ValueError, "invalid_config_keys"):
             self.runtime.load_config(self.installation)
+
+
+class FrontmatterScalarTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.runtime = load_runtime()
+
+    def test_plain_quoted_and_folded_scalars(self) -> None:
+        cases = (
+            (
+                b"---\nname: plain\ndescription: Plain description.\n---\n",
+                ("plain", "Plain description."),
+            ),
+            (
+                b'---\nname: "quoted"\ndescription: "Quoted: safe"\n---\n',
+                ("quoted", "Quoted: safe"),
+            ),
+            (
+                b"---\nname: folded\ndescription: >\n  first line\n"
+                b"  second line\nlicense: local\n---\n",
+                ("folded", "first line second line"),
+            ),
+        )
+        for raw, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(
+                    self.runtime.parse_frontmatter_scalars(raw, 65_536),
+                    expected,
+                )
+
+    def test_parser_rejects_non_scalar_duplicate_and_overflow(self) -> None:
+        invalid = (
+            b"---\nname: nested\ndescription:\n  child: value\n---\n",
+            b"---\nname: alias\ndescription: *external\n---\n",
+            b"---\nname: one\nname: two\ndescription: duplicate\n---\n",
+            b"---\nname: missing-description\n---\n",
+            b"name: no-frontmatter\ndescription: invalid\n",
+        )
+        for raw in invalid:
+            with self.subTest(raw=raw):
+                with self.assertRaisesRegex(
+                    ValueError, "invalid_skill_frontmatter"
+                ):
+                    self.runtime.parse_frontmatter_scalars(raw, 65_536)
+        with self.assertRaisesRegex(
+            ValueError, "skill_frontmatter_too_large"
+        ):
+            self.runtime.parse_frontmatter_scalars(
+                b"---\nname: x\ndescription: " + b"x" * 65_536,
+                65_536,
+            )
+
+
+class TrustedCatalogTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.runtime = load_runtime()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name).resolve()
+        self.skills = self.base / "skills"
+        self.skills.mkdir(mode=0o700)
+        self.review = replace(
+            self.runtime.load_review_runtime(),
+            mutable_skill_roots=(self.skills,),
+        )
+
+    def write_skill(
+        self,
+        directory_name: str,
+        display_name: str,
+        description: str,
+        body: bytes = b"# Body\n",
+    ) -> Path:
+        directory = self.skills / directory_name
+        directory.mkdir(mode=0o700)
+        encoded = (
+            b"---\nname: "
+            + display_name.encode("utf-8")
+            + b"\ndescription: "
+            + description.encode("utf-8")
+            + b"\n---\n"
+            + body
+        )
+        skill = directory / "SKILL.md"
+        skill.write_bytes(encoded)
+        skill.chmod(0o600)
+        return skill
+
+    def test_snapshot_exports_only_bounded_public_fields(self) -> None:
+        self.write_skill("beta", "Beta", "Second safe skill.")
+        self.write_skill("alpha", "Alpha", "First safe skill.")
+        snapshot = self.runtime.build_catalog_snapshot(self.review)
+        export = self.runtime.catalog_export_payload(snapshot)
+        self.assertEqual(
+            export,
+            [
+                {
+                    "identity": "user-skill:alpha",
+                    "display_name": "Alpha",
+                    "description": "First safe skill.",
+                },
+                {
+                    "identity": "user-skill:beta",
+                    "display_name": "Beta",
+                    "description": "Second safe skill.",
+                },
+            ],
+        )
+        self.assertEqual(
+            snapshot.export_bytes,
+            self.runtime.canonical_json_bytes(export),
+        )
+        self.assertNotIn(str(self.skills).encode(), snapshot.export_bytes)
+        self.assertNotIn(b"skill_sha256", snapshot.export_bytes)
+        target = self.runtime.resolve_catalog_target(
+            snapshot, "user-skill:alpha"
+        )
+        self.assertEqual(target.skill_dir, self.skills / "alpha")
+        self.assertEqual(
+            self.runtime.inspect_catalog_target(
+                self.review, snapshot, target.identity
+            ),
+            (target.skill_dir / "SKILL.md").read_bytes(),
+        )
+
+    def test_static_adapter_digest_and_dynamic_snapshot_are_separate(self) -> None:
+        self.write_skill("alpha", "Alpha", "First description.")
+        static_before = self.runtime.catalog_adapter_digest(self.review)
+        first = self.runtime.build_catalog_snapshot(self.review)
+        skill = self.skills / "alpha/SKILL.md"
+        skill.write_bytes(
+            b"---\nname: Alpha\ndescription: Changed description.\n---\n"
+        )
+        skill.chmod(0o600)
+        second = self.runtime.build_catalog_snapshot(self.review)
+        self.assertEqual(
+            self.runtime.catalog_adapter_digest(self.review),
+            static_before,
+        )
+        self.assertNotEqual(first.snapshot_digest, second.snapshot_digest)
+        with self.assertRaisesRegex(
+            self.runtime.CatalogAdapterError, "catalog_target_changed"
+        ):
+            self.runtime.inspect_catalog_target(
+                self.review, first, "user-skill:alpha"
+            )
+
+    def test_symlink_owner_and_mode_checks_fail_closed_per_entry(self) -> None:
+        safe = self.write_skill("safe", "Safe", "Safe entry.")
+        outside = self.base / "outside"
+        outside.mkdir(mode=0o700)
+        (outside / "SKILL.md").write_bytes(
+            b"---\nname: Outside\ndescription: Outside entry.\n---\n"
+        )
+        linked = self.skills / "linked"
+        linked.symlink_to(outside, target_is_directory=True)
+        group_dir = self.write_skill(
+            "group-dir", "GroupDir", "Unsafe directory."
+        ).parent
+        group_dir.chmod(0o720)
+        self.addCleanup(group_dir.chmod, 0o700)
+        group_file = self.write_skill(
+            "group-file", "GroupFile", "Unsafe file."
+        )
+        group_file.chmod(0o620)
+        self.addCleanup(group_file.chmod, 0o600)
+        world_file = self.write_skill(
+            "world-file", "WorldFile", "Unsafe file."
+        )
+        world_file.chmod(0o602)
+        self.addCleanup(world_file.chmod, 0o600)
+        wrong_owner = self.write_skill(
+            "wrong-owner", "WrongOwner", "Unsafe owner."
+        )
+        wrong_inode = wrong_owner.stat().st_ino
+        real_fstat = os.fstat
+
+        def fstat_with_wrong_owner(descriptor: int):
+            info = real_fstat(descriptor)
+            if info.st_ino == wrong_inode:
+                values = list(info)
+                values[4] = info.st_uid + 1
+                return os.stat_result(values)
+            return info
+
+        with mock.patch.object(
+            self.runtime.os, "fstat", side_effect=fstat_with_wrong_owner
+        ):
+            snapshot = self.runtime.build_catalog_snapshot(self.review)
+        self.assertEqual(
+            [entry.identity for entry in snapshot.entries],
+            ["user-skill:safe"],
+        )
+        self.assertEqual(snapshot.rejected_count, 5)
+        self.assertEqual(safe.read_bytes(), (safe.parent / "SKILL.md").read_bytes())
+
+        self.skills.chmod(0o720)
+        self.addCleanup(self.skills.chmod, 0o700)
+        with self.assertRaisesRegex(
+            self.runtime.CatalogAdapterError, "catalog_root_invalid"
+        ):
+            self.runtime.build_catalog_snapshot(self.review)
+
+    def test_exclusions_inventory_and_export_caps_are_exact(self) -> None:
+        self.write_skill(".system", "Managed", "Managed entry.")
+        self.write_skill(
+            "skill-evolver", "Self", "Self operation is forbidden."
+        )
+        self.write_skill("safe", "Safe", "Safe entry.")
+        snapshot = self.runtime.build_catalog_snapshot(self.review)
+        self.assertEqual(
+            [entry.identity for entry in snapshot.entries],
+            ["user-skill:safe"],
+        )
+
+        tiny_export = replace(self.review, catalog_export_max_bytes=10)
+        with self.assertRaisesRegex(
+            self.runtime.CatalogAdapterError, "catalog_export_too_large"
+        ):
+            self.runtime.build_catalog_snapshot(tiny_export)
+
+        for index in range(512):
+            path = self.skills / f"junk-{index:03d}"
+            path.mkdir(mode=0o700)
+        with self.assertRaisesRegex(
+            self.runtime.CatalogAdapterError,
+            "catalog_inventory_saturated",
+        ):
+            self.runtime.build_catalog_snapshot(self.review)
+
+    def test_field_and_inspection_byte_limits_are_utf8_exact(self) -> None:
+        exact_body = b"x" * (
+            65_536
+            - len(b"---\nname: Exact\ndescription: Exact bytes.\n---\n")
+        )
+        exact = self.write_skill(
+            "exact", "Exact", "Exact bytes.", exact_body
+        )
+        snapshot = self.runtime.build_catalog_snapshot(self.review)
+        self.assertEqual(exact.stat().st_size, 65_536)
+        self.assertEqual(
+            len(
+                self.runtime.inspect_catalog_target(
+                    self.review, snapshot, "user-skill:exact"
+                )
+            ),
+            65_536,
+        )
+        with exact.open("ab") as stream:
+            stream.write(b"x")
+        with self.assertRaisesRegex(
+            self.runtime.CatalogAdapterError,
+            "catalog_inspect_too_large",
+        ):
+            self.runtime.inspect_catalog_target(
+                self.review, snapshot, "user-skill:exact"
+            )
+
+        long_description = "가" * 129
+        self.write_skill(
+            "long-description", "Long", long_description
+        )
+        rebuilt = self.runtime.build_catalog_snapshot(self.review)
+        self.assertNotIn(
+            "user-skill:long-description",
+            [entry.identity for entry in rebuilt.entries],
+        )

@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import shutil
 import sqlite3
@@ -248,6 +249,29 @@ class ReviewRuntime:
 
 
 @dataclass(frozen=True)
+class CatalogEntry:
+    identity: str
+    display_name: str
+    description: str
+    skill_dir: Path
+    skill_sha256: str
+
+
+@dataclass(frozen=True)
+class CatalogSnapshot:
+    entries: tuple[CatalogEntry, ...]
+    export_bytes: bytes
+    snapshot_digest: str
+    rejected_count: int
+
+
+class CatalogAdapterError(ValueError):
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+@dataclass(frozen=True)
 class CapturedSessionStop:
     session_id: str
     diagnostic_turn_id: Optional[str]
@@ -335,6 +359,357 @@ def load_improvement_policy(runtime: ReviewRuntime) -> bytes:
 
 def improvement_policy_digest(policy: bytes) -> str:
     return hashlib.sha256(policy).hexdigest()
+
+
+FRONTMATTER_KEY = re.compile(r"[A-Za-z][A-Za-z0-9_-]*\Z")
+FRONTMATTER_FORBIDDEN_PREFIXES = ("!", "&", "*", "{", "[", "`")
+
+
+def _frontmatter_scalar(
+    lines: list[str],
+    index: int,
+    encoded: str,
+) -> tuple[str, int]:
+    value = encoded.strip()
+    if value in {">", ">-", "|", "|-"}:
+        parts: list[str] = []
+        cursor = index + 1
+        while cursor < len(lines):
+            line = lines[cursor]
+            if line and not line[0].isspace():
+                break
+            if line.strip():
+                parts.append(line.strip())
+            cursor += 1
+        if not parts:
+            raise ValueError("invalid_skill_frontmatter")
+        return " ".join(parts), cursor
+    if not value or value.startswith(FRONTMATTER_FORBIDDEN_PREFIXES):
+        raise ValueError("invalid_skill_frontmatter")
+    if value.startswith('"'):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            raise ValueError("invalid_skill_frontmatter") from None
+        if not isinstance(decoded, str):
+            raise ValueError("invalid_skill_frontmatter")
+        return decoded, index + 1
+    if value.startswith("'"):
+        if len(value) < 2 or not value.endswith("'"):
+            raise ValueError("invalid_skill_frontmatter")
+        return value[1:-1].replace("''", "'"), index + 1
+    return value, index + 1
+
+
+def parse_frontmatter_scalars(
+    raw: bytes,
+    maximum: int,
+) -> tuple[str, str]:
+    if type(maximum) is not int or maximum <= 0:
+        raise ValueError("invalid_frontmatter_limit")
+    if len(raw) > maximum:
+        raise ValueError("skill_frontmatter_too_large")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("invalid_skill_frontmatter") from None
+    lines = text.splitlines()
+    if not lines or lines[0] != "---":
+        raise ValueError("invalid_skill_frontmatter")
+    try:
+        closing = lines.index("---", 1)
+    except ValueError:
+        raise ValueError("invalid_skill_frontmatter") from None
+    header = lines[1:closing]
+    fields: dict[str, str] = {}
+    cursor = 0
+    while cursor < len(header):
+        line = header[cursor]
+        if not line.strip() or line.lstrip().startswith("#"):
+            cursor += 1
+            continue
+        if line[0].isspace() or ":" not in line:
+            raise ValueError("invalid_skill_frontmatter")
+        key, encoded = line.split(":", 1)
+        if not FRONTMATTER_KEY.fullmatch(key) or key in fields:
+            raise ValueError("invalid_skill_frontmatter")
+        value, cursor = _frontmatter_scalar(header, cursor, encoded)
+        fields[key] = unicodedata.normalize(
+            "NFC", " ".join(value.split())
+        )
+    try:
+        name = fields["name"]
+        description = fields["description"]
+    except KeyError:
+        raise ValueError("invalid_skill_frontmatter") from None
+    if not name or not description:
+        raise ValueError("invalid_skill_frontmatter")
+    return name, description
+
+
+CATALOG_EXCLUDED_NAMES = frozenset({".system", "skill-evolver"})
+
+
+def catalog_adapter_contract(
+    runtime: ReviewRuntime,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "roots": [str(path) for path in runtime.mutable_skill_roots],
+        "direct_children_only": True,
+        "current_user_only": True,
+        "no_symlinks": True,
+        "forbidden_mode_mask": 0o022,
+        "excluded_names": sorted(CATALOG_EXCLUDED_NAMES),
+        "required_file": "SKILL.md",
+        "frontmatter_parser": "stdlib-scalar-v1",
+        "limits": {
+            "skills": runtime.catalog_max_skills,
+            "frontmatter_bytes": runtime.catalog_frontmatter_max_bytes,
+            "inspect_bytes": runtime.catalog_inspect_max_bytes,
+            "export_bytes": runtime.catalog_export_max_bytes,
+            "identity_bytes": runtime.catalog_identity_max_bytes,
+            "display_name_bytes": (
+                runtime.catalog_display_name_max_bytes
+            ),
+            "description_bytes": runtime.catalog_description_max_bytes,
+        },
+        "export_fields": ["description", "display_name", "identity"],
+        "snapshot_fields": ["identity", "path", "skill_sha256"],
+    }
+
+
+def catalog_adapter_digest(runtime: ReviewRuntime) -> str:
+    return sha256_json(catalog_adapter_contract(runtime))
+
+
+def _catalog_root_descriptor(root: Path) -> int:
+    try:
+        if (
+            not root.is_absolute()
+            or root.is_symlink()
+            or root.resolve(strict=True) != root
+        ):
+            raise CatalogAdapterError("catalog_root_invalid")
+        descriptor = os.open(
+            str(root),
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except (OSError, RuntimeError):
+        raise CatalogAdapterError("catalog_root_invalid") from None
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_mode & 0o022
+    ):
+        os.close(descriptor)
+        raise CatalogAdapterError("catalog_root_invalid")
+    return descriptor
+
+
+def _read_catalog_entry(
+    runtime: ReviewRuntime,
+    root: Path,
+    root_descriptor: int,
+    name: str,
+) -> tuple[CatalogEntry, bytes]:
+    directory_descriptor = os.open(
+        name,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=root_descriptor,
+    )
+    try:
+        directory_info = os.fstat(directory_descriptor)
+        if (
+            not stat.S_ISDIR(directory_info.st_mode)
+            or directory_info.st_uid != os.getuid()
+            or directory_info.st_mode & 0o022
+        ):
+            raise ValueError("unsafe_catalog_directory")
+        skill_descriptor = os.open(
+            "SKILL.md",
+            os.O_RDONLY
+            | os.O_NONBLOCK
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_descriptor,
+        )
+        try:
+            skill_info = os.fstat(skill_descriptor)
+            if (
+                not stat.S_ISREG(skill_info.st_mode)
+                or skill_info.st_uid != os.getuid()
+                or skill_info.st_mode & 0o022
+            ):
+                raise ValueError("unsafe_catalog_file")
+            if skill_info.st_size > runtime.catalog_inspect_max_bytes:
+                raise CatalogAdapterError("catalog_inspect_too_large")
+            chunks: list[bytes] = []
+            remaining = runtime.catalog_inspect_max_bytes + 1
+            while remaining:
+                chunk = os.read(skill_descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+            if len(raw) > runtime.catalog_inspect_max_bytes:
+                raise CatalogAdapterError("catalog_inspect_too_large")
+            after = os.fstat(skill_descriptor)
+            if (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            ) != (
+                skill_info.st_dev,
+                skill_info.st_ino,
+                skill_info.st_size,
+                skill_info.st_mtime_ns,
+            ):
+                raise ValueError("changed_catalog_file")
+        finally:
+            os.close(skill_descriptor)
+    finally:
+        os.close(directory_descriptor)
+    display_name, description = parse_frontmatter_scalars(
+        raw, runtime.catalog_frontmatter_max_bytes
+    )
+    identity = f"user-skill:{name}"
+    if (
+        len(identity.encode("utf-8"))
+        > runtime.catalog_identity_max_bytes
+        or len(display_name.encode("utf-8"))
+        > runtime.catalog_display_name_max_bytes
+        or len(description.encode("utf-8"))
+        > runtime.catalog_description_max_bytes
+    ):
+        raise ValueError("catalog_field_too_large")
+    return (
+        CatalogEntry(
+            identity=identity,
+            display_name=display_name,
+            description=description,
+            skill_dir=root / name,
+            skill_sha256=hashlib.sha256(raw).hexdigest(),
+        ),
+        raw,
+    )
+
+
+def catalog_export_payload(
+    snapshot: CatalogSnapshot,
+) -> list[dict[str, str]]:
+    return [
+        {
+            "identity": entry.identity,
+            "display_name": entry.display_name,
+            "description": entry.description,
+        }
+        for entry in snapshot.entries
+    ]
+
+
+def build_catalog_snapshot(runtime: ReviewRuntime) -> CatalogSnapshot:
+    if len(runtime.mutable_skill_roots) != 1:
+        raise CatalogAdapterError("catalog_root_invalid")
+    root = runtime.mutable_skill_roots[0]
+    descriptor = _catalog_root_descriptor(root)
+    entries: list[CatalogEntry] = []
+    rejected = scanned = 0
+    try:
+        with os.scandir(descriptor) as children:
+            for child in children:
+                if child.name in CATALOG_EXCLUDED_NAMES:
+                    continue
+                scanned += 1
+                if scanned > runtime.catalog_max_skills:
+                    raise CatalogAdapterError(
+                        "catalog_inventory_saturated"
+                    )
+                try:
+                    entry, _ = _read_catalog_entry(
+                        runtime, root, descriptor, child.name
+                    )
+                except (
+                    CatalogAdapterError,
+                    OSError,
+                    UnicodeError,
+                    ValueError,
+                ):
+                    rejected += 1
+                    continue
+                entries.append(entry)
+    finally:
+        os.close(descriptor)
+    entries.sort(key=lambda entry: entry.identity)
+    provisional = CatalogSnapshot(
+        entries=tuple(entries),
+        export_bytes=b"",
+        snapshot_digest="",
+        rejected_count=rejected,
+    )
+    export_bytes = canonical_json_bytes(
+        catalog_export_payload(provisional)
+    )
+    if len(export_bytes) > runtime.catalog_export_max_bytes:
+        raise CatalogAdapterError("catalog_export_too_large")
+    digest_payload = [
+        {
+            "identity": entry.identity,
+            "path": str(entry.skill_dir),
+            "skill_sha256": entry.skill_sha256,
+        }
+        for entry in entries
+    ]
+    return CatalogSnapshot(
+        entries=tuple(entries),
+        export_bytes=export_bytes,
+        snapshot_digest=sha256_json(digest_payload),
+        rejected_count=rejected,
+    )
+
+
+def resolve_catalog_target(
+    snapshot: CatalogSnapshot,
+    target_identity: str,
+) -> CatalogEntry:
+    for entry in snapshot.entries:
+        if entry.identity == target_identity:
+            return entry
+    raise CatalogAdapterError("catalog_target_unknown")
+
+
+def inspect_catalog_target(
+    runtime: ReviewRuntime,
+    snapshot: CatalogSnapshot,
+    target_identity: str,
+) -> bytes:
+    expected = resolve_catalog_target(snapshot, target_identity)
+    if len(runtime.mutable_skill_roots) != 1:
+        raise CatalogAdapterError("catalog_root_invalid")
+    root = runtime.mutable_skill_roots[0]
+    if expected.skill_dir.parent != root:
+        raise CatalogAdapterError("catalog_target_changed")
+    descriptor = _catalog_root_descriptor(root)
+    try:
+        try:
+            current, raw = _read_catalog_entry(
+                runtime, root, descriptor, expected.skill_dir.name
+            )
+        except CatalogAdapterError:
+            raise
+        except (OSError, UnicodeError, ValueError):
+            raise CatalogAdapterError("catalog_target_changed") from None
+    finally:
+        os.close(descriptor)
+    if current != expected:
+        raise CatalogAdapterError("catalog_target_changed")
+    return raw
 
 
 def fsync_directory(path: Path) -> None:
