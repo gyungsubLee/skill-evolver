@@ -11,6 +11,7 @@ import sqlite3
 import stat
 import sys
 import tempfile
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
@@ -246,6 +247,45 @@ def canonical_roots(values: object, *, allow_empty: bool) -> tuple[Path, ...]:
     return tuple(roots)
 
 
+def validate_transcript_root(path: Path) -> Path:
+    requested = path.expanduser()
+    if requested.is_symlink():
+        raise ValueError("transcript_root_symlink")
+    try:
+        resolved = requested.resolve(strict=True)
+    except (FileNotFoundError, NotADirectoryError):
+        raise ValueError("transcript_root_not_directory") from None
+    info = resolved.stat()
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError("transcript_root_not_directory")
+    if info.st_uid != os.getuid():
+        raise ValueError("transcript_root_owner")
+    if stat.S_IMODE(info.st_mode) & stat.S_IWOTH:
+        raise ValueError("transcript_root_permissions")
+    return resolved
+
+
+def path_identity(path: Path) -> str:
+    normalized = unicodedata.normalize(
+        "NFC",
+        os.path.normpath(str(path)),
+    )
+    return unicodedata.normalize("NFC", normalized.casefold())
+
+
+def validate_transcript_separation(
+    data_root: Path, transcript_roots: tuple[Path, ...]
+) -> None:
+    data_parts = Path(path_identity(data_root)).parts
+    for transcript_root in transcript_roots:
+        transcript_parts = Path(path_identity(transcript_root)).parts
+        if (
+            data_parts[: len(transcript_parts)] == transcript_parts
+            or transcript_parts[: len(data_parts)] == data_parts
+        ):
+            raise ValueError("data_transcript_overlap")
+
+
 def initialize_runtime(
     data_root: Path,
     transcript_roots: tuple[Path, ...],
@@ -255,10 +295,14 @@ def initialize_runtime(
     if requested.is_symlink():
         raise ValueError("data_root_symlink")
     root = requested.parent.resolve(strict=True) / requested.name
+    fixed_transcripts = tuple(
+        validate_transcript_root(path)
+        for path in canonical_roots(transcript_roots, allow_empty=False)
+    )
+    validate_transcript_separation(root, fixed_transcripts)
     if root.exists():
         private_directory(root)
         raise ValueError("runtime_already_initialized")
-    fixed_transcripts = canonical_roots(transcript_roots, allow_empty=False)
     excludes = canonical_roots(config.get("exclude_roots", []), allow_empty=True)
     allowed = set(DEFAULTS) | {"capture_paused", "exclude_roots"}
     if set(config) - allowed:
@@ -337,11 +381,16 @@ def load_installation(path: Path) -> Installation:
     root = private_directory(Path(str(payload["data_root"])))
     if installation_path != root / "installation.json":
         raise ValueError("installation_root_mismatch")
+    transcript_roots = tuple(
+        validate_transcript_root(transcript_root)
+        for transcript_root in canonical_roots(
+            payload.get("transcript_roots"), allow_empty=False
+        )
+    )
+    validate_transcript_separation(root, transcript_roots)
     installation = Installation(
         data_root=root,
-        transcript_roots=canonical_roots(
-            payload.get("transcript_roots"), allow_empty=False
-        ),
+        transcript_roots=transcript_roots,
         python=Path("/usr/bin/python3"),
         config_path=root / "config.json",
         identity_key=root / "identity.key",

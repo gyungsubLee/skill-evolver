@@ -369,6 +369,10 @@ Expected: only the eleven listed test/harness paths are committed.
 - SQLite produces one unique `review_items.session_key`, session generation and
   epoch boundaries, frozen locator state, batch/evidence tables, and no
   turn-count or event-key columns.
+- Fixed transcript roots must be current-user-owned, non-world-writable
+  directories and must not contain, equal, or sit below the data root after
+  component-wise NFC/casefold normalization. Generic `exclude_roots`
+  canonicalization remains unchanged.
 
 - [ ] **Step 1: Create failing installation and schema tests**
 
@@ -403,6 +407,102 @@ class RuntimeStoreTests(unittest.TestCase):
             "capture_paused": False,
             "exclude_roots": [str(self.excluded)],
         }
+
+    def replace_transcript_roots(
+        self, installation_path: Path, transcript_roots: tuple[Path, ...]
+    ) -> None:
+        payload = json.loads(installation_path.read_text(encoding="utf-8"))
+        payload["transcript_roots"] = [
+            str(path) for path in transcript_roots
+        ]
+        installation_path.write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+        installation_path.chmod(0o600)
+
+    def test_initialize_rejects_world_writable_transcript_root_before_writes(
+        self,
+    ) -> None:
+        root = self.base / "world-writable-data"
+        self.sessions.chmod(0o777)
+        self.addCleanup(self.sessions.chmod, 0o700)
+
+        with self.assertRaisesRegex(
+            ValueError, "transcript_root_permissions"
+        ):
+            self.runtime.initialize_runtime(
+                root, (self.sessions,), self.config
+            )
+        self.assertFalse(root.exists())
+
+    def test_initialize_rejects_wrong_owner_transcript_root_before_writes(
+        self,
+    ) -> None:
+        root = self.base / "wrong-owner-data"
+        canonical_transcript = self.sessions.resolve()
+        real_stat = Path.stat
+
+        def stat_with_wrong_owner(
+            path: Path, *args: object, **kwargs: object
+        ):
+            info = real_stat(path, *args, **kwargs)
+            if path == canonical_transcript:
+                return mock.Mock(
+                    st_mode=info.st_mode, st_uid=info.st_uid + 1
+                )
+            return info
+
+        with mock.patch.object(Path, "stat", stat_with_wrong_owner):
+            with self.assertRaisesRegex(
+                ValueError, "transcript_root_owner"
+            ):
+                self.runtime.initialize_runtime(
+                    root, (self.sessions,), self.config
+                )
+        self.assertFalse(root.exists())
+
+    def test_initialize_rejects_data_root_inside_transcript_root_before_writes(
+        self,
+    ) -> None:
+        root = self.sessions / "data"
+        with self.assertRaisesRegex(ValueError, "data_transcript_overlap"):
+            self.runtime.initialize_runtime(
+                root, (self.sessions,), self.config
+            )
+        self.assertFalse(root.exists())
+
+    def test_load_rejects_tampered_transcript_data_root_overlap(self) -> None:
+        installation_path = self.runtime.initialize_runtime(
+            self.base / "data", (self.sessions,), self.config
+        )
+        root = installation_path.parent
+        transcript_roots = {
+            "parent": root.parent,
+            "equal": root,
+            "child": root / "spool",
+        }
+
+        for relation, transcript_root in transcript_roots.items():
+            with self.subTest(relation=relation):
+                self.replace_transcript_roots(
+                    installation_path, (transcript_root,)
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "data_transcript_overlap"
+                ):
+                    self.runtime.load_installation(installation_path)
+
+    def test_load_rejects_unsafe_fixed_transcript_root(self) -> None:
+        installation_path = self.runtime.initialize_runtime(
+            self.base / "data", (self.sessions,), self.config
+        )
+        self.sessions.chmod(0o777)
+        self.addCleanup(self.sessions.chmod, 0o700)
+
+        with self.assertRaisesRegex(
+            ValueError, "transcript_root_permissions"
+        ):
+            self.runtime.load_installation(installation_path)
 
     def test_init_creates_private_one_row_per_session_schema(self) -> None:
         installation_path = self.runtime.initialize_runtime(
@@ -679,6 +779,7 @@ import sqlite3
 import stat
 import sys
 import tempfile
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
@@ -914,6 +1015,45 @@ def canonical_roots(values: object, *, allow_empty: bool) -> tuple[Path, ...]:
     return tuple(roots)
 
 
+def validate_transcript_root(path: Path) -> Path:
+    requested = path.expanduser()
+    if requested.is_symlink():
+        raise ValueError("transcript_root_symlink")
+    try:
+        resolved = requested.resolve(strict=True)
+    except (FileNotFoundError, NotADirectoryError):
+        raise ValueError("transcript_root_not_directory") from None
+    info = resolved.stat()
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError("transcript_root_not_directory")
+    if info.st_uid != os.getuid():
+        raise ValueError("transcript_root_owner")
+    if stat.S_IMODE(info.st_mode) & stat.S_IWOTH:
+        raise ValueError("transcript_root_permissions")
+    return resolved
+
+
+def path_identity(path: Path) -> str:
+    normalized = unicodedata.normalize(
+        "NFC",
+        os.path.normpath(str(path)),
+    )
+    return unicodedata.normalize("NFC", normalized.casefold())
+
+
+def validate_transcript_separation(
+    data_root: Path, transcript_roots: tuple[Path, ...]
+) -> None:
+    data_parts = Path(path_identity(data_root)).parts
+    for transcript_root in transcript_roots:
+        transcript_parts = Path(path_identity(transcript_root)).parts
+        if (
+            data_parts[: len(transcript_parts)] == transcript_parts
+            or transcript_parts[: len(data_parts)] == data_parts
+        ):
+            raise ValueError("data_transcript_overlap")
+
+
 def initialize_runtime(
     data_root: Path,
     transcript_roots: tuple[Path, ...],
@@ -923,10 +1063,14 @@ def initialize_runtime(
     if requested.is_symlink():
         raise ValueError("data_root_symlink")
     root = requested.parent.resolve(strict=True) / requested.name
+    fixed_transcripts = tuple(
+        validate_transcript_root(path)
+        for path in canonical_roots(transcript_roots, allow_empty=False)
+    )
+    validate_transcript_separation(root, fixed_transcripts)
     if root.exists():
         private_directory(root)
         raise ValueError("runtime_already_initialized")
-    fixed_transcripts = canonical_roots(transcript_roots, allow_empty=False)
     excludes = canonical_roots(config.get("exclude_roots", []), allow_empty=True)
     allowed = set(DEFAULTS) | {"capture_paused", "exclude_roots"}
     if set(config) - allowed:
@@ -1005,11 +1149,16 @@ def load_installation(path: Path) -> Installation:
     root = private_directory(Path(str(payload["data_root"])))
     if installation_path != root / "installation.json":
         raise ValueError("installation_root_mismatch")
+    transcript_roots = tuple(
+        validate_transcript_root(transcript_root)
+        for transcript_root in canonical_roots(
+            payload.get("transcript_roots"), allow_empty=False
+        )
+    )
+    validate_transcript_separation(root, transcript_roots)
     installation = Installation(
         data_root=root,
-        transcript_roots=canonical_roots(
-            payload.get("transcript_roots"), allow_empty=False
-        ),
+        transcript_roots=transcript_roots,
         python=Path("/usr/bin/python3"),
         config_path=root / "config.json",
         identity_key=root / "identity.key",
@@ -1159,7 +1308,9 @@ Expected: all store tests PASS, including a staged `journal_mode=DELETE`
 database with zero busy timeout, an immediate `mode=ro` open while its directory
 is not writable, no auxiliary files created by that status open, read-only
 SQLite rejecting a write, exact private-file modes, schema rollback leaving
-`user_version == 0`, and cleanup after both pre- and post-placement failures.
+`user_version == 0`, cleanup after both pre- and post-placement failures,
+current-owner/non-world-writable transcript roots, and data/transcript
+separation on both initialization and installation load.
 
 - [ ] **Step 5: Commit the store**
 

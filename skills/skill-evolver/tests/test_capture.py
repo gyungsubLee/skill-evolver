@@ -27,6 +27,102 @@ class RuntimeStoreTests(unittest.TestCase):
             "exclude_roots": [str(self.excluded)],
         }
 
+    def replace_transcript_roots(
+        self, installation_path: Path, transcript_roots: tuple[Path, ...]
+    ) -> None:
+        payload = json.loads(installation_path.read_text(encoding="utf-8"))
+        payload["transcript_roots"] = [
+            str(path) for path in transcript_roots
+        ]
+        installation_path.write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+        installation_path.chmod(0o600)
+
+    def test_initialize_rejects_world_writable_transcript_root_before_writes(
+        self,
+    ) -> None:
+        root = self.base / "world-writable-data"
+        self.sessions.chmod(0o777)
+        self.addCleanup(self.sessions.chmod, 0o700)
+
+        with self.assertRaisesRegex(
+            ValueError, "transcript_root_permissions"
+        ):
+            self.runtime.initialize_runtime(
+                root, (self.sessions,), self.config
+            )
+        self.assertFalse(root.exists())
+
+    def test_initialize_rejects_wrong_owner_transcript_root_before_writes(
+        self,
+    ) -> None:
+        root = self.base / "wrong-owner-data"
+        canonical_transcript = self.sessions.resolve()
+        real_stat = Path.stat
+
+        def stat_with_wrong_owner(
+            path: Path, *args: object, **kwargs: object
+        ):
+            info = real_stat(path, *args, **kwargs)
+            if path == canonical_transcript:
+                return mock.Mock(
+                    st_mode=info.st_mode, st_uid=info.st_uid + 1
+                )
+            return info
+
+        with mock.patch.object(Path, "stat", stat_with_wrong_owner):
+            with self.assertRaisesRegex(
+                ValueError, "transcript_root_owner"
+            ):
+                self.runtime.initialize_runtime(
+                    root, (self.sessions,), self.config
+                )
+        self.assertFalse(root.exists())
+
+    def test_initialize_rejects_data_root_inside_transcript_root_before_writes(
+        self,
+    ) -> None:
+        root = self.sessions / "data"
+        with self.assertRaisesRegex(ValueError, "data_transcript_overlap"):
+            self.runtime.initialize_runtime(
+                root, (self.sessions,), self.config
+            )
+        self.assertFalse(root.exists())
+
+    def test_load_rejects_tampered_transcript_data_root_overlap(self) -> None:
+        installation_path = self.runtime.initialize_runtime(
+            self.base / "data", (self.sessions,), self.config
+        )
+        root = installation_path.parent
+        transcript_roots = {
+            "parent": root.parent,
+            "equal": root,
+            "child": root / "spool",
+        }
+
+        for relation, transcript_root in transcript_roots.items():
+            with self.subTest(relation=relation):
+                self.replace_transcript_roots(
+                    installation_path, (transcript_root,)
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "data_transcript_overlap"
+                ):
+                    self.runtime.load_installation(installation_path)
+
+    def test_load_rejects_unsafe_fixed_transcript_root(self) -> None:
+        installation_path = self.runtime.initialize_runtime(
+            self.base / "data", (self.sessions,), self.config
+        )
+        self.sessions.chmod(0o777)
+        self.addCleanup(self.sessions.chmod, 0o700)
+
+        with self.assertRaisesRegex(
+            ValueError, "transcript_root_permissions"
+        ):
+            self.runtime.load_installation(installation_path)
+
     def test_init_creates_private_one_row_per_session_schema(self) -> None:
         installation_path = self.runtime.initialize_runtime(
             self.base / "data", (self.sessions,), self.config
