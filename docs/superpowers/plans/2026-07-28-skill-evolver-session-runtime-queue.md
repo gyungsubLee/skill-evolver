@@ -1446,8 +1446,10 @@ Expected: only the runtime and focused test file are committed.
   `spool_session_stop(installation, config, event, key, now) -> bool`,
   and the
   silent `enqueue-stop` command.
-- The Hook observes transcript path/stat only. It never reads transcript bytes
-  and never increments `transcript_epoch`.
+- The Hook opens transcripts with
+  `O_RDONLY | O_NONBLOCK | O_NOFOLLOW`, observes path/stat only, and rejects
+  non-regular files before persistence. It never reads transcript bytes and
+  never increments `transcript_epoch`.
 - SQLite write contention is not waited out: `busy_timeout=0` makes the Hook
   attempt one short transaction before using the bounded spool.
 - Spool fallback streams at most 201 directory entries before failing
@@ -1462,6 +1464,7 @@ Add these imports to `test_capture.py`:
 import fcntl
 import hmac
 import socket
+import subprocess
 import threading
 import time
 from dataclasses import replace
@@ -1864,6 +1867,45 @@ class SessionCaptureTests(unittest.TestCase):
             "1\n",
         )
 
+    def test_hook_rejects_fifo_without_blocking_or_persistence(self) -> None:
+        fifo = self.sessions / "session.fifo"
+        os.mkfifo(fifo, 0o600)
+        fifo.chmod(0o600)
+        payload = {
+            **self.payload,
+            "transcript_path": str(fifo),
+        }
+
+        process = subprocess.run(
+            [
+                "/usr/bin/python3",
+                "-I",
+                str(SKILL_ROOT / "scripts" / "evolver.py"),
+                "enqueue-stop",
+                "--installation",
+                str(self.installation_path),
+            ],
+            input=json.dumps(payload).encode(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=1.0,
+        )
+
+        self.assertEqual(stat.S_IMODE(fifo.stat().st_mode), 0o600)
+        self.assertEqual(process.returncode, 0)
+        self.assertEqual(process.stdout, b"")
+        self.assertEqual(process.stderr, b"")
+        connection = self.runtime.open_database(
+            self.installation, read_only=True
+        )
+        rows = connection.execute(
+            "SELECT COUNT(*) FROM review_items"
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(rows, 0)
+        self.assertEqual(list(self.installation.spool.iterdir()), [])
+
     def test_hook_is_silent_network_free_and_never_mutates_a_skill(self) -> None:
         skill = self.base / "target-skill.md"
         skill.write_text("unchanged\n", encoding="utf-8")
@@ -2006,7 +2048,7 @@ def parse_session_stop(
         raise ValueError("transcript_outside_roots")
     descriptor = os.open(
         str(transcript),
-        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
     )
     try:
         info = os.fstat(descriptor)
@@ -2475,9 +2517,10 @@ Expected: all tests PASS. Missing `turn_id` queues successfully, repeated Stops
 produce one session row, zero-wait real writer contention uses the bounded spool,
 capacity is one pending session in the focused test, the spool caps at one file
 there, its directory scan stops at entry 201, unsafe spool files fail closed,
-concurrent overflow appends never exceed 64 KiB, invalid JSONL transcript
-content is never parsed, and every Hook subprocess is silent with exit code
-`0`.
+concurrent overflow appends never exceed 64 KiB, a private FIFO is rejected by
+the real Hook subprocess within its bounded timeout without a database or spool
+item, invalid JSONL transcript content is never read, and every Hook subprocess
+is silent with exit code `0`.
 
 - [ ] **Step 7: Commit session capture**
 

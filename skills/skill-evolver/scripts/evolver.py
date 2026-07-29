@@ -588,7 +588,7 @@ def parse_session_stop(
         raise ValueError("transcript_outside_roots")
     descriptor = os.open(
         str(transcript),
-        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
     )
     try:
         info = os.fstat(descriptor)

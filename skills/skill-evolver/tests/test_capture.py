@@ -7,6 +7,7 @@ import os
 import socket
 import sqlite3
 import stat
+import subprocess
 import tempfile
 import threading
 import time
@@ -850,6 +851,45 @@ class SessionCaptureTests(unittest.TestCase):
             ),
             "1\n",
         )
+
+    def test_hook_rejects_fifo_without_blocking_or_persistence(self) -> None:
+        fifo = self.sessions / "session.fifo"
+        os.mkfifo(fifo, 0o600)
+        fifo.chmod(0o600)
+        payload = {
+            **self.payload,
+            "transcript_path": str(fifo),
+        }
+
+        process = subprocess.run(
+            [
+                "/usr/bin/python3",
+                "-I",
+                str(SKILL_ROOT / "scripts" / "evolver.py"),
+                "enqueue-stop",
+                "--installation",
+                str(self.installation_path),
+            ],
+            input=json.dumps(payload).encode(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=1.0,
+        )
+
+        self.assertEqual(stat.S_IMODE(fifo.stat().st_mode), 0o600)
+        self.assertEqual(process.returncode, 0)
+        self.assertEqual(process.stdout, b"")
+        self.assertEqual(process.stderr, b"")
+        connection = self.runtime.open_database(
+            self.installation, read_only=True
+        )
+        rows = connection.execute(
+            "SELECT COUNT(*) FROM review_items"
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(rows, 0)
+        self.assertEqual(list(self.installation.spool.iterdir()), [])
 
     def test_hook_is_silent_network_free_and_never_mutates_a_skill(
         self,
