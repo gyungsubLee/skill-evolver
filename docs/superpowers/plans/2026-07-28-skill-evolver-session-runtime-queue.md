@@ -4217,6 +4217,23 @@ Expected: only the two listed files are committed.
 - Maintenance deletes malformed or expired raw spool payloads instead of
   preserving an unbounded quarantine. Status only stats spool files and never
   imports, removes, or opens their JSON content.
+- Every spool payload is a canonical JSON body plus
+  `HMAC-SHA256(identity_key, b"spool\0" + canonical_body)` in
+  `payload_hmac`. Import authenticates the envelope before trusting any field.
+- Hook, import, and identity-checked deletion share one fd-pinned `.lock`.
+  The lock and payload descriptors use `O_NOFOLLOW`; file type, owner, exact
+  mode, link count, and device/inode are verified on the opened descriptor.
+- Scans are bounded to 203 directory entries and 200 payloads. The compiled
+  200-file/10-MiB limits cannot be raised by editing `config.json`. Status is
+  lock-free, does not create `.lock`, and reports partial saturated inventory.
+- A signed backlog expiry remains authenticated across approved config
+  changes. Effective expiry is the earlier of the signed expiry and the
+  current retention policy, and every retention boundary expires at equality.
+  Captures more than 300 seconds in the future are rejected; accepted clock
+  skew uses `min(created_at, now)` for database TTL anchors.
+- When a 180-day dedupe row is deleted, evidence rows carrying the same
+  `session_key` are deleted first in the same transaction. Candidate
+  occurrence aggregates remain.
 
 - [ ] **Step 1: Add failing spool, retention, privacy, and status tests**
 
@@ -4226,7 +4243,8 @@ Add this import to `test_capture.py`:
 from argparse import Namespace
 ```
 
-Add this class before the final `unittest.main()` block:
+Add this class before the final `unittest.main()` block. This intentionally
+compact block is the five-test RED seed, not the final committed test body:
 
 ```python
 class MaintenanceStatusTests(unittest.TestCase):
@@ -4291,7 +4309,9 @@ class MaintenanceStatusTests(unittest.TestCase):
 
     def test_spool_import_converges_by_session_and_deletes_invalid_payload(self) -> None:
         now = 2_000_000_000.0
-        event = self.event()
+        event = replace(
+            self.event(), observed_at_ns=int(now * 1_000_000_000)
+        )
         key = self.runtime.session_key(self.installation, event.session_id)
         self.assertTrue(
             self.runtime.spool_session_stop(
@@ -4410,7 +4430,10 @@ class MaintenanceStatusTests(unittest.TestCase):
         self.runtime.upsert_session(
             connection, event, key, self.runtime_config, now
         )
-        spooled = self.event("spooled-session")
+        spooled = replace(
+            self.event("spooled-session"),
+            observed_at_ns=int(now * 1_000_000_000),
+        )
         spooled_key = self.runtime.session_key(
             self.installation, spooled.session_id
         )
@@ -4426,7 +4449,7 @@ class MaintenanceStatusTests(unittest.TestCase):
             connection,
             self.installation,
             self.runtime_config,
-            now + 14 * 86_400 + 1,
+            now + 14 * 86_400,
         )
         row = connection.execute(
             """
@@ -4450,7 +4473,7 @@ class MaintenanceStatusTests(unittest.TestCase):
             connection,
             self.installation,
             self.runtime_config,
-            now + 181 * 86_400,
+            now + 180 * 86_400,
         )
         remaining = connection.execute(
             "SELECT COUNT(*) FROM review_items WHERE session_key=?",
@@ -4523,6 +4546,23 @@ class MaintenanceStatusTests(unittest.TestCase):
         self.assertTrue(waiting.exists())
 ```
 
+The committed suite also includes focused regressions for these exact
+contracts:
+
+- HMAC tamper rejection, bounded/canonical envelope fields, signed-expiry
+  config changes, future-capture skew, and database TTL anchoring;
+- fd-pinned lock and payload swap races, transient read preservation,
+  hardlinks, FIFOs, non-regular JSON, bounded saturated scans, full-cap
+  sidecars, and directory fsync outside the lock;
+- oldest-first replay, later-arriving older replay, expired tombstones without
+  resurrection, and later-generation `pending_since` protection;
+- exact 14/30/180-day equality, set-based cleanup above SQLite parameter
+  limits, caller-owned transaction rejection, deletion of
+  `candidate_evidence` rows carrying the expired `session_key`, and retention
+  of the parent candidate aggregate;
+- status root/spool non-mutation, bounded partial inventory with
+  `scan_saturated`, full 200-payload inventory, and exact parser exposure.
+
 - [ ] **Step 2: Run maintenance/status tests and verify RED**
 
 Run:
@@ -4534,28 +4574,90 @@ Run:
   -v
 ```
 
-Expected: FAIL because `import_spool`, `run_maintenance`, `queue_status`,
-`maintain`, and `status` do not exist and the explicit skill still marks the
-two commands unavailable.
+Expected RED baseline:
+
+```text
+Ran 49 tests
+FAILED (failures=1, errors=4)
+```
+
+The failures are the missing `import_spool`, `run_maintenance`,
+`queue_status`, `maintain`, and `status` surfaces plus the skill text that
+still marks the commands unavailable.
 
 - [ ] **Step 3: Implement bounded spool import without transcript reads**
 
-Add this import beside the imports in `evolver.py`:
+Add these imports and fixed ceilings beside the existing imports/constants in
+`evolver.py`:
 
 ```python
 import calendar
+import errno
+
+SQLITE_INTEGER_MAX = 9_223_372_036_854_775_807
+HARD_LIMITS = {
+    "spool_limit_files": 200,
+    "spool_limit_bytes": 10_485_760,
+}
+MAX_SPOOL_SCAN_ENTRIES = 203
+MAX_SPOOL_FUTURE_SKEW_SECONDS = 300
 ```
 
-Add after `spool_session_stop()`:
+Reject initialization or loaded config values above `HARD_LIMITS`; configuration
+may lower these ceilings but never raise them.
+
+Change `spooled_stop_payload()` to sign every field except `payload_hmac`:
+
+```python
+def spool_payload_hmac(
+    installation: Installation, payload: dict[str, object]
+) -> str:
+    return hmac.new(
+        installation.identity_key.read_bytes(),
+        b"spool\0" + canonical_json_bytes(payload),
+        "sha256",
+    ).hexdigest()
+
+def spooled_stop_payload(
+    installation: Installation,
+    event: CapturedSessionStop,
+    key: str,
+    config: Config,
+) -> dict[str, object]:
+    ...
+    return {
+        **body,
+        "payload_hmac": spool_payload_hmac(installation, body),
+    }
+```
+
+Use the capture-time `observed_at_ns` for `created_at` and the signed expiry.
+Reject captures over 300 seconds in the future. For accepted skew, use
+`min(created_at, now)` rather than the later spool-write wall clock as the
+database retention anchor.
+
+Add the strict adapter after `spool_session_stop()`:
 
 ```python
 def parse_iso_utc(value: str) -> float:
-    return float(calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")))
+    try:
+        parsed = float(
+            calendar.timegm(
+                time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+            )
+        )
+    except (OSError, OverflowError, TypeError, ValueError):
+        raise ValueError("invalid_iso_utc") from None
+    if iso_utc(parsed) != value:
+        raise ValueError("invalid_iso_utc")
+    return parsed
 
 
 def event_from_spool(
     payload: object,
     installation: Installation,
+    config: Config,
+    now: float,
 ) -> tuple[CapturedSessionStop, str, float, float]:
     if not isinstance(payload, dict) or payload.get("schema_version") != 1:
         raise ValueError("invalid_spool_schema")
@@ -4573,37 +4675,81 @@ def event_from_spool(
         "created_at",
         "created_at_ns",
         "expires_at",
+        "payload_hmac",
     }
     if set(payload) != required:
         raise ValueError("invalid_spool_fields")
-    raw_session_id = payload["raw_session_id"]
-    diagnostic = payload["diagnostic_turn_id"]
-    if not isinstance(raw_session_id, str) or not raw_session_id:
-        raise ValueError("invalid_spool_session")
-    if diagnostic is not None and not isinstance(diagnostic, str):
-        raise ValueError("invalid_spool_diagnostic")
-    cwd = Path(str(payload["cwd"]))
-    transcript = Path(str(payload["transcript_path"]))
-    if not cwd.is_absolute() or not transcript.is_absolute():
+    supplied_hmac = payload["payload_hmac"]
+    if not isinstance(supplied_hmac, str) or len(supplied_hmac) != 64:
+        raise ValueError("invalid_spool_hmac")
+    body = {
+        name: value
+        for name, value in payload.items()
+        if name != "payload_hmac"
+    }
+    if not hmac.compare_digest(
+        supplied_hmac, spool_payload_hmac(installation, body)
+    ):
+        raise ValueError("invalid_spool_hmac")
+
+    raw_session_id = bounded_string(body, "raw_session_id", 512)
+    assert raw_session_id is not None
+    diagnostic = bounded_string(
+        body, "diagnostic_turn_id", 512, required=False
+    )
+    cwd_value = bounded_string(body, "cwd", 4_096)
+    transcript_value = bounded_string(body, "transcript_path", 4_096)
+    assert cwd_value is not None and transcript_value is not None
+    cwd = Path(cwd_value)
+    transcript = Path(transcript_value)
+    if (
+        not cwd.is_absolute()
+        or not transcript.is_absolute()
+        or Path(os.path.normpath(cwd_value)) != cwd
+        or Path(os.path.normpath(transcript_value)) != transcript
+    ):
         raise ValueError("invalid_spool_path")
     if not within(transcript, installation.transcript_roots):
         raise ValueError("invalid_spool_transcript_root")
     integers = [
-        payload["transcript_size"],
-        payload["transcript_mtime_ns"],
-        payload["transcript_device"],
-        payload["transcript_inode"],
+        body["transcript_size"],
+        body["transcript_mtime_ns"],
+        body["transcript_device"],
+        body["transcript_inode"],
     ]
-    if any(type(value) is not int or value < 0 for value in integers):
+    if any(
+        type(value) is not int
+        or value < 0
+        or value > SQLITE_INTEGER_MAX
+        for value in integers
+    ):
         raise ValueError("invalid_spool_stat")
-    created_at_ns = payload["created_at_ns"]
-    if type(created_at_ns) is not int or created_at_ns < 0:
-        raise ValueError("invalid_spool_created_at_ns")
+    created_at_ns = body["created_at_ns"]
+    created_at_text = body["created_at"]
+    expires_at_text = body["expires_at"]
+    if (
+        type(created_at_ns) is not int
+        or created_at_ns < 0
+        or not isinstance(created_at_text, str)
+        or not isinstance(expires_at_text, str)
+    ):
+        raise ValueError("invalid_spool_time")
+    if created_at_ns > int(
+        (now + MAX_SPOOL_FUTURE_SKEW_SECONDS) * 1_000_000_000
+    ):
+        raise ValueError("spool_capture_in_future")
     created_at = created_at_ns / 1_000_000_000
-    if iso_utc(created_at) != payload["created_at"]:
+    if iso_utc(created_at) != created_at_text:
         raise ValueError("inconsistent_spool_created_at")
-    key = str(payload["session_key"])
-    if not hmac.compare_digest(
+    signed_expires_at = parse_iso_utc(expires_at_text)
+    if signed_expires_at < created_at:
+        raise ValueError("inconsistent_spool_expiry")
+    expires_at = min(
+        signed_expires_at,
+        created_at + config.pending_retention_days * 86_400,
+    )
+    key = body["session_key"]
+    if not isinstance(key, str) or not hmac.compare_digest(
         key, session_key(installation, raw_session_id)
     ):
         raise ValueError("invalid_spool_session_key")
@@ -4613,15 +4759,15 @@ def event_from_spool(
             diagnostic_turn_id=diagnostic,
             cwd=cwd,
             transcript_path=transcript,
-            transcript_size=int(payload["transcript_size"]),
-            transcript_mtime_ns=int(payload["transcript_mtime_ns"]),
-            transcript_device=int(payload["transcript_device"]),
-            transcript_inode=int(payload["transcript_inode"]),
+            transcript_size=int(body["transcript_size"]),
+            transcript_mtime_ns=int(body["transcript_mtime_ns"]),
+            transcript_device=int(body["transcript_device"]),
+            transcript_inode=int(body["transcript_inode"]),
             observed_at_ns=created_at_ns,
         ),
         key,
-        created_at,
-        parse_iso_utc(str(payload["expires_at"])),
+        min(created_at, now),
+        expires_at,
     )
 
 
@@ -4631,94 +4777,159 @@ def import_spool(
     config: Config,
     now: float,
 ) -> dict[str, int]:
-    imported = duplicates = invalid = expired = 0
-    for path in sorted(installation.spool.glob("*.json")):
+    if connection.in_transaction:
+        raise ValueError("active_transaction")
+    imported = duplicates = invalid = expired = preserved = 0
+    deleted_any = False
+
+    def remove_snapshot(path: Path, identity: tuple[int, int]) -> bool:
+        nonlocal deleted_any
+        removed = delete_spool_identity(installation, path, identity)
+        deleted_any = deleted_any or removed
+        return removed
+
+    with open_locked_spool(installation):
+        paths, saturated = bounded_spool_paths(
+            installation, HARD_LIMITS["spool_limit_files"]
+        )
+    verified = []
+    for path in paths:
+        with open_locked_spool(installation):
+            state, encoded, identity = read_spool_snapshot(path)
+        if state == "missing":
+            continue
+        assert identity is not None
+        if state == "preserved":
+            preserved += 1
+            continue
+        if state == "invalid":
+            if remove_snapshot(path, identity):
+                invalid += 1
+            else:
+                preserved += 1
+            continue
+        assert encoded is not None
         try:
-            if path.is_symlink():
-                raise ValueError("spool_payload_symlink")
-            private_file(path)
-            if path.stat().st_size > MAX_HOOK_BYTES:
-                raise ValueError("spool_payload_too_large")
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            (
-                event,
-                key,
-                created_at,
-                expires_at,
-            ) = event_from_spool(payload, installation)
-            if now > expires_at:
-                path.unlink()
-                expired += 1
-                continue
-            outcome = upsert_session(
-                connection,
-                event,
-                key,
-                config,
-                created_at,
+            payload = json.loads(encoded.decode("utf-8"))
+            event, key, created_at, expires_at = event_from_spool(
+                payload, installation, config, now
             )
-            imported += int(outcome == "inserted")
-            duplicates += int(outcome != "inserted")
-            path.unlink()
-        except sqlite3.Error:
-            raise
-        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
-            path.unlink(missing_ok=True)
-            invalid += 1
-    fsync_directory(installation.spool)
+            if now >= expires_at:
+                if remove_snapshot(path, identity):
+                    expired += 1
+                else:
+                    preserved += 1
+                continue
+            verified.append(
+                (
+                    event.observed_at_ns,
+                    path.name,
+                    path,
+                    identity,
+                    event,
+                    key,
+                    created_at,
+                )
+            )
+        except (
+            KeyError,
+            OverflowError,
+            RecursionError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            if remove_snapshot(path, identity):
+                invalid += 1
+            else:
+                preserved += 1
+    verified.sort(key=lambda item: (item[0], item[1]))
+    for _, _, path, identity, event, key, created_at in verified:
+        outcome = upsert_session(
+            connection, event, key, config, created_at
+        )
+        imported += int(outcome == "inserted")
+        duplicates += int(outcome != "inserted")
+        if not remove_snapshot(path, identity):
+            preserved += 1
+    if deleted_any:
+        fsync_directory(installation.spool)
     return {
         "spool_imported": imported,
         "spool_duplicates": duplicates,
         "spool_invalid_deleted": invalid,
         "spool_expired": expired,
+        "spool_preserved": preserved,
+        "spool_scan_saturated": int(saturated),
     }
 ```
 
+Implement the helpers used above with these fixed rules:
+
+- `open_locked_spool()` opens `.lock` once with
+  `O_RDWR|O_CREAT|O_NOFOLLOW`, validates regular file/owner/`0600`/`nlink==1`
+  by `fstat`, and flocks that same descriptor. Hook and import share it.
+- `record_spool_overflow()` uses
+  `O_WRONLY|O_APPEND|O_CREAT|O_NONBLOCK|O_NOFOLLOW`; `ENXIO` becomes a fast
+  sanitized failure, and regular-file/owner/mode/link-count checks run both
+  before and after the fd lock.
+- `bounded_spool_paths()` processes at most 203 entries and returns at most
+  200 JSON paths plus a saturation flag. It considers the 203rd entry before
+  returning saturated, admitting a JSON payload at the cutoff when fewer than
+  200 payloads were collected.
+- `read_spool_snapshot()` uses `lstat`, then
+  `O_RDONLY|O_NONBLOCK|O_NOFOLLOW`, then `fstat`; it accepts at most 64 KiB
+  only when identity, type, owner, exact mode, and link count remain stable.
+  Transient read errors preserve the payload and propagate.
+- `delete_spool_identity()` reacquires the shared lock and unlinks only when a
+  fresh `lstat` still matches the verified device/inode. Directory fsync runs
+  once after the batch and outside `.lock`.
+- Neither import nor status opens or stats a transcript. Import orders
+  authenticated work by `(observed_at_ns, stable_filename)`.
+
 - [ ] **Step 4: Implement retention, raw cleanup, and dedupe deletion**
 
-Add after `import_spool()`:
+Before the locator-update guard in `upsert_session()`, tighten authenticated
+retention anchors for every existing row:
+
+```sql
+UPDATE review_items
+SET first_stop_at=MIN(first_stop_at,?),
+    dedupe_expires_at=MIN(dedupe_expires_at,?),
+    raw_metadata_expires_at=CASE
+      WHEN raw_redacted_at IS NULL
+        AND raw_metadata_expires_at IS NOT NULL
+      THEN MIN(raw_metadata_expires_at,?)
+      ELSE raw_metadata_expires_at
+    END,
+    pending_since=CASE
+      WHEN generation=1 AND status='pending'
+      THEN CASE
+        WHEN pending_since IS NULL THEN ?
+        ELSE MIN(pending_since,?)
+      END
+      ELSE pending_since
+    END
+WHERE session_key=?
+```
+
+This runs even for an `expired` or raw-redacted tombstone. Only
+`first_stop_at` and `dedupe_expires_at` tighten after redaction; the locator,
+raw fields, status, and later-generation `pending_since` are never revived or
+regressed.
+
+Add `run_maintenance()` after `import_spool()`:
 
 ```python
-def redact_raw_metadata(
-    connection: sqlite3.Connection,
-    ids: list[int],
-    now: float,
-) -> int:
-    if not ids:
-        return 0
-    marks = ",".join("?" for _ in ids)
-    return connection.execute(
-        f"""
-        UPDATE review_items
-        SET status=CASE
-              WHEN status IN ('pending','reviewing') THEN 'expired'
-              ELSE status
-            END,
-            excluded_reason=CASE
-              WHEN status IN ('pending','reviewing')
-              THEN COALESCE(excluded_reason,'raw_metadata_ttl')
-              ELSE excluded_reason
-            END,
-            reviewed_at=CASE
-              WHEN status IN ('pending','reviewing') THEN ?
-              ELSE reviewed_at
-            END,
-            batch_id=NULL,review_started_at=NULL,frozen_epoch=NULL,
-            frozen_from=NULL,frozen_to=NULL,frozen_locator_json=NULL,
-            lease_owner=NULL,lease_expires_at=NULL,raw_redacted_at=?,
-            {RAW_CLEAR_ASSIGNMENTS}
-        WHERE id IN ({marks}) AND raw_redacted_at IS NULL
-        """,
-        (iso_utc(now), iso_utc(now), *ids),
-    ).rowcount
-
-
 def run_maintenance(
     connection: sqlite3.Connection,
     installation: Installation,
     config: Config,
     now: float,
 ) -> dict[str, int]:
+    if connection.in_transaction:
+        raise ValueError("active_transaction")
     counts = import_spool(connection, installation, config, now)
     leases_recovered = recover_expired_review_leases(connection, now)
     connection.execute("BEGIN IMMEDIATE")
@@ -4728,7 +4939,7 @@ def run_maintenance(
             for row in connection.execute(
                 """
                 SELECT id FROM review_items
-                WHERE status='pending' AND pending_since < ?
+                WHERE status='pending' AND pending_since <= ?
                 ORDER BY pending_since,id
                 """,
                 (
@@ -4761,25 +4972,50 @@ def run_maintenance(
         capacity_expired = expire_session_ids(
             connection, capacity_ids, "capacity", now
         )
-        raw_ids = [
-            int(row["id"])
-            for row in connection.execute(
-                """
-                SELECT id FROM review_items
-                WHERE raw_redacted_at IS NULL
-                  AND raw_metadata_expires_at < ?
-                """,
-                (iso_utc(now),),
+        raw_redacted = connection.execute(
+            f"""
+            UPDATE review_items
+            SET status=CASE
+                  WHEN status IN ('pending','reviewing') THEN 'expired'
+                  ELSE status
+                END,
+                excluded_reason=CASE
+                  WHEN status IN ('pending','reviewing')
+                  THEN COALESCE(excluded_reason,'raw_metadata_ttl')
+                  ELSE excluded_reason
+                END,
+                reviewed_at=CASE
+                  WHEN status IN ('pending','reviewing') THEN ?
+                  ELSE reviewed_at
+                END,
+                batch_id=NULL,review_started_at=NULL,frozen_epoch=NULL,
+                frozen_from=NULL,frozen_to=NULL,frozen_locator_json=NULL,
+                lease_owner=NULL,lease_expires_at=NULL,raw_redacted_at=?,
+                {RAW_CLEAR_ASSIGNMENTS}
+            WHERE raw_redacted_at IS NULL
+              AND raw_metadata_expires_at <= ?
+            """,
+            (iso_utc(now), iso_utc(now), iso_utc(now)),
+        ).rowcount
+        dedupe_cutoff = iso_utc(now)
+        connection.execute(
+            """
+            DELETE FROM candidate_evidence
+            WHERE session_key IN (
+              SELECT session_key FROM review_items
+              WHERE dedupe_expires_at <= ?
+                AND status NOT IN ('pending','reviewing')
             )
-        ]
-        raw_redacted = redact_raw_metadata(connection, raw_ids, now)
+            """,
+            (dedupe_cutoff,),
+        )
         dedupe_deleted = connection.execute(
             """
             DELETE FROM review_items
-            WHERE dedupe_expires_at < ?
+            WHERE dedupe_expires_at <= ?
               AND status NOT IN ('pending','reviewing')
             """,
-            (iso_utc(now),),
+            (dedupe_cutoff,),
         ).rowcount
         connection.execute(
             """
@@ -4812,23 +5048,34 @@ def run_maintenance(
     }
 ```
 
+The raw cleanup is one set-based update, not an ID list. The evidence delete
+and review-row delete share the same `dedupe_cutoff` and `BEGIN IMMEDIATE`
+transaction, so `ON DELETE SET NULL` cannot leave the exact session HMAC
+behind. Do not modify the parent candidate row or its `occurrence_count`.
+
 - [ ] **Step 5: Implement transcript-free status and commands**
 
 Add after `run_maintenance()`:
 
 ```python
-def spool_inventory(installation: Installation) -> tuple[int, int]:
+def spool_inventory(installation: Installation) -> tuple[int, int, bool]:
     count = total = 0
-    for path in installation.spool.glob("*.json"):
+    paths, saturated = bounded_spool_paths(
+        installation, DEFAULTS["spool_limit_files"]
+    )
+    for path in paths:
         try:
-            if path.is_symlink():
-                continue
-            private_file(path)
-            total += path.stat().st_size
-            count += 1
-        except (FileNotFoundError, ValueError):
+            info = os.lstat(path)
+        except OSError:
             continue
-    return count, total
+        if (
+            stat.S_ISREG(info.st_mode)
+            and info.st_uid == os.getuid()
+            and stat.S_IMODE(info.st_mode) == 0o600
+        ):
+            count += 1
+            total += info.st_size
+    return count, total, saturated
 
 
 def queue_status(
@@ -4884,7 +5131,7 @@ def queue_status(
             """
             SELECT COUNT(*) FROM review_items
             WHERE raw_redacted_at IS NULL
-              AND raw_metadata_expires_at < ?
+              AND raw_metadata_expires_at <= ?
             """,
             (iso_utc(now),),
         ).fetchone()[0]
@@ -4902,15 +5149,20 @@ def queue_status(
             """
         )
     }
-    spool_files, spool_bytes = spool_inventory(installation)
+    spool_files, spool_bytes, spool_saturated = spool_inventory(
+        installation
+    )
     overflow_path = installation.spool / "overflow.events"
     try:
+        overflow_info = os.lstat(overflow_path)
         overflow_bytes = (
-            private_file(overflow_path).stat().st_size
-            if overflow_path.exists() and not overflow_path.is_symlink()
+            overflow_info.st_size
+            if stat.S_ISREG(overflow_info.st_mode)
+            and overflow_info.st_uid == os.getuid()
+            and stat.S_IMODE(overflow_info.st_mode) == 0o600
             else 0
         )
-    except (OSError, ValueError):
+    except FileNotFoundError:
         overflow_bytes = 0
     oldest = pending["oldest"]
     return {
@@ -4932,6 +5184,7 @@ def queue_status(
         "spool": {
             "files": spool_files,
             "bytes": spool_bytes,
+            "scan_saturated": spool_saturated,
             "overflow_total": overflow_bytes // len(OVERFLOW_EVENT),
             "overflow_counter_saturated": (
                 overflow_bytes + len(OVERFLOW_EVENT)
@@ -5011,12 +5264,34 @@ Run:
   -v
 ```
 
-Expected: all tests PASS. Two spooled Stops converge to one session, malformed
-spool JSON is deleted, 14-day pending/spool data is removed, 180-day dedupe is
-removed, status succeeds read-only immediately after initialization, and status
-reports session/generation/lease/spool/privacy health after the transcript file
-itself has been deleted, including saturation when no complete overflow record
-fits below the 64-KiB cap.
+Expected:
+
+```text
+Ran 79 tests
+OK
+```
+
+Then run the complete historical and production suite:
+
+```bash
+/usr/bin/python3 -m unittest discover \
+  -s skill-evolver/skills/skill-evolver/tests \
+  -v
+```
+
+Expected at the settled Task 6 commit:
+
+```text
+Ran 252 tests
+OK (skipped=3)
+```
+
+The three skips are the expected superseded probe-surface tests. The green
+suite proves HMAC-authenticated spool convergence, bounded fd-safe import,
+exact 14/30/180-day cleanup, no expired-row resurrection, deletion of
+`candidate_evidence` rows carrying the expired `session_key` while retaining
+the parent candidate aggregate, FIFO-safe overflow handling, config-change
+expiry clamping, and lock-free read-only status after transcript deletion.
 
 - [ ] **Step 7: Commit maintenance and status**
 
