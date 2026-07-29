@@ -111,6 +111,84 @@ class RuntimeStoreTests(unittest.TestCase):
                 ):
                     self.runtime.load_installation(installation_path)
 
+    def test_load_rejects_noncanonical_fixed_transcript_roots(self) -> None:
+        fixed_transcript = self.base / "7"
+        fixed_transcript.mkdir(mode=0o700)
+        installation_path = self.runtime.initialize_runtime(
+            self.base / "data", (fixed_transcript,), self.config
+        )
+        original_payload = json.loads(
+            installation_path.read_text(encoding="utf-8")
+        )
+        alias_parent = self.base / "transcript-root-alias"
+        alias_parent.symlink_to(self.base, target_is_directory=True)
+        cases = (
+            ("relative", ["."], fixed_transcript),
+            ("tilde", ["~"], Path.cwd()),
+            ("non_string", [7], self.base),
+            (
+                "symlinked_ancestor",
+                [str(alias_parent / fixed_transcript.name)],
+                Path.cwd(),
+            ),
+        )
+
+        for name, transcript_roots, working_directory in cases:
+            with self.subTest(name=name):
+                payload = {
+                    **original_payload,
+                    "transcript_roots": transcript_roots,
+                }
+                installation_path.write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+                installation_path.chmod(0o600)
+                previous_cwd = Path.cwd()
+                try:
+                    os.chdir(working_directory)
+                    with mock.patch.dict(
+                        os.environ, {"HOME": str(fixed_transcript)}
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError, "invalid_transcript_roots"
+                        ):
+                            self.runtime.load_installation(installation_path)
+                finally:
+                    os.chdir(previous_cwd)
+
+    def test_load_rejects_noncanonical_fixed_data_root(self) -> None:
+        root = self.base / "7"
+        installation_path = self.runtime.initialize_runtime(
+            root, (self.sessions,), self.config
+        )
+        original_payload = json.loads(
+            installation_path.read_text(encoding="utf-8")
+        )
+        alias_parent = self.base / "data-root-alias"
+        alias_parent.symlink_to(self.base, target_is_directory=True)
+        cases = (
+            ("relative", ".", root),
+            ("non_string", 7, self.base),
+            ("symlinked_ancestor", str(alias_parent / root.name), Path.cwd()),
+        )
+
+        for name, data_root, working_directory in cases:
+            with self.subTest(name=name):
+                payload = {**original_payload, "data_root": data_root}
+                installation_path.write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+                installation_path.chmod(0o600)
+                previous_cwd = Path.cwd()
+                try:
+                    os.chdir(working_directory)
+                    with self.assertRaisesRegex(
+                        ValueError, "invalid_data_root"
+                    ):
+                        self.runtime.load_installation(installation_path)
+                finally:
+                    os.chdir(previous_cwd)
+
     def test_load_rejects_unsafe_fixed_transcript_root(self) -> None:
         installation_path = self.runtime.initialize_runtime(
             self.base / "data", (self.sessions,), self.config

@@ -369,6 +369,9 @@ Expected: only the eleven listed test/harness paths are committed.
 - SQLite produces one unique `review_items.session_key`, session generation and
   epoch boundaries, frozen locator state, batch/evidence tables, and no
   turn-count or event-key columns.
+- Persisted fixed data/transcript locators must be nonempty absolute strings
+  and must already equal their validated resolved paths; relative, tilde,
+  non-string, and symlink-ancestor forms fail before downstream path use.
 - Fixed transcript roots must be current-user-owned, non-world-writable
   directories and must not contain, equal, or sit below the data root after
   component-wise NFC/casefold normalization. Generic `exclude_roots`
@@ -491,6 +494,84 @@ class RuntimeStoreTests(unittest.TestCase):
                     ValueError, "data_transcript_overlap"
                 ):
                     self.runtime.load_installation(installation_path)
+
+    def test_load_rejects_noncanonical_fixed_transcript_roots(self) -> None:
+        fixed_transcript = self.base / "7"
+        fixed_transcript.mkdir(mode=0o700)
+        installation_path = self.runtime.initialize_runtime(
+            self.base / "data", (fixed_transcript,), self.config
+        )
+        original_payload = json.loads(
+            installation_path.read_text(encoding="utf-8")
+        )
+        alias_parent = self.base / "transcript-root-alias"
+        alias_parent.symlink_to(self.base, target_is_directory=True)
+        cases = (
+            ("relative", ["."], fixed_transcript),
+            ("tilde", ["~"], Path.cwd()),
+            ("non_string", [7], self.base),
+            (
+                "symlinked_ancestor",
+                [str(alias_parent / fixed_transcript.name)],
+                Path.cwd(),
+            ),
+        )
+
+        for name, transcript_roots, working_directory in cases:
+            with self.subTest(name=name):
+                payload = {
+                    **original_payload,
+                    "transcript_roots": transcript_roots,
+                }
+                installation_path.write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+                installation_path.chmod(0o600)
+                previous_cwd = Path.cwd()
+                try:
+                    os.chdir(working_directory)
+                    with mock.patch.dict(
+                        os.environ, {"HOME": str(fixed_transcript)}
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError, "invalid_transcript_roots"
+                        ):
+                            self.runtime.load_installation(installation_path)
+                finally:
+                    os.chdir(previous_cwd)
+
+    def test_load_rejects_noncanonical_fixed_data_root(self) -> None:
+        root = self.base / "7"
+        installation_path = self.runtime.initialize_runtime(
+            root, (self.sessions,), self.config
+        )
+        original_payload = json.loads(
+            installation_path.read_text(encoding="utf-8")
+        )
+        alias_parent = self.base / "data-root-alias"
+        alias_parent.symlink_to(self.base, target_is_directory=True)
+        cases = (
+            ("relative", ".", root),
+            ("non_string", 7, self.base),
+            ("symlinked_ancestor", str(alias_parent / root.name), Path.cwd()),
+        )
+
+        for name, data_root, working_directory in cases:
+            with self.subTest(name=name):
+                payload = {**original_payload, "data_root": data_root}
+                installation_path.write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+                installation_path.chmod(0o600)
+                previous_cwd = Path.cwd()
+                try:
+                    os.chdir(working_directory)
+                    with self.assertRaisesRegex(
+                        ValueError, "invalid_data_root"
+                    ):
+                        self.runtime.load_installation(installation_path)
+                finally:
+                    os.chdir(previous_cwd)
 
     def test_load_rejects_unsafe_fixed_transcript_root(self) -> None:
         installation_path = self.runtime.initialize_runtime(
@@ -1146,15 +1227,39 @@ def load_installation(path: Path) -> Installation:
     payload = json.loads(installation_path.read_text(encoding="utf-8"))
     if payload.get("schema_version") != 1 or payload.get("python") != "/usr/bin/python3":
         raise ValueError("unsupported_installation")
-    root = private_directory(Path(str(payload["data_root"])))
+    fixed_data_root = payload.get("data_root")
+    if (
+        not isinstance(fixed_data_root, str)
+        or not fixed_data_root
+        or not Path(fixed_data_root).is_absolute()
+    ):
+        raise ValueError("invalid_data_root")
+    requested_root = Path(fixed_data_root)
+    root = private_directory(requested_root)
+    if requested_root != root:
+        raise ValueError("invalid_data_root")
     if installation_path != root / "installation.json":
         raise ValueError("installation_root_mismatch")
-    transcript_roots = tuple(
-        validate_transcript_root(transcript_root)
-        for transcript_root in canonical_roots(
-            payload.get("transcript_roots"), allow_empty=False
+    fixed_transcript_roots = payload.get("transcript_roots")
+    if (
+        not isinstance(fixed_transcript_roots, list)
+        or not fixed_transcript_roots
+        or any(
+            not isinstance(item, str)
+            or not item
+            or not Path(item).is_absolute()
+            for item in fixed_transcript_roots
         )
+    ):
+        raise ValueError("invalid_transcript_roots")
+    requested_transcript_roots = tuple(
+        Path(item) for item in fixed_transcript_roots
     )
+    transcript_roots = tuple(
+        validate_transcript_root(item) for item in requested_transcript_roots
+    )
+    if requested_transcript_roots != transcript_roots:
+        raise ValueError("invalid_transcript_roots")
     validate_transcript_separation(root, transcript_roots)
     installation = Installation(
         data_root=root,

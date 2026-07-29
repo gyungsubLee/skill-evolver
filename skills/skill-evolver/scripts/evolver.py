@@ -378,15 +378,39 @@ def load_installation(path: Path) -> Installation:
     payload = json.loads(installation_path.read_text(encoding="utf-8"))
     if payload.get("schema_version") != 1 or payload.get("python") != "/usr/bin/python3":
         raise ValueError("unsupported_installation")
-    root = private_directory(Path(str(payload["data_root"])))
+    fixed_data_root = payload.get("data_root")
+    if (
+        not isinstance(fixed_data_root, str)
+        or not fixed_data_root
+        or not Path(fixed_data_root).is_absolute()
+    ):
+        raise ValueError("invalid_data_root")
+    requested_root = Path(fixed_data_root)
+    root = private_directory(requested_root)
+    if requested_root != root:
+        raise ValueError("invalid_data_root")
     if installation_path != root / "installation.json":
         raise ValueError("installation_root_mismatch")
-    transcript_roots = tuple(
-        validate_transcript_root(transcript_root)
-        for transcript_root in canonical_roots(
-            payload.get("transcript_roots"), allow_empty=False
+    fixed_transcript_roots = payload.get("transcript_roots")
+    if (
+        not isinstance(fixed_transcript_roots, list)
+        or not fixed_transcript_roots
+        or any(
+            not isinstance(item, str)
+            or not item
+            or not Path(item).is_absolute()
+            for item in fixed_transcript_roots
         )
+    ):
+        raise ValueError("invalid_transcript_roots")
+    requested_transcript_roots = tuple(
+        Path(item) for item in fixed_transcript_roots
     )
+    transcript_roots = tuple(
+        validate_transcript_root(item) for item in requested_transcript_roots
+    )
+    if requested_transcript_roots != transcript_roots:
+        raise ValueError("invalid_transcript_roots")
     validate_transcript_separation(root, transcript_roots)
     installation = Installation(
         data_root=root,
