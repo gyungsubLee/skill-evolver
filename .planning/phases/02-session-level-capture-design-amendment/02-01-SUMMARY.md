@@ -59,7 +59,13 @@ status: complete
 - 두 surface 모두 `same_file_identity`에 결합됐고, frozen prefix 뒤 suffix를 읽지 않았다(`read_past_boundary: false`, `suffix_ignored: true`).
 - 정확히 여섯 개의 schema-v2 sanitized fixtures가 JSON과 Markdown에서 모두 `PASS`인 authoritative report를 생성했다.
 - v2 report를 Phase 1 JSON digest `ced4503adb44bd041de063c04e0c6c64d0831370fc12e96a920fe97244d8ae15`에 결합했다.
-- superseded turn-level Runtime Queue plan을 실행 불가로 표시하고, session contract replacement plan을 Task 7 commit `e8fad084e275896622baeea4ffb9d5580b46104b`에 기록했다.
+- superseded turn-level Runtime Queue plan을 실행 불가로 표시했다. Task 7
+  session contract replacement plan은 original
+  `e8fad084e275896622baeea4ffb9d5580b46104b`, bounded spool/path/init
+  hardening `d9d6ef7bdc51ff2f6b3112b824aba9688acb54e0`, portable
+  DELETE-journal final `dd9227408d433ed97e5c958bc377920770e0941a` 순서로
+  교정됐고 최종 review는 `CLEAN`이다. Phase 3의 executable plan은
+  `dd9227408d433ed97e5c958bc377920770e0941a`다.
 - 현재 full deterministic suite는 `/usr/bin/python3 -m unittest discover -s skills/skill-evolver/tests -p 'test_*.py' -v`에서 `173/173`을 통과한다.
 
 ## Exact Gate Evidence
@@ -85,7 +91,12 @@ Reports:
 - Deterministic v2 gate slice: `9338c1f..431ae3b`
 - Probe runbook/hardening slice: `431ae3b..fbc1516`
 - Real evidence and staging correction slice: `fbc1516..4dc8ac5`
-- Replacement Runtime Queue plan: `e8fad084e275896622baeea4ffb9d5580b46104b`
+- Replacement Runtime Queue plan lineage: original
+  `e8fad084e275896622baeea4ffb9d5580b46104b`; bounded
+  spool/path/init hardening `d9d6ef7bdc51ff2f6b3112b824aba9688acb54e0`;
+  executable portable DELETE-journal final
+  `dd9227408d433ed97e5c958bc377920770e0941a` (`CLEAN`)
+- Full Phase 2 evidence range: `dd9c94f..dd92274`
 
 ## Cleanup and Privacy Outcome
 
@@ -104,9 +115,12 @@ claim that a plugin cache was deleted.
 - **Requirement:** `GATE-01` satisfied
 - **Authorized next phase:** Phase 3 Runtime Queue
 - **Executable downstream plan:** `docs/superpowers/plans/2026-07-28-skill-evolver-session-runtime-queue.md`
+  at `dd9227408d433ed97e5c958bc377920770e0941a`
 
 ## Next Phase Readiness
 
-Phase 3 may implement the replacement session Runtime Queue plan. Required
-`turn_id`, per-Stop rows, symmetric default write, and the superseded
-`2026-07-26` Runtime Queue plan remain prohibited.
+Phase 3 may implement only the final reviewed replacement session Runtime Queue
+plan at `dd9227408d433ed97e5c958bc377920770e0941a`. Its portable SQLite
+contract uses `journal_mode=DELETE` and makes no runtime WAL/auxiliary-file
+assumption. Required `turn_id`, per-Stop rows, symmetric default write, and the
+superseded `2026-07-26` Runtime Queue plan remain prohibited.

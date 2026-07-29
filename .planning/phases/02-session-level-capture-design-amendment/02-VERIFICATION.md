@@ -19,7 +19,7 @@ behavior_unverified: 0
 | 1 | Required turn identity 없이 repeated Stops가 하나의 bounded session contract로 수렴한다. | ✓ VERIFIED | amendment sections 3.3–3.5; optional `turn_id`; replacement plan HMAC `session_key`와 one-row-per-session contract |
 | 2 | Global inbox를 유지하면서 Hook, default skill과 explicitly approved mutation의 권한이 분리된다. | ✓ VERIFIED | 두 access fixtures의 exact asymmetric matrix |
 | 3 | CLI와 Desktop 각각 두 independent sessions에서 stable Stop, same-file binding, provenance와 frozen-prefix behavior가 확인된다. | ✓ VERIFIED | 네 session Stop/transcript fixtures에서 `observation_count: 2`, `distinct_sessions: true`, `same_file_identity`, `read_past_boundary: false` |
-| 4 | Immutable Phase 1 predecessor에 결합된 amended gate `PASS` 뒤에만 Runtime Queue replacement plan이 제공된다. | ✓ VERIFIED | 두 v2 reports, predecessor digest, Task 7 commit `e8fad084e275896622baeea4ffb9d5580b46104b` |
+| 4 | Immutable Phase 1 predecessor에 결합된 amended gate `PASS` 뒤에만 Runtime Queue replacement plan이 제공된다. | ✓ VERIFIED | 두 v2 reports, predecessor digest, Task 7 original `e8fad084e275896622baeea4ffb9d5580b46104b` → hardening `d9d6ef7bdc51ff2f6b3112b824aba9688acb54e0` → executable final `dd9227408d433ed97e5c958bc377920770e0941a` |
 
 **Score:** 4/4 truths verified
 
@@ -85,8 +85,17 @@ All six parse as schema `2` and identify only `cli` or `desktop`.
 
 - The old plan begins with `SUPERSEDED — DO NOT EXECUTE`.
 - The replacement contains HMAC `session_key`, optional `turn_id`, one row per session, `transcript_epoch`, generation, observed/reviewed/frozen boundaries, lease recovery without cursor advancement, session-unique candidate evidence, Hook-only automatic writes, read-only status, exact-command scoped mutation approval, session limits and bounded spool.
+- The executable final plan includes the bounded spool/path/init hardening and
+  uses portable SQLite `journal_mode=DELETE` with `busy_timeout=0`. It requires
+  no runtime WAL or WAL auxiliary-file assumption; the only remaining WAL text
+  explains why `SQLITE_FCNTL_PERSIST_WAL` is unavailable through Python's
+  standard library.
 - Assertion result: `replacement Runtime Queue session-contract assertions: PASS`.
-- Evidence commit: `e8fad084e275896622baeea4ffb9d5580b46104b`.
+- Evidence lineage: original plan
+  `e8fad084e275896622baeea4ffb9d5580b46104b`; bounded spool/path/init
+  hardening `d9d6ef7bdc51ff2f6b3112b824aba9688acb54e0`; executable portable
+  DELETE-journal final `dd9227408d433ed97e5c958bc377920770e0941a`.
+- Final review: `CLEAN`.
 
 ## Historical Commit Slices
 
@@ -96,7 +105,11 @@ All six parse as schema `2` and identify only `cli` or `desktop`.
 - Deterministic gate: `9338c1f..431ae3b`
 - Probe runbook and hardening: `431ae3b..fbc1516`
 - Real evidence and physical gate staging: `fbc1516..4dc8ac5`
-- Replacement Runtime Queue plan: `e8fad084e275896622baeea4ffb9d5580b46104b`
+- Replacement Runtime Queue plan lineage:
+  `e8fad084e275896622baeea4ffb9d5580b46104b` →
+  `d9d6ef7bdc51ff2f6b3112b824aba9688acb54e0` →
+  `dd9227408d433ed97e5c958bc377920770e0941a` (executable final, `CLEAN`)
+- Full Phase 2 evidence range: `dd9c94f..dd92274`
 
 ## Human Verification Required
 
@@ -111,7 +124,7 @@ Phase 3 work and was not executed by this historical closeout.
 
 ## Verification Metadata
 
-**Verification approach:** fresh full-suite execution plus exact report, digest, fixture, privacy, inventory and replacement-plan assertions
+**Verification approach:** fresh full-suite execution plus exact report, digest, fixture, privacy, inventory and executable replacement-plan lineage/contract assertions
 **Must-haves source:** ROADMAP Phase 2, approved amendment and historical PLAN
 **Automated checks:** 4 evidence groups passed, 0 failed
 **Human checks required:** 0
