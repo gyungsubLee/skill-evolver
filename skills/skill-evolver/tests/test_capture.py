@@ -1088,6 +1088,32 @@ class ProductionSurfaceTests(unittest.TestCase):
         self.assertIn("Never invoke after an ordinary task", skill)
         self.assertNotIn("SubagentStop", json.dumps(hooks))
 
+    def test_readme_uses_v2_gate_and_scoped_mutation_approval(self) -> None:
+        readme = (PLUGIN_ROOT / "README.md").read_text(encoding="utf-8")
+        evolver = (
+            "/Users/igyeongseob/Documents/오픈소스/skill-evolver/"
+            "skills/skill-evolver/scripts/evolver.py"
+        )
+        self.assertIn("docs/feasibility-report-v2.json", readme)
+        self.assertIn('"next_action": "write_session_runtime_queue_plan"', readme)
+        self.assertIn(
+            "/Users/igyeongseob/.codex/skill-evolver/installation.json",
+            readme,
+        )
+        self.assertEqual(readme.count(evolver), 3)
+        for command in ("init", "status", "maintain"):
+            self.assertIn(f"{evolver} {command}", readme)
+        self.assertNotIn(
+            "\n  skill-evolver/skills/skill-evolver/scripts/evolver.py ",
+            readme,
+        )
+        self.assertIn("Status needs no write approval", readme)
+        self.assertIn("approve only this exact command and data root", readme)
+        self.assertIn("200 pending sessions", readme)
+        self.assertIn("one row per session", readme)
+        self.assertNotIn("200 turns", readme)
+        self.assertIn("There is no `SubagentStop` registration.", readme)
+
 
 class GenerationStateTests(unittest.TestCase):
     def setUp(self) -> None:
