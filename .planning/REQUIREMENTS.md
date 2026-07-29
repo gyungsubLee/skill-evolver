@@ -12,7 +12,7 @@
 ### Feasibility and Gate Routing
 
 - [x] **FEAS-01**: macOS Codex CLI와 Desktop 각각에서 bounded Stop observation, skill-process data-root access와 transcript structure를 probe하고, 성공 여부와 무관하게 sanitized fixture와 deterministic PASS/FAIL report를 생성해야 한다.
-- [ ] **GATE-01**: Feasibility FAIL 시 turn-level 및 inaccessible fixed-root 가정을 session-level queue/data-root 계약으로 수정하고 두 surface에서 재검증해야 하며, PASS 전에는 Runtime Queue를 승인하지 않아야 한다.
+- [x] **GATE-01**: Feasibility FAIL 시 turn-level 및 inaccessible fixed-root 가정을 session-level queue/data-root 계약으로 수정하고 두 surface에서 재검증해야 하며, PASS 전에는 Runtime Queue를 승인하지 않아야 한다.
 
 ### Read-only MVP
 
@@ -44,7 +44,7 @@
 | Requirement | Phase | Status |
 |-------------|-------|--------|
 | FEAS-01 | Phase 1 | Complete |
-| GATE-01 | Phase 2 | Pending |
+| GATE-01 | Phase 2 | Complete |
 | CAPT-01 | Phase 3 | Pending |
 | REVIEW-01 | Phase 4 | Pending |
 | QUALITY-01 | Phase 5 | Pending |

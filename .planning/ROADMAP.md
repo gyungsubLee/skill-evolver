@@ -2,15 +2,15 @@
 
 ## Overview
 
-Skill Evolver는 이미 완료된 Feasibility probe의 FAIL 결과에서 시작한다. 먼저 session-level capture와 CLI/Desktop에서 접근 가능한 data-root 계약으로 설계를 수정해 재검증하고, PASS 뒤에만 Read-only Queue와 Review를 진행한다. 이후 quality, runner, immutable evaluation, manual apply/versioning, undo/recovery와 hardening gate를 순서대로 통과한다.
+Skill Evolver는 완료된 Phase 1 Feasibility `FAIL`을 Phase 2에서 session-level capture와 asymmetric data-root 계약으로 수정했고, CLI/Desktop amended gate `PASS`를 확보했다. 이제 replacement Runtime Queue plan을 구현하고, 이후 Review, quality, runner, immutable evaluation, manual apply/versioning, undo/recovery와 hardening gate를 순서대로 통과한다.
 
 ## Phases
 
 **Phase Numbering:** 정수 phase는 순차 milestone 작업이며, 긴급 삽입만 소수 phase를 사용한다.
 
 - [x] **Phase 1: Feasibility Spike** - CLI/Desktop probe를 실행하고 deterministic gate decision을 생성했다.
-- [ ] **Phase 2: Session-Level Capture Design Amendment** - 실패한 turn/root 가정을 session-level queue와 접근 가능한 data-root 계약으로 수정하고 재검증한다.
-- [ ] **Phase 3: Runtime Queue** - amended PASS 계약에 따라 silent, bounded SQLite capture와 status를 제공한다.
+- [x] **Phase 2: Session-Level Capture Design Amendment** - 실패한 turn/root 가정을 session-level queue와 접근 가능한 data-root 계약으로 수정하고 CLI/Desktop에서 재검증했다.
+- [ ] **Phase 3: Runtime Queue** - amended PASS 계약에 따라 silent, bounded SQLite capture와 status를 제공한다. **(current)**
 - [ ] **Phase 4: Review and Inbox** - 명시적 review로 안전한 candidate inbox를 제공한다.
 - [ ] **Phase 5: Read-only Quality Gate** - 실제 sample과 attribution 품질로 Evaluate 진입 여부를 결정한다.
 - [ ] **Phase 6: Evaluate Runner Spike** - pinned runner의 격리·resource·재현성 계약을 검증한다.
@@ -59,16 +59,17 @@ Plans:
 **Requirements**: GATE-01
 **Entry Gate**: Phase 1 product gate is FAIL
 **Exit Gate**: Amended Feasibility rerun is PASS on CLI and Desktop
+**Gate Result**: **PASS** — `docs/feasibility-report-v2.{json,md}`
 **Failure Route**: Phase 2에 머물며 Phase 3을 계속 차단한다.
 **Success Criteria** (what must be TRUE):
   1. 개발자가 turn ID 없이도 bounded session을 중복 없이 queue하고 review할 수 있는 계약을 설명할 수 있다.
-  2. Hook과 explicit skill process가 default `workspace-write`에서 elevation 없이 같은 허용 data root를 사용할 수 있다.
+  2. Hook은 global root를 read/write하고 default skill은 read-only로 접근하며, skill write는 default에서 거부되고 explicit scoped approval에서만 허용된다.
   3. CLI와 Desktop 각각의 재실행 report가 amended session provenance와 access contract를 검증한다.
   4. 재실행 decision이 PASS이기 전에는 Runtime Queue 구현이 시작되지 않는다.
-**Plans**: 1 plan to be written
+**Plans**: 1 historical plan (registered after execution)
 
 Plans:
-- [ ] 02-01: Session-level capture/data-root 설계 수정과 cross-surface Feasibility rerun
+- [x] 02-01: Session-level capture/data-root 설계 수정과 cross-surface Feasibility rerun — completed 2026-07-29
 
 ### Phase 3: Runtime Queue
 **Goal**: amended PASS 계약에 맞춰 허용된 workspace의 bounded session metadata를 silent하고 idempotent하게 queue하고 transcript-free health를 제공한다.
@@ -222,8 +223,8 @@ Plans:
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Feasibility Spike | 1/1 | Complete (gate FAIL) | 2026-07-27 |
-| 2. Session-Level Capture Design Amendment | 0/1 | Not started (current) | - |
-| 3. Runtime Queue | 0/1 | Blocked by Phase 2 | - |
+| 2. Session-Level Capture Design Amendment | 1/1 | Complete (gate PASS) | 2026-07-29 |
+| 3. Runtime Queue | 0/1 | Not started (current) | - |
 | 4. Review and Inbox | 0/1 | Not started | - |
 | 5. Read-only Quality Gate | 0/1 | Not started | - |
 | 6. Evaluate Runner Spike | 0/1 | Not started | - |

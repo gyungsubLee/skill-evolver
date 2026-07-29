@@ -3,10 +3,10 @@ gsd_state_version: '1.0'
 status: planning
 progress:
   total_phases: 11
-  completed_phases: 1
-  total_plans: 1
-  completed_plans: 1
-  percent: 9
+  completed_phases: 2
+  total_plans: 2
+  completed_plans: 2
+  percent: 18
 ---
 
 # Project State
@@ -16,21 +16,21 @@ progress:
 See: `.planning/PROJECT.md` (updated 2026-07-27)
 
 **Core value:** 관찰은 최소화하고 판단과 스킬 변경 권한은 사용자에게 남긴다.
-**Current focus:** Phase 2 — Session-Level Capture Design Amendment
+**Current focus:** Phase 3 — Runtime Queue
 
 ## Current Position
 
-Phase: 2 of 11 (Session-Level Capture Design Amendment)
-Plan: 0 of TBD in current phase
-Status: Ready for discussion/planning
-Last activity: 2026-07-27 — GSD baseline created; Phase 1 work recorded complete with product gate FAIL
+Phase: 3 of 11 (Runtime Queue)
+Plan: 0 of 1 in current phase
+Status: Ready for implementation from the replacement session Runtime Queue plan
+Last activity: 2026-07-29 — Phase 2 amended CLI/Desktop gate recorded PASS; `GATE-01` complete
 
-Progress: [█░░░░░░░░░] 9%
+Progress: [██░░░░░░░░] 18%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 1
+- Total plans completed: 2
 - Average duration: Not recorded
 - Total execution time: Not recorded
 
@@ -39,39 +39,40 @@ Progress: [█░░░░░░░░░] 9%
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 1. Feasibility Spike | 1/1 | Not recorded | Not recorded |
+| 2. Session-Level Capture Design Amendment | 1/1 | Not recorded | Not recorded |
 
-**Recent Trend:** Insufficient data
+**Recent Trend:** Two historical phase plans recorded complete
 
 ## Accumulated Context
 
 ### Decisions
 
 - Phase 1 completion means the probe and deterministic report were produced; it does not convert the product gate to PASS.
-- Phase 2 replaces turn-level capture and inaccessible fixed-root assumptions with a session-level queue/data-root contract.
-- Phase 3 Runtime Queue requires an amended CLI/Desktop Feasibility PASS.
+- Phase 2 retained one global inbox while replacing turn-level and symmetric-write assumptions with session identity, same-file/frozen-prefix binding and asymmetric access.
+- CLI와 Desktop 각각 두 independent sessions와 exact-six schema-v2 fixtures가 amended report `PASS`를 입증했다.
+- Phase 3 uses only `docs/superpowers/plans/2026-07-28-skill-evolver-session-runtime-queue.md` from Task 7 commit `e8fad084e275896622baeea4ffb9d5580b46104b`.
 - Review, evaluation and mutation remain explicit-only; apply/undo require external TTY and complete digest/hash.
 
 ### Pending Todos
 
-- Discuss the session-level event identity, bounded transcript/session context and dedupe contract.
-- Select a data-root handoff that both Stop Hook and skill process can access under default `workspace-write`.
-- Write the amendment/re-probe execution plan after design decisions are settled.
+- Implement Phase 3 HMAC `session_key`, one-row-per-session upsert and bounded spool from the replacement plan.
+- Preserve optional `turn_id`, generation/epoch/frozen-boundary and session-unique evidence contracts.
+- Keep status read-only and require scoped approval for global-root review or maintenance mutations.
 
 ### Blockers/Concerns
 
-- **Runtime Queue blocked:** `docs/feasibility-report.md` decision is `FAIL`.
-- Failed access checks: `cli_skill_data_root`, `desktop_skill_data_root`.
-- Failed transcript checks: `cli_transcript_supported`, `desktop_transcript_supported`.
-- Do not execute the existing Runtime Queue plan until the amended rerun is PASS.
+- No Phase 2 product blocker remains: `docs/feasibility-report-v2.{json,md}` both record `PASS`.
+- The original Phase 1 `FAIL` remains immutable predecessor evidence, not a current Phase 3 blocker.
+- Do not execute the superseded turn-level Runtime Queue plan.
 
 ## Deferred Items
 
 | Category | Item | Status | Deferred At |
 |----------|------|--------|-------------|
-| Runtime | Turn-level queue implementation | Blocked pending redesign | Phase 1 gate |
+| Runtime | Turn-level queue implementation | Superseded; must not execute | Phase 2 amendment |
 
 ## Session Continuity
 
-Last session: 2026-07-27
-Stopped at: GSD project initialized; Phase 2 is ready for brainstorming and planning
+Last session: 2026-07-29
+Stopped at: Phase 2 complete and verified; Phase 3 Runtime Queue is current
 Resume file: None
