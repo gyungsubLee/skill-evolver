@@ -805,11 +805,13 @@ def upsert_session(
                 status = str(row["status"])
                 generation = int(row["generation"])
                 pending_since = row["pending_since"]
+                excluded_reason = row["excluded_reason"]
                 if status not in {"pending", "reviewing"} and new_work:
                     reserve_pending_session(connection, config, now)
                     status = "pending"
                     generation += 1
                     pending_since = now_text
+                    excluded_reason = None
                 elif status == "pending" and pending_since is None:
                     pending_since = now_text
                 binding_status = (
@@ -826,7 +828,7 @@ def upsert_session(
                         transcript_size=?,transcript_mtime_ns=?,
                         transcript_device=?,transcript_inode=?,
                         observed_boundary=?,last_stop_ns=?,last_stop_at=?,
-                        pending_since=?,error_code=?
+                        pending_since=?,excluded_reason=?,error_code=?
                     WHERE session_key=?
                     """,
                     (
@@ -845,6 +847,7 @@ def upsert_session(
                         event_time_ns,
                         now_text,
                         pending_since,
+                        excluded_reason,
                         error_code,
                         key,
                     ),

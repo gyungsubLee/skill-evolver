@@ -1626,6 +1626,13 @@ class GenerationStateTests(unittest.TestCase):
         self.runtime.claim_review_generation(
             connection, self.key, "owner-a", now, self.runtime_config
         )
+        connection.execute(
+            """
+            UPDATE review_items SET excluded_reason='prior exclusion'
+            WHERE session_key=?
+            """,
+            (self.key,),
+        )
         with self.transcript.open("ab") as stream:
             stream.write(b'{"payload":{"role":"assistant"}}\n')
         event = self.runtime.parse_session_stop(
@@ -1635,6 +1642,14 @@ class GenerationStateTests(unittest.TestCase):
         self.runtime.upsert_session(
             connection, event, self.key, self.runtime_config, now + 1
         )
+        during = connection.execute(
+            """
+            SELECT status,excluded_reason
+            FROM review_items WHERE session_key=?
+            """,
+            (self.key,),
+        ).fetchone()
+        self.assertEqual(tuple(during), ("reviewing", "prior exclusion"))
         connection.execute("BEGIN IMMEDIATE")
         completed = self.runtime.complete_review_generation(
             connection,
@@ -1655,6 +1670,108 @@ class GenerationStateTests(unittest.TestCase):
         connection.close()
         self.assertEqual(completed["status"], "pending")
         self.assertEqual(tuple(row), ("pending", None))
+
+    def test_later_stop_clears_completed_exclusion_when_reopened(self) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        self.runtime.claim_review_generation(
+            connection, self.key, "owner-a", now, self.runtime_config
+        )
+        connection.execute("BEGIN IMMEDIATE")
+        completed = self.runtime.complete_review_generation(
+            connection,
+            self.key,
+            "owner-a",
+            "excluded",
+            "not a reusable skill issue",
+            now + 1,
+        )
+        connection.commit()
+        excluded = connection.execute(
+            """
+            SELECT status,generation,excluded_reason
+            FROM review_items WHERE session_key=?
+            """,
+            (self.key,),
+        ).fetchone()
+        self.assertEqual(completed["status"], "excluded")
+        self.assertEqual(
+            tuple(excluded),
+            ("excluded", 1, "not a reusable skill issue"),
+        )
+
+        with self.transcript.open("ab") as stream:
+            stream.write(b'{"payload":{"role":"assistant"}}\n')
+        event = self.runtime.parse_session_stop(
+            self.raw, self.installation, self.runtime_config
+        )
+        assert event is not None
+        self.runtime.upsert_session(
+            connection, event, self.key, self.runtime_config, now + 2
+        )
+        reopened = connection.execute(
+            """
+            SELECT status,generation,excluded_reason
+            FROM review_items WHERE session_key=?
+            """,
+            (self.key,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(tuple(reopened), ("pending", 2, None))
+
+    def test_duplicate_and_stale_stop_preserve_terminal_exclusion(self) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        self.runtime.claim_review_generation(
+            connection, self.key, "owner-a", now, self.runtime_config
+        )
+        connection.execute("BEGIN IMMEDIATE")
+        self.runtime.complete_review_generation(
+            connection,
+            self.key,
+            "owner-a",
+            "excluded",
+            "terminal exclusion",
+            now + 1,
+        )
+        connection.commit()
+
+        duplicate = self.runtime.parse_session_stop(
+            self.raw, self.installation, self.runtime_config
+        )
+        assert duplicate is not None
+        self.assertEqual(
+            self.runtime.upsert_session(
+                connection,
+                duplicate,
+                self.key,
+                self.runtime_config,
+                now + 2,
+            ),
+            "duplicate",
+        )
+        self.assertEqual(
+            self.runtime.upsert_session(
+                connection,
+                replace(duplicate, observed_at_ns=0),
+                self.key,
+                self.runtime_config,
+                now + 3,
+            ),
+            "stale",
+        )
+        row = connection.execute(
+            """
+            SELECT status,generation,excluded_reason
+            FROM review_items WHERE session_key=?
+            """,
+            (self.key,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(
+            tuple(row),
+            ("excluded", 1, "terminal exclusion"),
+        )
 
     def test_candidate_evidence_is_unique_across_session_generations(
         self,
