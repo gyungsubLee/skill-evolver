@@ -1,0 +1,45 @@
+{
+  "checks": {
+    "bounded_spool_and_privacy_cleanup": true,
+    "candidate_evidence_unique_by_session": true,
+    "epoch_requires_explicit_embedded_binding": true,
+    "frozen_generation_boundary": true,
+    "hmac_session_identity": true,
+    "hook_metadata_only": true,
+    "lease_recovery_without_cursor_advance": true,
+    "one_row_per_session": true,
+    "optional_turn_id": true,
+    "session_capacity_retention_status": true,
+    "status_read_only": true,
+    "stop_during_review": true
+  },
+  "decision": "PASS",
+  "implementation_commit": "d7fb9b95d8f5816fde13a274a9b421c7b69412c7",
+  "production_sha256": {
+    ".agents/plugins/marketplace.json": "e5639e4b95eba663435044031268bb11fac22fe7c539885570ab7bfab4bb1936",
+    "skill-evolver/.codex-plugin/plugin.json": "acc1dacfeba7b9f89369254414f4d57619005ed30de3292c66847629a56de41e",
+    "skill-evolver/hooks/hooks.json": "a6bd79c7dbddd98fb318186444d2e2c61fe792f8569787f79a9689c7904659ec",
+    "skill-evolver/skills/skill-evolver/SKILL.md": "c8467d4dbbf83205f1933235d68bd7df97700a030600c06b730ae0e59fbdf923",
+    "skill-evolver/skills/skill-evolver/references/runtime.json": "6b98a9fec3e897da720b87845c36e298d8e2511250d25124b68405568e13d8c0",
+    "skill-evolver/skills/skill-evolver/scripts/evolver.py": "60b9eb25910663697205171840de4f8594cfd786b998b1e07db39e85c67e0482",
+    "skill-evolver/skills/skill-evolver/tests/test_capture.py": "c70168a9de8abce10a5c1ca2b3e7c006d07465dba17b8e37cea678891f0853c6"
+  },
+  "schema_version": 1,
+  "tests": {
+    "command": "/usr/bin/python3 -m unittest discover -s skill-evolver/skills/skill-evolver/tests -p test*.py -v",
+    "obsolete_probe_surface_assertions_skipped": 3,
+    "result": "PASS",
+    "skipped_test_methods": [
+      "test_manifest_and_hook_are_discoverable",
+      "test_skill_is_explicit_only",
+      "test_readme_stages_exact_private_v2_gate_inventory"
+    ]
+  },
+  "upstream": {
+    "decision": "PASS",
+    "next_action": "write_session_runtime_queue_plan",
+    "path": "docs/feasibility-report-v2.json",
+    "predecessor_sha256": "ced4503adb44bd041de063c04e0c6c64d0831370fc12e96a920fe97244d8ae15",
+    "schema_version": 2
+  }
+}
