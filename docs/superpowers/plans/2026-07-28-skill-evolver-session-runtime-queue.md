@@ -5353,8 +5353,8 @@ Run:
   -v
 ```
 
-Expected: FAIL because the current README still documents the feasibility
-probe rather than production session queue operations.
+Expected: 80 tests run and FAIL because the current README still documents the
+feasibility probe rather than production session queue operations.
 
 - [ ] **Step 3: Replace README with the exact production runbook**
 
@@ -5401,7 +5401,7 @@ Then run:
 
 ```bash
 /usr/bin/python3 -I \
-  skill-evolver/skills/skill-evolver/scripts/evolver.py init \
+  /Users/igyeongseob/Documents/오픈소스/skill-evolver/skills/skill-evolver/scripts/evolver.py init \
   --data-root /Users/igyeongseob/.codex/skill-evolver \
   --transcript-root /Users/igyeongseob/.codex/sessions \
   --transcript-root /Users/igyeongseob/.codex/archived_sessions \
@@ -5437,7 +5437,7 @@ Status needs no write approval:
 
 ```bash
 /usr/bin/python3 -I \
-  skill-evolver/skills/skill-evolver/scripts/evolver.py status \
+  /Users/igyeongseob/Documents/오픈소스/skill-evolver/skills/skill-evolver/scripts/evolver.py status \
   --installation \
   /Users/igyeongseob/.codex/skill-evolver/installation.json
 ```
@@ -5456,7 +5456,7 @@ command and data root for this invocation:
 
 ```bash
 /usr/bin/python3 -I \
-  skill-evolver/skills/skill-evolver/scripts/evolver.py maintain \
+  /Users/igyeongseob/Documents/오픈소스/skill-evolver/skills/skill-evolver/scripts/evolver.py maintain \
   --installation \
   /Users/igyeongseob/.codex/skill-evolver/installation.json
 ```
@@ -5490,7 +5490,7 @@ Run the production tests:
   -v
 ```
 
-Expected: all production tests PASS.
+Expected: all 80 production tests PASS.
 
 Run complete discovery:
 
@@ -5501,9 +5501,9 @@ Run complete discovery:
   -v
 ```
 
-Expected: all production and frozen feasibility behavior tests PASS; exactly
-the three obsolete probe-metadata/README assertions from Task 1 are skipped.
-No other test is skipped or fails.
+Expected: all 253 production and frozen feasibility behavior tests PASS;
+exactly the three obsolete probe-metadata/README assertions from Task 1 are
+skipped. No other test is skipped or fails.
 
 - [ ] **Step 5: Commit operations**
 
@@ -5511,7 +5511,7 @@ No other test is skipped or fails.
 git add \
   skill-evolver/README.md \
   skill-evolver/skills/skill-evolver/tests/test_capture.py
-git commit -m "docs(skill-evolver): document session queue operations"
+git commit -m "docs(skill-evolver): publish session queue runbook"
 ```
 
 Expected: only README and the operations-boundary test are committed.
