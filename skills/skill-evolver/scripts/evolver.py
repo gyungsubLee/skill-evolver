@@ -860,12 +860,17 @@ def read_frozen_transcript(
         config.max_transcript_records, runtime.max_transcript_records
     )
     delta_length = frozen.frozen_to - frozen.frozen_from
-    if delta_length > byte_limit:
-        raise _transcript_error("oversized_session")
     descriptor = _open_frozen_transcript(installation, frozen)
     try:
         before = _stable_frozen_stat(os.fstat(descriptor), frozen)
         _initial_session_meta(descriptor, installation, frozen)
+        after_header = _stable_frozen_stat(
+            os.fstat(descriptor), frozen
+        )
+        if after_header != before:
+            raise _transcript_error("transcript_changed")
+        if delta_length > byte_limit:
+            raise _transcript_error("oversized_session")
         delta = _read_exact_at(
             descriptor, frozen.frozen_from, delta_length
         )

@@ -1046,3 +1046,96 @@ class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
             exported.delta_source_bytes + exported.context_source_bytes,
             limited.max_transcript_bytes,
         )
+
+    def test_missing_oversized_delta_is_retryable_missing(self) -> None:
+        header = self.fixture_lines[0]
+        delta = self.fixture_lines[5]
+        connection, transcript, frozen = self.capture_and_claim(
+            [header, delta],
+            reviewed_boundary=len(header),
+        )
+        limited = replace(
+            self.config, max_transcript_bytes=len(delta) - 1
+        )
+        transcript.unlink()
+        try:
+            with self.assertRaises(
+                self.runtime.TranscriptAdapterError
+            ) as raised:
+                self.runtime.read_frozen_transcript(
+                    self.installation,
+                    frozen,
+                    limited,
+                    self.review,
+                )
+            self.assertEqual(raised.exception.code, "transcript_missing")
+            self.assertTrue(raised.exception.retryable)
+        finally:
+            connection.close()
+
+    def test_changed_oversized_delta_is_retryable_changed(self) -> None:
+        header = self.fixture_lines[0]
+        delta = self.fixture_lines[5]
+        connection, transcript, frozen = self.capture_and_claim(
+            [header, delta],
+            reviewed_boundary=len(header),
+        )
+        limited = replace(
+            self.config, max_transcript_bytes=len(delta) - 1
+        )
+        initial_session_meta = self.runtime._initial_session_meta
+
+        def change_after_initial_meta(*args) -> None:
+            initial_session_meta(*args)
+            os.utime(
+                transcript,
+                ns=(
+                    frozen.locator.mtime_ns,
+                    frozen.locator.mtime_ns + 1_000_000,
+                ),
+            )
+
+        try:
+            with mock.patch.object(
+                self.runtime,
+                "_initial_session_meta",
+                side_effect=change_after_initial_meta,
+            ):
+                with self.assertRaises(
+                    self.runtime.TranscriptAdapterError
+                ) as raised:
+                    self.runtime.read_frozen_transcript(
+                        self.installation,
+                        frozen,
+                        limited,
+                        self.review,
+                    )
+            self.assertEqual(raised.exception.code, "transcript_changed")
+            self.assertTrue(raised.exception.retryable)
+        finally:
+            connection.close()
+
+    def test_stable_oversized_delta_is_terminal_oversized(self) -> None:
+        header = self.fixture_lines[0]
+        delta = self.fixture_lines[5]
+        connection, _, frozen = self.capture_and_claim(
+            [header, delta],
+            reviewed_boundary=len(header),
+        )
+        limited = replace(
+            self.config, max_transcript_bytes=len(delta) - 1
+        )
+        try:
+            with self.assertRaises(
+                self.runtime.TranscriptAdapterError
+            ) as raised:
+                self.runtime.read_frozen_transcript(
+                    self.installation,
+                    frozen,
+                    limited,
+                    self.review,
+                )
+            self.assertEqual(raised.exception.code, "oversized_session")
+            self.assertFalse(raised.exception.retryable)
+        finally:
+            connection.close()
