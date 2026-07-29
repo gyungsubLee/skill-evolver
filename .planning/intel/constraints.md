@@ -18,12 +18,12 @@
 ## Skill Evolver Read-only Runtime Queue Implementation Plan
 - source: /Users/igyeongseob/Documents/오픈소스/skill-evolver/docs/superpowers/plans/2026-07-26-skill-evolver-read-only-runtime-queue.md
 - type: schema
-- content: Runtime Queue requires a Feasibility PASS. It uses the fixed private data root `/Users/igyeongseob/.codex/skill-evolver`, SQLite WAL schema v1, HMAC event deduplication, a 200-file/10-MiB bounded spool, 14-day/200-turn pending limits, and transcript-free status. The Stop Hook accepts at most 64 KiB, emits no output, performs no model or network call, and never mutates installed skills.
+- content: SUPERSEDED by the session amendment and `2026-07-28-skill-evolver-session-runtime-queue.md`. The implemented Runtime Queue uses one HMAC-keyed row per session, SQLite schema v1 with `journal_mode=DELETE`, a 200-file/10-MiB bounded authenticated spool, 14-day/200-session pending limits, and transcript-free status. The Stop Hook accepts at most 64 KiB, emits no output, performs no model or network call, and never mutates installed skills.
 
 ## Skill Evolver Read-only Review Inbox Implementation Plan
 - source: /Users/igyeongseob/Documents/오픈소스/skill-evolver/docs/superpowers/plans/2026-07-26-skill-evolver-read-only-review-inbox.md
 - type: protocol
-- content: Review starts only after explicit `$skill-evolver review`. The adapter reads no-follow transcript prefixes within captured device, inode, size, and allowlisted-root boundaries. A batch is limited to 5 sessions, 20 turns, 2 MiB/100 records per session, and 8 MiB total; it creates at most one candidate per session and three new fingerprints per batch. External content, environment failures, one-off work, uncertain attribution, unsupported targets, and privacy failures are excluded.
+- content: SUPERSEDED for Phase 4 planning by `2026-07-29-skill-evolver-session-review-inbox-design.md`. Review starts only after explicit `$skill-evolver review`. The adapter reads no-follow frozen session-generation prefixes within captured identity and allowlisted-root boundaries. A batch is limited to 5 distinct sessions, 2 MiB/100 records per session, and 8 MiB total; there is no 20-turn abstraction. It creates at most one candidate per session and three new fingerprints per batch. External content, environment failures, one-off work, uncertain attribution, unsupported targets, and privacy failures are excluded.
 
 ## Skill Evolver Read-only Quality Gate Implementation Plan
 - source: /Users/igyeongseob/Documents/오픈소스/skill-evolver/docs/superpowers/plans/2026-07-26-skill-evolver-read-only-quality-gate.md

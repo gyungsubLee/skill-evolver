@@ -2,7 +2,7 @@
 
 ## Overview
 
-Skill Evolver는 완료된 Phase 1 Feasibility `FAIL`을 Phase 2에서 session-level capture와 asymmetric data-root 계약으로 수정했고, CLI/Desktop amended gate `PASS`를 확보했다. 이제 replacement Runtime Queue plan을 구현하고, 이후 Review, quality, runner, immutable evaluation, manual apply/versioning, undo/recovery와 hardening gate를 순서대로 통과한다.
+Skill Evolver는 Phase 1 Feasibility `FAIL`을 Phase 2의 session-level 계약으로 수정해 amended gate `PASS`를 확보했고, Phase 3에서 bounded Runtime Queue를 구현했다. 이제 explicit Review/Inbox를 구현한 뒤 quality, runner, immutable evaluation, manual apply/versioning, undo/recovery와 hardening gate를 순서대로 통과한다.
 
 ## Phases
 
@@ -10,8 +10,8 @@ Skill Evolver는 완료된 Phase 1 Feasibility `FAIL`을 Phase 2에서 session-l
 
 - [x] **Phase 1: Feasibility Spike** - CLI/Desktop probe를 실행하고 deterministic gate decision을 생성했다.
 - [x] **Phase 2: Session-Level Capture Design Amendment** - 실패한 turn/root 가정을 session-level queue와 접근 가능한 data-root 계약으로 수정하고 CLI/Desktop에서 재검증했다.
-- [ ] **Phase 3: Runtime Queue** - amended PASS 계약에 따라 silent, bounded SQLite capture와 status를 제공한다. **(current)**
-- [ ] **Phase 4: Review and Inbox** - 명시적 review로 안전한 candidate inbox를 제공한다.
+- [x] **Phase 3: Runtime Queue** - amended PASS 계약에 따라 silent, bounded SQLite capture와 status를 제공한다.
+- [ ] **Phase 4: Review and Inbox** - 명시적 review로 안전한 candidate inbox를 제공한다. **(current)**
 - [ ] **Phase 5: Read-only Quality Gate** - 실제 sample과 attribution 품질로 Evaluate 진입 여부를 결정한다.
 - [ ] **Phase 6: Evaluate Runner Spike** - pinned runner의 격리·resource·재현성 계약을 검증한다.
 - [ ] **Phase 7: Evaluate Prepare** - 변경을 실행하지 않고 immutable candidate와 evaluation spec을 준비한다.
@@ -76,6 +76,8 @@ Plans:
 **Depends on**: Phase 2
 **Requirements**: CAPT-01
 **Entry Gate**: Amended Feasibility decision is PASS
+**Exit Gate**: Runtime Queue integration suite and canonical report are PASS
+**Gate Result**: **PASS** — `docs/release-reports/runtime-queue.json`
 **Failure Route**: Phase 3을 수정하고 Phase 4로 진행하지 않는다.
 **Success Criteria** (what must be TRUE):
   1. CLI와 Desktop의 trusted Stop Hook이 사용자 채팅 출력, model call 또는 network 없이 session metadata를 queue한다.
@@ -85,7 +87,7 @@ Plans:
 **Plans**: 1 plan
 
 Plans:
-- [ ] 03-01: Amended Runtime Queue와 schema v1 capture/status
+- [x] 03-01: Amended Runtime Queue와 schema v1 capture/status — completed 2026-07-29
 
 ### Phase 4: Review and Inbox
 **Goal**: 사용자가 명시적으로 요청한 bounded review에서 재사용 가능한 candidate를 만들고 inspect, defer와 reject로 관리한다.
@@ -95,7 +97,7 @@ Plans:
 **Failure Route**: Phase 4 adapter, policy 또는 validation을 수정한다.
 **Success Criteria** (what must be TRUE):
   1. 인자 없는 호출과 status/inspect/defer/reject는 transcript를 열지 않고, explicit `review`만 bounded context를 읽는다.
-  2. review는 lease와 session/item/byte 상한을 지키며 지원하지 않거나 변경된 transcript를 추측하지 않는다.
+  2. review는 최대 5개 distinct sessions, session별 100 records·2 MiB와 batch 8 MiB 상한을 지키며 지원하지 않거나 변경된 transcript를 추측하지 않는다.
   3. 사용자 교정과 skill-caused failure만 candidate가 되고 환경·one-off·external·uncertain 신호는 정확한 exclusion으로 남는다.
   4. candidate는 allowlisted user skill에만 귀속되고 session당 1개, batch당 신규 3개를 넘지 않는다.
 **Plans**: 1 plan
@@ -224,8 +226,8 @@ Plans:
 |-------|----------------|--------|-----------|
 | 1. Feasibility Spike | 1/1 | Complete (gate FAIL) | 2026-07-27 |
 | 2. Session-Level Capture Design Amendment | 1/1 | Complete (gate PASS) | 2026-07-29 |
-| 3. Runtime Queue | 0/1 | Not started (current) | - |
-| 4. Review and Inbox | 0/1 | Not started | - |
+| 3. Runtime Queue | 1/1 | Complete (gate PASS) | 2026-07-29 |
+| 4. Review and Inbox | 0/1 | Not started (current) | - |
 | 5. Read-only Quality Gate | 0/1 | Not started | - |
 | 6. Evaluate Runner Spike | 0/1 | Not started | - |
 | 7. Evaluate Prepare | 0/1 | Not started | - |

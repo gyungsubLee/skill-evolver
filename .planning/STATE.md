@@ -3,10 +3,10 @@ gsd_state_version: '1.0'
 status: planning
 progress:
   total_phases: 11
-  completed_phases: 2
-  total_plans: 2
-  completed_plans: 2
-  percent: 18
+  completed_phases: 3
+  total_plans: 3
+  completed_plans: 3
+  percent: 27
 ---
 
 # Project State
@@ -16,22 +16,22 @@ progress:
 See: `.planning/PROJECT.md` (updated 2026-07-27)
 
 **Core value:** 관찰은 최소화하고 판단과 스킬 변경 권한은 사용자에게 남긴다.
-**Current focus:** Phase 3 — Runtime Queue
+**Current focus:** Phase 4 — Review and Inbox
 
 ## Current Position
 
-Phase: 3 of 11 (Runtime Queue)
+Phase: 4 of 11 (Review and Inbox)
 Plan: 0 of 1 in current phase
-Status: Ready for implementation from the final portable DELETE-journal session Runtime Queue plan
-Last activity: 2026-07-29 — Phase 2 amended CLI/Desktop gate recorded PASS;
-`GATE-01` complete; Task 7 plan corrections reviewed `CLEAN`
+Status: Ready to replace the stale turn-level Review plan with a session-generation plan
+Last activity: 2026-07-29 — Phase 3 Runtime Queue gate recorded PASS;
+`CAPT-01` complete; canonical report and Task 7 plan corrections committed
 
-Progress: [██░░░░░░░░] 18%
+Progress: [███░░░░░░░] 27%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 2
+- Total plans completed: 3
 - Average duration: Not recorded
 - Total execution time: Not recorded
 
@@ -41,8 +41,9 @@ Progress: [██░░░░░░░░] 18%
 |-------|-------|-------|----------|
 | 1. Feasibility Spike | 1/1 | Not recorded | Not recorded |
 | 2. Session-Level Capture Design Amendment | 1/1 | Not recorded | Not recorded |
+| 3. Runtime Queue | 1/1 | Not recorded | Not recorded |
 
-**Recent Trend:** Two historical phase plans recorded complete
+**Recent Trend:** Three sequential phase gates recorded; Phase 2 and Phase 3 are PASS
 
 ## Accumulated Context
 
@@ -58,30 +59,38 @@ Progress: [██░░░░░░░░] 18%
   hardening `d9d6ef7bdc51ff2f6b3112b824aba9688acb54e0`, and executable portable
   DELETE-journal final `dd9227408d433ed97e5c958bc377920770e0941a`
   (`CLEAN`).
+- Phase 3 completion report
+  `docs/release-reports/runtime-queue.json` records `PASS`, 12 true checks,
+  seven production digests and implementation commit `d7fb9b9`.
+- Phase 4 must use session generations and frozen byte boundaries, not required
+  turn identity, per-Stop rows or a 20-item batch abstraction.
 - Review, evaluation and mutation remain explicit-only; apply/undo require external TTY and complete digest/hash.
 
 ### Pending Todos
 
-- Implement Phase 3 HMAC `session_key`, one-row-per-session upsert, bounded
-  spool, and SQLite `journal_mode=DELETE` from the executable final replacement
-  plan; do not introduce a runtime WAL/auxiliary-file assumption.
-- Preserve optional `turn_id`, generation/epoch/frozen-boundary and session-unique evidence contracts.
-- Keep status read-only and require scoped approval for global-root review or maintenance mutations.
+- Replace the superseded turn-level Review/Inbox plan with a session-generation
+  plan gated on `docs/release-reports/runtime-queue.json`.
+- Reuse the implemented claim, heartbeat, epoch adoption, evidence and
+  completion helpers; do not duplicate lease state or bump the schema.
+- Keep status/inspect read-only and require scoped approval for every
+  transcript read or global-root mutation.
 
 ### Blockers/Concerns
 
-- No Phase 2 product blocker remains: `docs/feasibility-report-v2.{json,md}` both record `PASS`.
+- No Phase 3 product blocker remains: `docs/release-reports/runtime-queue.json` records `PASS`.
 - The original Phase 1 `FAIL` remains immutable predecessor evidence, not a current Phase 3 blocker.
-- Do not execute the superseded turn-level Runtime Queue plan.
+- The existing 2026-07-26 Review plan is turn-level and must not be executed
+  until rewritten for session generations.
 
 ## Deferred Items
 
 | Category | Item | Status | Deferred At |
 |----------|------|--------|-------------|
 | Runtime | Turn-level queue implementation | Superseded; must not execute | Phase 2 amendment |
+| Review | Turn-level/20-item Review plan | Superseded; rewrite before execution | Phase 4 |
 
 ## Session Continuity
 
 Last session: 2026-07-29
-Stopped at: Phase 2 complete and verified; final Task 7 corrections are recorded and Phase 3 Runtime Queue is current
+Stopped at: Phase 3 complete and verified; Phase 4 Review plan rewrite is current
 Resume file: None
