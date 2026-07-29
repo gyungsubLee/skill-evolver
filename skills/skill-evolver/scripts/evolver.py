@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -11,6 +13,7 @@ import sqlite3
 import stat
 import sys
 import tempfile
+import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -161,6 +164,19 @@ class Config:
     max_candidates_per_batch: int
     lease_seconds: int
     lease_heartbeat_seconds: int
+
+
+@dataclass(frozen=True)
+class CapturedSessionStop:
+    session_id: str
+    diagnostic_turn_id: Optional[str]
+    cwd: Path
+    transcript_path: Path
+    transcript_size: int
+    transcript_mtime_ns: int
+    transcript_device: int
+    transcript_inode: int
+    observed_at_ns: int
 
 
 def canonical_json_bytes(value: object) -> bytes:
@@ -513,6 +529,490 @@ def open_database(
     return connection
 
 
+def within(path: Path, roots: tuple[Path, ...]) -> bool:
+    for root in roots:
+        try:
+            if os.path.commonpath((str(path), str(root))) == str(root):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def bounded_string(
+    payload: dict[str, object],
+    name: str,
+    maximum: int,
+    *,
+    required: bool = True,
+) -> Optional[str]:
+    value = payload.get(name)
+    if value is None and not required:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode("utf-8")) > maximum
+    ):
+        raise ValueError(f"invalid_{name}")
+    return value
+
+
+def parse_session_stop(
+    raw: bytes,
+    installation: Installation,
+    config: Config,
+) -> Optional[CapturedSessionStop]:
+    if len(raw) > MAX_HOOK_BYTES:
+        raise ValueError("hook_input_too_large")
+    payload = json.loads(raw)
+    if not isinstance(payload, dict) or payload.get("hook_event_name") != "Stop":
+        raise ValueError("not_stop_event")
+    if config.capture_paused:
+        return None
+    cwd_text = bounded_string(payload, "cwd", 4_096)
+    assert cwd_text is not None
+    cwd_value = Path(cwd_text).expanduser()
+    if cwd_value.is_symlink():
+        raise ValueError("cwd_symlink")
+    cwd = cwd_value.resolve(strict=True)
+    if within(cwd, config.exclude_roots):
+        return None
+    transcript_text = bounded_string(payload, "transcript_path", 4_096)
+    assert transcript_text is not None
+    transcript_value = Path(transcript_text).expanduser()
+    if transcript_value.is_symlink():
+        raise ValueError("transcript_symlink")
+    transcript = transcript_value.resolve(strict=True)
+    if not within(transcript, installation.transcript_roots):
+        raise ValueError("transcript_outside_roots")
+    descriptor = os.open(
+        str(transcript),
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        info = os.fstat(descriptor)
+        observed_at_ns = time.time_ns()
+    finally:
+        os.close(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        raise ValueError("transcript_owner_or_type")
+    raw_session_id = bounded_string(payload, "session_id", 512)
+    assert raw_session_id is not None
+    return CapturedSessionStop(
+        session_id=raw_session_id,
+        diagnostic_turn_id=bounded_string(
+            payload, "turn_id", 512, required=False
+        ),
+        cwd=cwd,
+        transcript_path=transcript,
+        transcript_size=info.st_size,
+        transcript_mtime_ns=info.st_mtime_ns,
+        transcript_device=info.st_dev,
+        transcript_inode=info.st_ino,
+        observed_at_ns=observed_at_ns,
+    )
+
+
+def session_key(installation: Installation, session_id: str) -> str:
+    return hmac.new(
+        installation.identity_key.read_bytes(),
+        b"session\0" + session_id.encode("utf-8"),
+        "sha256",
+    ).hexdigest()
+
+
+def iso_utc(epoch: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+RAW_CLEAR_ASSIGNMENTS = """
+raw_session_id=NULL,
+diagnostic_turn_id=NULL,
+cwd=NULL,
+transcript_path=NULL,
+transcript_size=NULL,
+transcript_mtime_ns=NULL,
+transcript_device=NULL,
+transcript_inode=NULL,
+error_code=NULL
+"""
+
+
+def expire_session_ids(
+    connection: sqlite3.Connection,
+    ids: list[int],
+    reason: str,
+    now: float,
+) -> int:
+    if not ids:
+        return 0
+    marks = ",".join("?" for _ in ids)
+    changed = connection.execute(
+        f"""
+        UPDATE review_items
+        SET status='expired', excluded_reason=?, reviewed_at=?,
+            raw_redacted_at=?, {RAW_CLEAR_ASSIGNMENTS}
+        WHERE id IN ({marks}) AND status='pending'
+        """,
+        (reason, iso_utc(now), iso_utc(now), *ids),
+    ).rowcount
+    if changed != len(ids):
+        raise sqlite3.IntegrityError("session_expiry_race")
+    return changed
+
+
+def reserve_pending_session(
+    connection: sqlite3.Connection,
+    config: Config,
+    now: float,
+) -> int:
+    count = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM review_items WHERE status='pending'"
+        ).fetchone()[0]
+    )
+    needed = max(count - config.pending_limit_sessions + 1, 0)
+    if not needed:
+        return 0
+    ids = [
+        int(row["id"])
+        for row in connection.execute(
+            """
+            SELECT id FROM review_items
+            WHERE status='pending'
+            ORDER BY pending_since, id
+            LIMIT ?
+            """,
+            (needed,),
+        )
+    ]
+    changed = expire_session_ids(connection, ids, "capacity", now)
+    connection.execute(
+        """
+        INSERT INTO metadata(key,value) VALUES('capacity_expired_count',?)
+        ON CONFLICT(key) DO UPDATE SET
+          value=CAST(CAST(value AS INTEGER)+excluded.value AS TEXT)
+        """,
+        (str(changed),),
+    )
+    return changed
+
+
+def upsert_session(
+    connection: sqlite3.Connection,
+    event: CapturedSessionStop,
+    key: str,
+    config: Config,
+    now: float,
+) -> str:
+    now_text = iso_utc(now)
+    event_time_ns = event.observed_at_ns
+    if type(event_time_ns) is not int or event_time_ns < 0:
+        raise ValueError("invalid_observed_at_ns")
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        row = connection.execute(
+            "SELECT * FROM review_items WHERE session_key=?",
+            (key,),
+        ).fetchone()
+        outcome = "duplicate"
+        if row is None:
+            reserve_pending_session(connection, config, now)
+            connection.execute(
+                """
+                INSERT INTO review_items(
+                  session_key,raw_session_id,diagnostic_turn_id,generation,
+                  transcript_epoch,status,binding_status,cwd,transcript_path,
+                  transcript_size,transcript_mtime_ns,transcript_device,
+                  transcript_inode,observed_boundary,last_stop_ns,
+                  reviewed_boundary,
+                  first_stop_at,last_stop_at,pending_since,
+                  raw_metadata_expires_at,dedupe_expires_at
+                ) VALUES(
+                  ?,?,?,1,0,'pending','accepted',?,?,?,?,?,?,?,?,0,?,?,?,?,?
+                )
+                """,
+                (
+                    key,
+                    event.session_id,
+                    event.diagnostic_turn_id,
+                    str(event.cwd),
+                    str(event.transcript_path),
+                    event.transcript_size,
+                    event.transcript_mtime_ns,
+                    event.transcript_device,
+                    event.transcript_inode,
+                    event.transcript_size,
+                    event_time_ns,
+                    now_text,
+                    now_text,
+                    now_text,
+                    iso_utc(now + config.raw_metadata_ttl_days * 86_400),
+                    iso_utc(now + config.session_dedupe_days * 86_400),
+                ),
+            )
+            outcome = "inserted"
+        elif row["status"] != "expired" and row["raw_redacted_at"] is None:
+            same_identity = (
+                int(row["transcript_device"]) == event.transcript_device
+                and int(row["transcript_inode"]) == event.transcript_inode
+            )
+            observed_boundary = int(row["observed_boundary"])
+            prior_time_ns = int(row["last_stop_ns"])
+            # ponytail: an equal clock tick keeps the current locator unless
+            # the same inode grew; add a per-process sequence only if future
+            # platforms cannot provide sufficient timestamp precision.
+            stale_observation = event_time_ns < prior_time_ns or (
+                event_time_ns == prior_time_ns
+                and (
+                    not same_identity
+                    or event.transcript_size <= observed_boundary
+                )
+            )
+            if stale_observation:
+                outcome = "stale"
+            else:
+                shrank = same_identity and (
+                    event.transcript_size < observed_boundary
+                )
+                pending_binding = row["binding_status"] == "pending_epoch"
+                needs_rebind = pending_binding or not same_identity or shrank
+                new_work = needs_rebind or (
+                    same_identity
+                    and event.transcript_size > int(row["reviewed_boundary"])
+                )
+                status = str(row["status"])
+                generation = int(row["generation"])
+                pending_since = row["pending_since"]
+                if status not in {"pending", "reviewing"} and new_work:
+                    reserve_pending_session(connection, config, now)
+                    status = "pending"
+                    generation += 1
+                    pending_since = now_text
+                elif status == "pending" and pending_since is None:
+                    pending_since = now_text
+                binding_status = (
+                    "pending_epoch" if needs_rebind else "accepted"
+                )
+                error_code = (
+                    "transcript_rebind_required" if needs_rebind else None
+                )
+                connection.execute(
+                    """
+                    UPDATE review_items
+                    SET raw_session_id=?,diagnostic_turn_id=?,generation=?,
+                        status=?,binding_status=?,cwd=?,transcript_path=?,
+                        transcript_size=?,transcript_mtime_ns=?,
+                        transcript_device=?,transcript_inode=?,
+                        observed_boundary=?,last_stop_ns=?,last_stop_at=?,
+                        pending_since=?,error_code=?
+                    WHERE session_key=?
+                    """,
+                    (
+                        event.session_id,
+                        event.diagnostic_turn_id,
+                        generation,
+                        status,
+                        binding_status,
+                        str(event.cwd),
+                        str(event.transcript_path),
+                        event.transcript_size,
+                        event.transcript_mtime_ns,
+                        event.transcript_device,
+                        event.transcript_inode,
+                        event.transcript_size,
+                        event_time_ns,
+                        now_text,
+                        pending_since,
+                        error_code,
+                        key,
+                    ),
+                )
+                outcome = "advanced" if new_work else "duplicate"
+        connection.execute(
+            """
+            INSERT INTO metadata(key,value) VALUES('last_hook_success_at',?)
+            ON CONFLICT(key) DO UPDATE SET value=MAX(value,excluded.value)
+            """,
+            (now_text,),
+        )
+        pending = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM review_items WHERE status='pending'"
+            ).fetchone()[0]
+        )
+        if pending > config.pending_limit_sessions:
+            raise sqlite3.IntegrityError("pending_session_capacity")
+        connection.commit()
+        return outcome
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def spooled_stop_payload(
+    event: CapturedSessionStop,
+    key: str,
+    config: Config,
+    now: float,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "session_key": key,
+        "raw_session_id": event.session_id,
+        "diagnostic_turn_id": event.diagnostic_turn_id,
+        "cwd": str(event.cwd),
+        "transcript_path": str(event.transcript_path),
+        "transcript_size": event.transcript_size,
+        "transcript_mtime_ns": event.transcript_mtime_ns,
+        "transcript_device": event.transcript_device,
+        "transcript_inode": event.transcript_inode,
+        "created_at": iso_utc(event.observed_at_ns / 1_000_000_000),
+        "created_at_ns": event.observed_at_ns,
+        "expires_at": iso_utc(now + config.pending_retention_days * 86_400),
+    }
+
+
+OVERFLOW_EVENT = b"1\n"
+MAX_OVERFLOW_EVENT_BYTES = 65_536
+MAX_SPOOL_SCAN_ENTRIES = 201
+
+
+def record_spool_overflow(installation: Installation) -> None:
+    path = installation.spool / "overflow.events"
+    descriptor = os.open(
+        str(path),
+        os.O_WRONLY
+        | os.O_APPEND
+        | os.O_CREAT
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise ValueError("spool_overflow_permissions")
+        if not acquire_spool_lock(descriptor, timeout_seconds=0.005):
+            return
+        info = os.fstat(descriptor)
+        if info.st_size + len(OVERFLOW_EVENT) <= MAX_OVERFLOW_EVENT_BYTES:
+            os.write(descriptor, OVERFLOW_EVENT)
+            os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def acquire_spool_lock(
+    descriptor: int, timeout_seconds: float = 0.05
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.005, remaining))
+
+
+def spool_session_stop(
+    installation: Installation,
+    config: Config,
+    event: CapturedSessionStop,
+    key: str,
+    now: float,
+) -> bool:
+    if type(event.observed_at_ns) is not int or event.observed_at_ns < 0:
+        raise ValueError("invalid_observed_at_ns")
+    lock_path = installation.spool / ".lock"
+    if lock_path.is_symlink():
+        raise ValueError("spool_lock_symlink")
+    lock_path.touch(mode=0o600, exist_ok=True)
+    with private_file(lock_path).open("r+b") as lock:
+        if not acquire_spool_lock(lock.fileno()):
+            record_spool_overflow(installation)
+            return False
+        files: list[Path] = []
+        with os.scandir(installation.spool) as entries:
+            for scanned, entry in enumerate(entries, start=1):
+                # Seeing the 201st entry is enough to fail conservatively; do
+                # not stat it or continue through an attacker-inflated spool.
+                if scanned >= MAX_SPOOL_SCAN_ENTRIES:
+                    record_spool_overflow(installation)
+                    return False
+                if not entry.name.endswith(".json"):
+                    continue
+                files.append(Path(entry.path))
+                if len(files) >= config.spool_limit_files:
+                    record_spool_overflow(installation)
+                    return False
+        total = 0
+        for path in files:
+            if path.is_symlink():
+                raise ValueError("spool_payload_symlink")
+            total += private_file(path).stat().st_size
+        encoded = (
+            canonical_json_bytes(
+                spooled_stop_payload(event, key, config, now)
+            )
+            + b"\n"
+        )
+        if (
+            len(files) >= config.spool_limit_files
+            or total + len(encoded) > config.spool_limit_bytes
+        ):
+            record_spool_overflow(installation)
+            return False
+        destination = installation.spool / (
+            f"{time.time_ns()}-{os.getpid()}-{secrets.token_hex(4)}.json"
+        )
+        atomic_write_bytes(destination, encoded)
+        return True
+
+
+def enqueue_stop(
+    installation: Installation,
+    config: Config,
+    raw: bytes,
+) -> str:
+    event = parse_session_stop(raw, installation, config)
+    if event is None:
+        return "ignored"
+    now = time.time()
+    key = session_key(installation, event.session_id)
+    try:
+        connection = open_database(installation)
+        try:
+            return upsert_session(
+                connection,
+                event,
+                key,
+                config,
+                now,
+            )
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return (
+            "spooled"
+            if spool_session_stop(
+                installation,
+                config,
+                event,
+                key,
+                now,
+            )
+            else "overflow"
+        )
+
+
 def write_json_stdout(value: object) -> None:
     sys.stdout.buffer.write(canonical_json_bytes(value) + b"\n")
 
@@ -528,6 +1028,17 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_enqueue_stop(args: argparse.Namespace) -> int:
+    try:
+        installation = load_installation(Path(args.installation))
+        config = load_config(installation)
+        raw = sys.stdin.buffer.read(MAX_HOOK_BYTES + 1)
+        enqueue_stop(installation, config, raw)
+    except Exception:
+        pass
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="evolver.py")
     parser.add_argument("--version", action="version", version=VERSION)
@@ -537,6 +1048,9 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--transcript-root", action="append", required=True)
     init.add_argument("--config", required=True)
     init.set_defaults(handler=cmd_init)
+    enqueue = commands.add_parser("enqueue-stop")
+    enqueue.add_argument("--installation", required=True)
+    enqueue.set_defaults(handler=cmd_enqueue_stop)
     return parser
 
 

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import fcntl
+import hmac
 import json
 import os
+import socket
 import sqlite3
 import stat
 import tempfile
+import threading
+import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -437,6 +443,454 @@ class RuntimeStoreTests(unittest.TestCase):
             installation_path.resolve(),
             (root / "installation.json").resolve(),
         )
+
+
+class SessionCaptureTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.runtime = load_runtime()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.sessions = self.base / "sessions"
+        self.excluded = self.base / "excluded"
+        for path in (self.sessions, self.excluded):
+            path.mkdir(mode=0o700)
+        self.config = {
+            "capture_paused": False,
+            "exclude_roots": [str(self.excluded)],
+        }
+        self.workspace = self.base / "workspace"
+        self.workspace.mkdir(mode=0o700)
+        self.installation_path = self.runtime.initialize_runtime(
+            self.base / "data", (self.sessions,), self.config
+        )
+        self.installation = self.runtime.load_installation(
+            self.installation_path
+        )
+        self.runtime_config = self.runtime.load_config(self.installation)
+        self.transcript = self.sessions / "session.jsonl"
+        self.transcript.write_text(
+            "not-json transcript body\n", encoding="utf-8"
+        )
+        self.payload = {
+            "hook_event_name": "Stop",
+            "session_id": "raw-session-1",
+            "cwd": str(self.workspace),
+            "transcript_path": str(self.transcript),
+        }
+
+    def test_missing_turn_id_uses_exact_session_hmac(self) -> None:
+        event = self.runtime.parse_session_stop(
+            json.dumps(self.payload).encode(),
+            self.installation,
+            self.runtime_config,
+        )
+        assert event is not None
+        expected = hmac.new(
+            self.installation.identity_key.read_bytes(),
+            b"session\0raw-session-1",
+            "sha256",
+        ).hexdigest()
+        self.assertIsNone(event.diagnostic_turn_id)
+        self.assertEqual(
+            self.runtime.session_key(self.installation, event.session_id),
+            expected,
+        )
+
+    def test_repeated_stops_converge_on_one_session_row(self) -> None:
+        first_size = self.transcript.stat().st_size
+        raw = json.dumps(self.payload).encode()
+        self.assertEqual(
+            self.runtime.enqueue_stop(
+                self.installation, self.runtime_config, raw
+            ),
+            "inserted",
+        )
+        with self.transcript.open("ab") as stream:
+            stream.write(b"still-not-json\n")
+        second_size = self.transcript.stat().st_size
+        self.assertEqual(
+            self.runtime.enqueue_stop(
+                self.installation, self.runtime_config, raw
+            ),
+            "advanced",
+        )
+        connection = self.runtime.open_database(self.installation)
+        rows = connection.execute("SELECT * FROM review_items").fetchall()
+        connection.close()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["generation"], 1)
+        self.assertEqual(rows[0]["transcript_epoch"], 0)
+        self.assertEqual(rows[0]["reviewed_boundary"], 0)
+        self.assertEqual(rows[0]["observed_boundary"], second_size)
+        self.assertGreater(second_size, first_size)
+        database_text = self.installation.database.read_bytes().decode(
+            "utf-8", errors="ignore"
+        )
+        self.assertNotIn("not-json transcript body", database_text)
+
+    def test_pending_capacity_is_sessions_not_stop_count(self) -> None:
+        limited = self.runtime.Config(
+            **{
+                **self.runtime_config.__dict__,
+                "pending_limit_sessions": 1,
+            }
+        )
+        first = json.dumps(self.payload).encode()
+        self.runtime.enqueue_stop(self.installation, limited, first)
+        self.runtime.enqueue_stop(self.installation, limited, first)
+        second = json.dumps(
+            {**self.payload, "session_id": "raw-session-2"}
+        ).encode()
+        self.runtime.enqueue_stop(self.installation, limited, second)
+        connection = self.runtime.open_database(self.installation)
+        counts = dict(
+            connection.execute(
+                "SELECT status,COUNT(*) FROM review_items GROUP BY status"
+            ).fetchall()
+        )
+        expired = connection.execute(
+            """
+            SELECT raw_session_id,diagnostic_turn_id,cwd,transcript_path,
+              transcript_size,transcript_mtime_ns,transcript_device,
+              transcript_inode,raw_redacted_at
+            FROM review_items WHERE status='expired'
+            """
+        ).fetchone()
+        connection.close()
+        self.assertEqual(counts, {"expired": 1, "pending": 1})
+        self.assertTrue(
+            all(expired[name] is None for name in expired.keys()[:-1])
+        )
+        self.assertIsNotNone(expired["raw_redacted_at"])
+
+    def test_concurrent_new_sessions_cannot_exceed_capacity(self) -> None:
+        limited = self.runtime.Config(
+            **{
+                **self.runtime_config.__dict__,
+                "pending_limit_sessions": 1,
+            }
+        )
+        events = []
+        for raw_session_id in ("concurrent-a", "concurrent-b"):
+            event = self.runtime.parse_session_stop(
+                json.dumps(
+                    {**self.payload, "session_id": raw_session_id}
+                ).encode(),
+                self.installation,
+                limited,
+            )
+            assert event is not None
+            events.append(
+                (
+                    event,
+                    self.runtime.session_key(
+                        self.installation, event.session_id
+                    ),
+                )
+            )
+        barrier = threading.Barrier(2)
+        failures: list[BaseException] = []
+        locked: list[sqlite3.OperationalError] = []
+
+        def capture(event, key) -> None:
+            connection = self.runtime.open_database(self.installation)
+            try:
+                barrier.wait(timeout=2)
+                self.runtime.upsert_session(
+                    connection, event, key, limited, 2_000_000_000.0
+                )
+            except sqlite3.OperationalError as error:
+                if "locked" in str(error).lower():
+                    locked.append(error)
+                else:
+                    failures.append(error)
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                connection.close()
+
+        workers = [
+            threading.Thread(target=capture, args=item, daemon=True)
+            for item in events
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=4)
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(failures, [])
+        self.assertLessEqual(len(locked), 1)
+        connection = self.runtime.open_database(self.installation)
+        pending = connection.execute(
+            "SELECT COUNT(*) FROM review_items WHERE status='pending'"
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(pending, 1)
+
+    def test_older_same_session_observation_cannot_regress_locator(self) -> None:
+        old_event = self.runtime.parse_session_stop(
+            json.dumps(self.payload).encode(),
+            self.installation,
+            self.runtime_config,
+        )
+        assert old_event is not None
+        with self.transcript.open("ab") as stream:
+            stream.write(b"newer-boundary\n")
+        new_event = self.runtime.parse_session_stop(
+            json.dumps(self.payload).encode(),
+            self.installation,
+            self.runtime_config,
+        )
+        assert new_event is not None
+        key = self.runtime.session_key(
+            self.installation, old_event.session_id
+        )
+        connection = self.runtime.open_database(self.installation)
+        self.runtime.upsert_session(
+            connection,
+            new_event,
+            key,
+            self.runtime_config,
+            2_000_000_000.0,
+        )
+        outcome = self.runtime.upsert_session(
+            connection,
+            old_event,
+            key,
+            self.runtime_config,
+            2_000_000_010.0,
+        )
+        row = connection.execute(
+            """
+            SELECT transcript_path,transcript_device,transcript_inode,
+              observed_boundary,last_stop_ns
+            FROM review_items WHERE session_key=?
+            """,
+            (key,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(outcome, "stale")
+        self.assertEqual(
+            row["transcript_path"], str(new_event.transcript_path)
+        )
+        self.assertEqual(
+            row["transcript_device"], new_event.transcript_device
+        )
+        self.assertEqual(row["transcript_inode"], new_event.transcript_inode)
+        self.assertEqual(
+            row["observed_boundary"], new_event.transcript_size
+        )
+        self.assertEqual(row["last_stop_ns"], new_event.observed_at_ns)
+
+    def test_writer_contention_immediately_uses_bounded_spool(self) -> None:
+        limited = self.runtime.Config(
+            **{
+                **self.runtime_config.__dict__,
+                "spool_limit_files": 1,
+            }
+        )
+        blocker = self.runtime.open_database(self.installation)
+        self.assertEqual(
+            blocker.execute("PRAGMA busy_timeout").fetchone()[0],
+            0,
+        )
+        blocker.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+        try:
+            first = self.runtime.enqueue_stop(
+                self.installation,
+                limited,
+                json.dumps(self.payload).encode(),
+            )
+            second = self.runtime.enqueue_stop(
+                self.installation,
+                limited,
+                json.dumps(
+                    {**self.payload, "session_id": "raw-session-2"}
+                ).encode(),
+            )
+        finally:
+            blocker.rollback()
+            blocker.close()
+        self.assertLess(time.monotonic() - started, 0.25)
+        self.assertEqual(first, "spooled")
+        self.assertEqual(second, "overflow")
+        self.assertEqual(
+            len(list(self.installation.spool.glob("*.json"))), 1
+        )
+        self.assertEqual(
+            (self.installation.spool / "overflow.events").read_text(
+                encoding="ascii"
+            ),
+            "1\n",
+        )
+
+    def test_overflow_counter_never_exceeds_hard_cap(self) -> None:
+        counter = self.installation.spool / "overflow.events"
+        counter.write_bytes(
+            b"1\n" * (self.runtime.MAX_OVERFLOW_EVENT_BYTES // 2 - 1)
+            + b"1"
+        )
+        counter.chmod(0o600)
+        self.runtime.record_spool_overflow(self.installation)
+        self.assertEqual(
+            counter.stat().st_size,
+            self.runtime.MAX_OVERFLOW_EVENT_BYTES - 1,
+        )
+
+    def test_concurrent_overflow_appends_share_one_hard_cap_decision(
+        self,
+    ) -> None:
+        counter = self.installation.spool / "overflow.events"
+        counter.write_bytes(
+            b"1\n" * (self.runtime.MAX_OVERFLOW_EVENT_BYTES // 2 - 1)
+        )
+        counter.chmod(0o600)
+        barrier = threading.Barrier(16)
+        failures: list[BaseException] = []
+
+        def overflow() -> None:
+            try:
+                barrier.wait(timeout=2)
+                self.runtime.record_spool_overflow(self.installation)
+            except BaseException as error:
+                failures.append(error)
+
+        workers = [
+            threading.Thread(target=overflow, daemon=True) for _ in range(16)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=4)
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(failures, [])
+        self.assertEqual(
+            counter.stat().st_size,
+            self.runtime.MAX_OVERFLOW_EVENT_BYTES,
+        )
+
+    def test_spool_directory_scan_fails_boundedly_at_entry_limit(self) -> None:
+        event = self.runtime.parse_session_stop(
+            json.dumps(self.payload).encode(),
+            self.installation,
+            self.runtime_config,
+        )
+        assert event is not None
+        key = self.runtime.session_key(self.installation, event.session_id)
+        for index in range(self.runtime.MAX_SPOOL_SCAN_ENTRIES):
+            path = self.installation.spool / f"junk-{index:03d}"
+            path.write_bytes(b"")
+            path.chmod(0o600)
+        started = time.monotonic()
+        spooled = self.runtime.spool_session_stop(
+            self.installation,
+            self.runtime_config,
+            event,
+            key,
+            2_000_000_000.0,
+        )
+        self.assertFalse(spooled)
+        self.assertLess(time.monotonic() - started, 0.25)
+        self.assertEqual(
+            list(self.installation.spool.glob("*.json")),
+            [],
+        )
+
+    def test_spool_size_scan_rejects_nonprivate_json_file(self) -> None:
+        event = self.runtime.parse_session_stop(
+            json.dumps(self.payload).encode(),
+            self.installation,
+            self.runtime_config,
+        )
+        assert event is not None
+        key = self.runtime.session_key(self.installation, event.session_id)
+        unsafe = self.installation.spool / "unsafe.json"
+        unsafe.write_bytes(b"{}\n")
+        unsafe.chmod(0o644)
+        with self.assertRaisesRegex(
+            ValueError, "private_file_permissions"
+        ):
+            self.runtime.spool_session_stop(
+                self.installation,
+                self.runtime_config,
+                event,
+                key,
+                2_000_000_000.0,
+            )
+
+    def test_spool_lock_contention_returns_within_hook_budget(self) -> None:
+        event = self.runtime.parse_session_stop(
+            json.dumps(self.payload).encode(),
+            self.installation,
+            self.runtime_config,
+        )
+        assert event is not None
+        key = self.runtime.session_key(self.installation, event.session_id)
+        lock_path = self.installation.spool / ".lock"
+        lock_path.touch(mode=0o600)
+        lock_path.chmod(0o600)
+        with lock_path.open("r+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            started = time.monotonic()
+            spooled = self.runtime.spool_session_stop(
+                self.installation,
+                self.runtime_config,
+                event,
+                key,
+                2_000_000_000.0,
+            )
+            elapsed = time.monotonic() - started
+        self.assertFalse(spooled)
+        self.assertLess(elapsed, 0.25)
+        self.assertEqual(
+            (self.installation.spool / "overflow.events").read_text(
+                encoding="ascii"
+            ),
+            "1\n",
+        )
+
+    def test_hook_is_silent_network_free_and_never_mutates_a_skill(
+        self,
+    ) -> None:
+        skill = self.base / "target-skill.md"
+        skill.write_text("unchanged\n", encoding="utf-8")
+        with mock.patch.object(
+            socket, "socket", side_effect=AssertionError("network forbidden")
+        ):
+            result = self.runtime.enqueue_stop(
+                self.installation,
+                self.runtime_config,
+                json.dumps(self.payload).encode(),
+            )
+        self.assertEqual(result, "inserted")
+        self.assertEqual(skill.read_text(encoding="utf-8"), "unchanged\n")
+
+        processes = (
+            run_isolated(
+                "enqueue-stop",
+                "--installation",
+                str(self.installation_path),
+                stdin=json.dumps(self.payload).encode(),
+            ),
+            run_isolated(
+                "enqueue-stop",
+                "--installation",
+                "/missing/installation.json",
+                stdin=b"{",
+            ),
+            run_isolated(
+                "enqueue-stop",
+                "--installation",
+                str(self.installation_path),
+                stdin=b"x" * 65_537,
+            ),
+        )
+        for process in processes:
+            self.assertEqual(process.returncode, 0)
+            self.assertEqual(process.stdout, b"")
+            self.assertEqual(process.stderr, b"")
 
 
 if __name__ == "__main__":
