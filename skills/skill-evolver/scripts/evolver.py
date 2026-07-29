@@ -43,6 +43,7 @@ CATALOG_EXPORT_MAX_BYTES = 49_152
 CATALOG_IDENTITY_MAX_BYTES = 272
 CATALOG_DISPLAY_NAME_MAX_BYTES = 128
 CATALOG_DESCRIPTION_MAX_BYTES = 384
+RUNTIME_REFERENCE_MAX_BYTES = 8_192
 POLICY_MAX_BYTES = 8_192
 RESULT_SCHEMA_INSTRUCTIONS_MAX_BYTES = 8_192
 CLAIM_CONTRACT_OVERHEAD_MAX_BYTES = 8_192
@@ -270,9 +271,16 @@ def sha256_json(value: object) -> str:
 
 
 def load_review_runtime() -> ReviewRuntime:
-    payload = json.loads(RUNTIME_REFERENCE_PATH.read_text(encoding="utf-8"))
+    with RUNTIME_REFERENCE_PATH.open("rb") as stream:
+        encoded = stream.read(RUNTIME_REFERENCE_MAX_BYTES + 1)
+    if len(encoded) > RUNTIME_REFERENCE_MAX_BYTES:
+        raise ValueError("review_runtime_too_large")
+    try:
+        payload = json.loads(encoded.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        raise ValueError("invalid_review_runtime") from None
     if (
-        not isinstance(payload, dict)
+        type(payload) is not dict
         or set(payload)
         != {
             "schema_version",
@@ -281,13 +289,28 @@ def load_review_runtime() -> ReviewRuntime:
             "mutable_skill_roots",
             "review_limits",
         }
+    ):
+        raise ValueError("invalid_review_runtime")
+    review_limits = payload["review_limits"]
+    if (
+        type(payload["schema_version"]) is not int
         or payload["schema_version"] != 1
+        or type(payload["version"]) is not str
         or payload["version"] != "0.1.0"
+        or type(payload["installation"]) is not str
         or payload["installation"]
         != "/Users/igyeongseob/.codex/skill-evolver/installation.json"
+        or type(payload["mutable_skill_roots"]) is not list
+        or any(
+            type(value) is not str
+            for value in payload["mutable_skill_roots"]
+        )
         or payload["mutable_skill_roots"]
         != [str(path) for path in FIXED_MUTABLE_SKILL_ROOTS]
-        or payload["review_limits"] != REVIEW_RUNTIME_FIXED
+        or type(review_limits) is not dict
+        or set(review_limits) != set(REVIEW_RUNTIME_FIXED)
+        or any(type(value) is not int for value in review_limits.values())
+        or review_limits != REVIEW_RUNTIME_FIXED
     ):
         raise ValueError("invalid_review_runtime")
     return ReviewRuntime(

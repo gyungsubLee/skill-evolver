@@ -65,16 +65,76 @@ class ReviewRuntimeContractTests(unittest.TestCase):
         payload = json.loads(source.read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "runtime.json"
-            payload["review_limits"]["catalog_inspect_max_bytes"] = 65_537
-            path.write_text(json.dumps(payload), encoding="utf-8")
-            path.chmod(0o600)
+            hostile_values = (
+                (
+                    "changed_limit",
+                    ("review_limits", "catalog_inspect_max_bytes"),
+                    65_537,
+                ),
+                ("bool_schema", ("schema_version",), True),
+                (
+                    "bool_limit",
+                    ("review_limits", "max_candidates_per_session"),
+                    True,
+                ),
+                (
+                    "float_limit",
+                    ("review_limits", "review_batch_sessions"),
+                    5.0,
+                ),
+            )
+            for label, keys, value in hostile_values:
+                hostile = json.loads(json.dumps(payload))
+                target = hostile
+                for key in keys[:-1]:
+                    target = target[key]
+                target[keys[-1]] = value
+                path.write_text(json.dumps(hostile), encoding="utf-8")
+                path.chmod(0o600)
+                with self.subTest(label=label):
+                    with mock.patch.object(
+                        self.runtime, "RUNTIME_REFERENCE_PATH", path
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError, "invalid_review_runtime"
+                        ):
+                            self.runtime.load_review_runtime()
+
+            for label, encoded in (
+                ("invalid_utf8", b"\xff"),
+                ("invalid_json", b"{"),
+                ("not_object", b"[]"),
+            ):
+                path.write_bytes(encoded)
+                with self.subTest(label=label):
+                    with mock.patch.object(
+                        self.runtime, "RUNTIME_REFERENCE_PATH", path
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError, "invalid_review_runtime"
+                        ):
+                            self.runtime.load_review_runtime()
+
+            self.assertEqual(
+                self.runtime.RUNTIME_REFERENCE_MAX_BYTES,
+                8_192,
+            )
+            bounded_path = mock.MagicMock()
+            bounded_reader = (
+                bounded_path.open.return_value.__enter__.return_value
+            )
+            bounded_reader.read.return_value = b"\xff" * 8_193
             with mock.patch.object(
-                self.runtime, "RUNTIME_REFERENCE_PATH", path
+                self.runtime, "RUNTIME_REFERENCE_PATH", bounded_path
             ):
                 with self.assertRaisesRegex(
-                    ValueError, "invalid_review_runtime"
+                    ValueError, "review_runtime_too_large"
                 ):
                     self.runtime.load_review_runtime()
+            bounded_path.open.assert_called_once_with("rb")
+            bounded_reader.read.assert_called_once_with(
+                self.runtime.RUNTIME_REFERENCE_MAX_BYTES + 1
+            )
 
     def test_policy_rejects_empty_invalid_utf8_and_overflow(self) -> None:
         review = self.runtime.load_review_runtime()
