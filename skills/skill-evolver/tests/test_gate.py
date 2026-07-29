@@ -138,12 +138,16 @@ class GateTests(unittest.TestCase):
         self.assertIn("CLI/Desktop schema differences", markdown)
 
     def test_skill_records_the_final_gate_boundary(self) -> None:
-        skill = (
-            PLUGIN_ROOT / "skills" / "skill-evolver" / "SKILL.md"
+        plan = (
+            PLUGIN_ROOT
+            / "docs"
+            / "superpowers"
+            / "plans"
+            / "2026-07-26-skill-evolver-feasibility-spike.md"
         ).read_text(encoding="utf-8")
-        self.assertIn("## Gate boundary", skill)
-        self.assertIn("A `PASS` report authorizes writing a separate Read-only MVP", skill)
-        self.assertIn("A `FAIL` report requires a design amendment", skill)
+        self.assertIn("## Gate boundary", plan)
+        self.assertIn("A `PASS` report authorizes writing a separate Read-only MVP", plan)
+        self.assertIn("A `FAIL` report requires a design amendment", plan)
 
     def test_gate_failure_names_the_failed_surface(self) -> None:
         report = self.runtime.evaluate_feasibility_gate(

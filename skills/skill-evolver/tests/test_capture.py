@@ -979,6 +979,12 @@ class ProductionSurfaceTests(unittest.TestCase):
             runtime["installation"],
             "/Users/igyeongseob/.codex/skill-evolver/installation.json",
         )
+        self.assertIn(
+            "Status and `maintain` are unavailable in this release",
+            skill,
+        )
+        self.assertNotIn("- No argument or `status`: run", skill)
+        self.assertNotIn("- `maintain`: show the exact", skill)
         self.assertIn("Status is read-only", skill)
         self.assertIn("exact command and global data root", skill)
         self.assertIn("No persistent writable-root grant", skill)
