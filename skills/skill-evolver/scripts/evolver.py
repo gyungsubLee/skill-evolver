@@ -863,12 +863,18 @@ def read_frozen_transcript(
     descriptor = _open_frozen_transcript(installation, frozen)
     try:
         before = _stable_frozen_stat(os.fstat(descriptor), frozen)
-        _initial_session_meta(descriptor, installation, frozen)
+        header_error: Optional[TranscriptAdapterError] = None
+        try:
+            _initial_session_meta(descriptor, installation, frozen)
+        except TranscriptAdapterError as error:
+            header_error = error
         after_header = _stable_frozen_stat(
             os.fstat(descriptor), frozen
         )
         if after_header != before:
             raise _transcript_error("transcript_changed")
+        if header_error is not None:
+            raise header_error
         if delta_length > byte_limit:
             raise _transcript_error("oversized_session")
         delta = _read_exact_at(

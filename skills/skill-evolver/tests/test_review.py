@@ -1115,6 +1115,103 @@ class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
         finally:
             connection.close()
 
+    def test_changed_malformed_oversized_header_is_retryable_changed(
+        self,
+    ) -> None:
+        header = self.fixture_lines[0]
+        delta = self.fixture_lines[5]
+        connection, transcript, frozen = self.capture_and_claim(
+            [header, delta],
+            reviewed_boundary=len(header),
+        )
+        limited = replace(
+            self.config, max_transcript_bytes=len(delta) - 1
+        )
+        original_pread = self.runtime.os.pread
+        changed = False
+
+        def change_before_first_pread(
+            descriptor: int,
+            length: int,
+            offset: int,
+        ) -> bytes:
+            nonlocal changed
+            if not changed:
+                changed = True
+                with transcript.open("r+b", buffering=0) as stream:
+                    stream.write(b"!")
+                    os.fsync(stream.fileno())
+                current = transcript.stat()
+                os.utime(
+                    transcript,
+                    ns=(
+                        current.st_atime_ns,
+                        frozen.locator.mtime_ns + 1_000_000,
+                    ),
+                )
+            return original_pread(descriptor, length, offset)
+
+        try:
+            with mock.patch.object(
+                self.runtime.os,
+                "pread",
+                side_effect=change_before_first_pread,
+            ):
+                with self.assertRaises(
+                    self.runtime.TranscriptAdapterError
+                ) as raised:
+                    self.runtime.read_frozen_transcript(
+                        self.installation,
+                        frozen,
+                        limited,
+                        self.review,
+                    )
+            current = transcript.stat()
+            self.assertEqual(
+                (current.st_dev, current.st_ino, current.st_size),
+                (
+                    frozen.locator.device,
+                    frozen.locator.inode,
+                    frozen.locator.size,
+                ),
+            )
+            self.assertNotEqual(
+                current.st_mtime_ns, frozen.locator.mtime_ns
+            )
+            self.assertEqual(raised.exception.code, "transcript_changed")
+            self.assertTrue(raised.exception.retryable)
+        finally:
+            connection.close()
+
+    def test_stable_malformed_oversized_header_is_terminal_unsupported(
+        self,
+    ) -> None:
+        header = b"!" + self.fixture_lines[0][1:]
+        delta = self.fixture_lines[5]
+        connection, _, frozen = self.capture_and_claim(
+            [header, delta],
+            reviewed_boundary=len(header),
+        )
+        limited = replace(
+            self.config, max_transcript_bytes=len(delta) - 1
+        )
+        try:
+            with self.assertRaises(
+                self.runtime.TranscriptAdapterError
+            ) as raised:
+                self.runtime.read_frozen_transcript(
+                    self.installation,
+                    frozen,
+                    limited,
+                    self.review,
+                )
+            self.assertEqual(
+                raised.exception.code, "unsupported_transcript"
+            )
+            self.assertFalse(raised.exception.retryable)
+        finally:
+            connection.close()
+
     def test_stable_oversized_delta_is_terminal_oversized(self) -> None:
         header = self.fixture_lines[0]
         delta = self.fixture_lines[5]
