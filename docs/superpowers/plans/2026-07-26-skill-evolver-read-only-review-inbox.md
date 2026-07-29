@@ -1,3 +1,9 @@
+# SUPERSEDED — DO NOT EXECUTE
+
+This turn-level plan is retained only as historical context. Implement Phase 4
+from `2026-07-29-skill-evolver-session-review-inbox.md`, which follows the
+committed session-generation design amendment.
+
 # Skill Evolver Read-only Review Inbox Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
