@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import calendar
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -23,6 +25,7 @@ from urllib.parse import quote
 VERSION = "skill-evolver 0.1.0"
 SCHEMA_VERSION = 1
 MAX_HOOK_BYTES = 65_536
+SQLITE_INTEGER_MAX = 9_223_372_036_854_775_807
 
 DEFAULTS = {
     "pending_retention_days": 14,
@@ -39,6 +42,10 @@ DEFAULTS = {
     "max_candidates_per_batch": 3,
     "lease_seconds": 600,
     "lease_heartbeat_seconds": 60,
+}
+HARD_LIMITS = {
+    "spool_limit_files": 200,
+    "spool_limit_bytes": 10_485_760,
 }
 
 SCHEMA_SQL = """
@@ -338,6 +345,9 @@ def initialize_runtime(
         value = merged[key]
         if type(value) is not int or value <= 0:
             raise ValueError(f"invalid_config_{key}")
+    for key, maximum in HARD_LIMITS.items():
+        if int(merged[key]) > maximum:
+            raise ValueError(f"invalid_config_{key}")
     if merged["max_candidates_per_session"] != 1:
         raise ValueError("invalid_config_max_candidates_per_session")
 
@@ -458,6 +468,9 @@ def load_config(installation: Installation) -> Config:
         if type(value) is not int or value <= 0:
             raise ValueError(f"invalid_config_{key}")
         values[key] = value
+    for key, maximum in HARD_LIMITS.items():
+        if values[key] > maximum:
+            raise ValueError(f"invalid_config_{key}")
     if values["max_candidates_per_session"] != 1:
         raise ValueError("invalid_config_max_candidates_per_session")
     return Config(
@@ -753,7 +766,50 @@ def upsert_session(
                 ),
             )
             outcome = "inserted"
-        elif row["status"] != "expired" and row["raw_redacted_at"] is None:
+        else:
+            connection.execute(
+                """
+                UPDATE review_items
+                SET first_stop_at=MIN(first_stop_at,?),
+                    dedupe_expires_at=MIN(dedupe_expires_at,?),
+                    raw_metadata_expires_at=CASE
+                      WHEN raw_redacted_at IS NULL
+                        AND raw_metadata_expires_at IS NOT NULL
+                      THEN MIN(raw_metadata_expires_at,?)
+                      ELSE raw_metadata_expires_at
+                    END,
+                    pending_since=CASE
+                      WHEN generation=1 AND status='pending'
+                      THEN CASE
+                        WHEN pending_since IS NULL THEN ?
+                        ELSE MIN(pending_since,?)
+                      END
+                      ELSE pending_since
+                    END
+                WHERE session_key=?
+                """,
+                (
+                    now_text,
+                    iso_utc(
+                        now + config.session_dedupe_days * 86_400
+                    ),
+                    iso_utc(
+                        now + config.raw_metadata_ttl_days * 86_400
+                    ),
+                    now_text,
+                    now_text,
+                    key,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM review_items WHERE session_key=?",
+                (key,),
+            ).fetchone()
+        if (
+            row is not None
+            and row["status"] != "expired"
+            and row["raw_redacted_at"] is None
+        ):
             same_identity = (
                 int(row["transcript_device"]) == event.transcript_device
                 and int(row["transcript_inode"]) == event.transcript_inode
@@ -1223,13 +1279,24 @@ def record_candidate_evidence(
     return changed == 1
 
 
+def spool_payload_hmac(
+    installation: Installation, payload: dict[str, object]
+) -> str:
+    return hmac.new(
+        installation.identity_key.read_bytes(),
+        b"spool\0" + canonical_json_bytes(payload),
+        "sha256",
+    ).hexdigest()
+
+
 def spooled_stop_payload(
+    installation: Installation,
     event: CapturedSessionStop,
     key: str,
     config: Config,
-    now: float,
 ) -> dict[str, object]:
-    return {
+    created_at = event.observed_at_ns / 1_000_000_000
+    body: dict[str, object] = {
         "schema_version": 1,
         "session_key": key,
         "raw_session_id": event.session_id,
@@ -1240,38 +1307,59 @@ def spooled_stop_payload(
         "transcript_mtime_ns": event.transcript_mtime_ns,
         "transcript_device": event.transcript_device,
         "transcript_inode": event.transcript_inode,
-        "created_at": iso_utc(event.observed_at_ns / 1_000_000_000),
+        "created_at": iso_utc(created_at),
         "created_at_ns": event.observed_at_ns,
-        "expires_at": iso_utc(now + config.pending_retention_days * 86_400),
+        "expires_at": iso_utc(
+            created_at + config.pending_retention_days * 86_400
+        ),
+    }
+    return {
+        **body,
+        "payload_hmac": spool_payload_hmac(installation, body),
     }
 
 
 OVERFLOW_EVENT = b"1\n"
 MAX_OVERFLOW_EVENT_BYTES = 65_536
-MAX_SPOOL_SCAN_ENTRIES = 201
+MAX_SPOOL_SCAN_ENTRIES = 203
+MAX_SPOOL_FUTURE_SKEW_SECONDS = 300
 
 
 def record_spool_overflow(installation: Installation) -> None:
     path = installation.spool / "overflow.events"
-    descriptor = os.open(
-        str(path),
-        os.O_WRONLY
-        | os.O_APPEND
-        | os.O_CREAT
-        | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
-    )
+    try:
+        descriptor = os.open(
+            str(path),
+            os.O_WRONLY
+            | os.O_APPEND
+            | os.O_CREAT
+            | os.O_NONBLOCK
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+    except OSError as error:
+        if error.errno == errno.ENXIO:
+            raise ValueError("spool_overflow_permissions") from None
+        raise
     try:
         info = os.fstat(descriptor)
         if (
             not stat.S_ISREG(info.st_mode)
             or info.st_uid != os.getuid()
             or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
         ):
             raise ValueError("spool_overflow_permissions")
         if not acquire_spool_lock(descriptor, timeout_seconds=0.005):
             return
         info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+        ):
+            raise ValueError("spool_overflow_permissions")
         if info.st_size + len(OVERFLOW_EVENT) <= MAX_OVERFLOW_EVENT_BYTES:
             os.write(descriptor, OVERFLOW_EVENT)
             os.fsync(descriptor)
@@ -1303,28 +1391,37 @@ def spool_session_stop(
 ) -> bool:
     if type(event.observed_at_ns) is not int or event.observed_at_ns < 0:
         raise ValueError("invalid_observed_at_ns")
-    lock_path = installation.spool / ".lock"
-    if lock_path.is_symlink():
-        raise ValueError("spool_lock_symlink")
-    lock_path.touch(mode=0o600, exist_ok=True)
-    with private_file(lock_path).open("r+b") as lock:
-        if not acquire_spool_lock(lock.fileno()):
-            record_spool_overflow(installation)
-            return False
+    try:
+        lock = open_locked_spool(installation)
+    except BlockingIOError:
+        record_spool_overflow(installation)
+        return False
+    with lock:
+        file_limit = min(
+            config.spool_limit_files, HARD_LIMITS["spool_limit_files"]
+        )
+        byte_limit = min(
+            config.spool_limit_bytes, HARD_LIMITS["spool_limit_bytes"]
+        )
         files: list[Path] = []
+        scanned_total = 0
         with os.scandir(installation.spool) as entries:
             for scanned, entry in enumerate(entries, start=1):
-                # Seeing the 201st entry is enough to fail conservatively; do
-                # not stat it or continue through an attacker-inflated spool.
+                scanned_total = scanned
+                # Admit 200 payloads plus the lock/overflow sidecars; the next
+                # entry proves attacker-inflated inventory and ends the scan.
                 if scanned >= MAX_SPOOL_SCAN_ENTRIES:
                     record_spool_overflow(installation)
                     return False
                 if not entry.name.endswith(".json"):
                     continue
                 files.append(Path(entry.path))
-                if len(files) >= config.spool_limit_files:
+                if len(files) >= file_limit:
                     record_spool_overflow(installation)
                     return False
+        if scanned_total + 1 >= MAX_SPOOL_SCAN_ENTRIES:
+            record_spool_overflow(installation)
+            return False
         total = 0
         for path in files:
             if path.is_symlink():
@@ -1332,13 +1429,13 @@ def spool_session_stop(
             total += private_file(path).stat().st_size
         encoded = (
             canonical_json_bytes(
-                spooled_stop_payload(event, key, config, now)
+                spooled_stop_payload(installation, event, key, config)
             )
             + b"\n"
         )
         if (
-            len(files) >= config.spool_limit_files
-            or total + len(encoded) > config.spool_limit_bytes
+            len(files) >= file_limit
+            or total + len(encoded) > byte_limit
         ):
             record_spool_overflow(installation)
             return False
@@ -1347,6 +1444,645 @@ def spool_session_stop(
         )
         atomic_write_bytes(destination, encoded)
         return True
+
+
+def parse_iso_utc(value: str) -> float:
+    try:
+        parsed = float(
+            calendar.timegm(
+                time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+            )
+        )
+    except (OSError, OverflowError, TypeError, ValueError):
+        raise ValueError("invalid_iso_utc") from None
+    if iso_utc(parsed) != value:
+        raise ValueError("invalid_iso_utc")
+    return parsed
+
+
+def event_from_spool(
+    payload: object,
+    installation: Installation,
+    config: Config,
+    now: float,
+) -> tuple[CapturedSessionStop, str, float, float]:
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise ValueError("invalid_spool_schema")
+    required = {
+        "schema_version",
+        "session_key",
+        "raw_session_id",
+        "diagnostic_turn_id",
+        "cwd",
+        "transcript_path",
+        "transcript_size",
+        "transcript_mtime_ns",
+        "transcript_device",
+        "transcript_inode",
+        "created_at",
+        "created_at_ns",
+        "expires_at",
+        "payload_hmac",
+    }
+    if set(payload) != required:
+        raise ValueError("invalid_spool_fields")
+    supplied_hmac = payload["payload_hmac"]
+    if not isinstance(supplied_hmac, str) or len(supplied_hmac) != 64:
+        raise ValueError("invalid_spool_hmac")
+    body = {
+        name: value
+        for name, value in payload.items()
+        if name != "payload_hmac"
+    }
+    if not hmac.compare_digest(
+        supplied_hmac, spool_payload_hmac(installation, body)
+    ):
+        raise ValueError("invalid_spool_hmac")
+
+    raw_session_id = bounded_string(body, "raw_session_id", 512)
+    assert raw_session_id is not None
+    diagnostic = bounded_string(
+        body, "diagnostic_turn_id", 512, required=False
+    )
+    cwd_value = bounded_string(body, "cwd", 4_096)
+    transcript_value = bounded_string(body, "transcript_path", 4_096)
+    assert cwd_value is not None and transcript_value is not None
+    cwd = Path(cwd_value)
+    transcript = Path(transcript_value)
+    if (
+        not cwd.is_absolute()
+        or not transcript.is_absolute()
+        or Path(os.path.normpath(cwd_value)) != cwd
+        or Path(os.path.normpath(transcript_value)) != transcript
+    ):
+        raise ValueError("invalid_spool_path")
+    if not within(transcript, installation.transcript_roots):
+        raise ValueError("invalid_spool_transcript_root")
+    integers = [
+        body["transcript_size"],
+        body["transcript_mtime_ns"],
+        body["transcript_device"],
+        body["transcript_inode"],
+    ]
+    if any(
+        type(value) is not int
+        or value < 0
+        or value > SQLITE_INTEGER_MAX
+        for value in integers
+    ):
+        raise ValueError("invalid_spool_stat")
+    created_at_ns = body["created_at_ns"]
+    created_at_text = body["created_at"]
+    expires_at_text = body["expires_at"]
+    if (
+        type(created_at_ns) is not int
+        or created_at_ns < 0
+        or not isinstance(created_at_text, str)
+        or not isinstance(expires_at_text, str)
+    ):
+        raise ValueError("invalid_spool_time")
+    if created_at_ns > int(
+        (now + MAX_SPOOL_FUTURE_SKEW_SECONDS) * 1_000_000_000
+    ):
+        raise ValueError("spool_capture_in_future")
+    created_at = created_at_ns / 1_000_000_000
+    if iso_utc(created_at) != created_at_text:
+        raise ValueError("inconsistent_spool_created_at")
+    signed_expires_at = parse_iso_utc(expires_at_text)
+    if signed_expires_at < created_at:
+        raise ValueError("inconsistent_spool_expiry")
+    expires_at = min(
+        signed_expires_at,
+        created_at + config.pending_retention_days * 86_400,
+    )
+    key = body["session_key"]
+    if not isinstance(key, str) or not hmac.compare_digest(
+        key, session_key(installation, raw_session_id)
+    ):
+        raise ValueError("invalid_spool_session_key")
+    return (
+        CapturedSessionStop(
+            session_id=raw_session_id,
+            diagnostic_turn_id=diagnostic,
+            cwd=cwd,
+            transcript_path=transcript,
+            transcript_size=int(body["transcript_size"]),
+            transcript_mtime_ns=int(body["transcript_mtime_ns"]),
+            transcript_device=int(body["transcript_device"]),
+            transcript_inode=int(body["transcript_inode"]),
+            observed_at_ns=created_at_ns,
+        ),
+        key,
+        min(created_at, now),
+        expires_at,
+    )
+
+
+def open_locked_spool(installation: Installation):
+    lock_path = installation.spool / ".lock"
+    descriptor = os.open(
+        str(lock_path),
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+        ):
+            raise ValueError("spool_lock_permissions")
+        if not acquire_spool_lock(descriptor):
+            raise BlockingIOError(
+                errno.EWOULDBLOCK, "spool_lock_busy"
+            )
+        return os.fdopen(descriptor, "r+b", buffering=0)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def bounded_spool_paths(
+    installation: Installation,
+    maximum_payloads: int,
+) -> tuple[list[Path], bool]:
+    paths: list[Path] = []
+    with os.scandir(installation.spool) as entries:
+        for scanned, entry in enumerate(entries, start=1):
+            if entry.name.endswith(".json"):
+                if len(paths) >= maximum_payloads:
+                    return paths, True
+                paths.append(Path(entry.path))
+            if scanned >= MAX_SPOOL_SCAN_ENTRIES:
+                return paths, True
+    return paths, False
+
+
+def read_spool_snapshot(
+    path: Path,
+) -> tuple[str, Optional[bytes], Optional[tuple[int, int]]]:
+    try:
+        before = os.lstat(path)
+    except FileNotFoundError:
+        return "missing", None, None
+    identity = (before.st_dev, before.st_ino)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.getuid()
+        or stat.S_IMODE(before.st_mode) != 0o600
+        or before.st_nlink != 1
+        or before.st_size > MAX_HOOK_BYTES
+    ):
+        return "invalid", None, identity
+    try:
+        descriptor = os.open(
+            str(path),
+            os.O_RDONLY
+            | os.O_NONBLOCK
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except FileNotFoundError:
+        return "missing", None, None
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            return "preserved", None, identity
+        raise
+    try:
+        info = os.fstat(descriptor)
+        if (
+            (info.st_dev, info.st_ino) != identity
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+            or info.st_size > MAX_HOOK_BYTES
+        ):
+            return (
+                "preserved"
+                if (info.st_dev, info.st_ino) != identity
+                else "invalid"
+            ), None, identity
+        chunks: list[bytes] = []
+        remaining = MAX_HOOK_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        encoded = b"".join(chunks)
+        if len(encoded) > MAX_HOOK_BYTES:
+            return "invalid", None, identity
+        return "verified", encoded, identity
+    finally:
+        os.close(descriptor)
+
+
+def delete_spool_identity(
+    installation: Installation,
+    path: Path,
+    identity: tuple[int, int],
+) -> bool:
+    with open_locked_spool(installation):
+        try:
+            current = os.lstat(path)
+        except FileNotFoundError:
+            return False
+        if (current.st_dev, current.st_ino) != identity:
+            return False
+        try:
+            if stat.S_ISDIR(current.st_mode):
+                os.rmdir(path)
+            else:
+                os.unlink(path)
+        except OSError as error:
+            if error.errno in {errno.ENOTEMPTY, errno.EEXIST}:
+                return False
+            raise
+        return True
+
+
+def import_spool(
+    connection: sqlite3.Connection,
+    installation: Installation,
+    config: Config,
+    now: float,
+) -> dict[str, int]:
+    if connection.in_transaction:
+        raise ValueError("active_transaction")
+    imported = duplicates = invalid = expired = preserved = 0
+    deleted_any = False
+
+    def remove_snapshot(path: Path, identity: tuple[int, int]) -> bool:
+        nonlocal deleted_any
+        removed = delete_spool_identity(installation, path, identity)
+        deleted_any = deleted_any or removed
+        return removed
+
+    with open_locked_spool(installation):
+        paths, saturated = bounded_spool_paths(
+            installation, HARD_LIMITS["spool_limit_files"]
+        )
+    verified: list[
+        tuple[
+            int,
+            str,
+            Path,
+            tuple[int, int],
+            CapturedSessionStop,
+            str,
+            float,
+        ]
+    ] = []
+    for path in paths:
+        with open_locked_spool(installation):
+            state, encoded, identity = read_spool_snapshot(path)
+        if state == "missing":
+            continue
+        assert identity is not None
+        if state == "preserved":
+            preserved += 1
+            continue
+        if state == "invalid":
+            if remove_snapshot(path, identity):
+                invalid += 1
+            else:
+                preserved += 1
+            continue
+        assert encoded is not None
+        try:
+            payload = json.loads(encoded.decode("utf-8"))
+            event, key, created_at, expires_at = event_from_spool(
+                payload, installation, config, now
+            )
+            if now >= expires_at:
+                if remove_snapshot(path, identity):
+                    expired += 1
+                else:
+                    preserved += 1
+                continue
+            verified.append(
+                (
+                    event.observed_at_ns,
+                    path.name,
+                    path,
+                    identity,
+                    event,
+                    key,
+                    created_at,
+                )
+            )
+        except (
+            KeyError,
+            OverflowError,
+            RecursionError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            if remove_snapshot(path, identity):
+                invalid += 1
+            else:
+                preserved += 1
+    verified.sort(key=lambda item: (item[0], item[1]))
+    for _, _, path, identity, event, key, created_at in verified:
+        outcome = upsert_session(
+            connection,
+            event,
+            key,
+            config,
+            created_at,
+        )
+        imported += int(outcome == "inserted")
+        duplicates += int(outcome != "inserted")
+        if not remove_snapshot(path, identity):
+            preserved += 1
+    if deleted_any:
+        fsync_directory(installation.spool)
+    return {
+        "spool_imported": imported,
+        "spool_duplicates": duplicates,
+        "spool_invalid_deleted": invalid,
+        "spool_expired": expired,
+        "spool_preserved": preserved,
+        "spool_scan_saturated": int(saturated),
+    }
+
+
+def run_maintenance(
+    connection: sqlite3.Connection,
+    installation: Installation,
+    config: Config,
+    now: float,
+) -> dict[str, int]:
+    if connection.in_transaction:
+        raise ValueError("active_transaction")
+    counts = import_spool(connection, installation, config, now)
+    leases_recovered = recover_expired_review_leases(connection, now)
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        retention_ids = [
+            int(row["id"])
+            for row in connection.execute(
+                """
+                SELECT id FROM review_items
+                WHERE status='pending' AND pending_since <= ?
+                ORDER BY pending_since,id
+                """,
+                (
+                    iso_utc(
+                        now - config.pending_retention_days * 86_400
+                    ),
+                ),
+            )
+        ]
+        pending_expired = expire_session_ids(
+            connection, retention_ids, "retention", now
+        )
+        pending_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM review_items WHERE status='pending'"
+            ).fetchone()[0]
+        )
+        capacity_ids = [
+            int(row["id"])
+            for row in connection.execute(
+                """
+                SELECT id FROM review_items
+                WHERE status='pending'
+                ORDER BY pending_since,id
+                LIMIT ?
+                """,
+                (max(pending_count - config.pending_limit_sessions, 0),),
+            )
+        ]
+        capacity_expired = expire_session_ids(
+            connection, capacity_ids, "capacity", now
+        )
+        raw_redacted = connection.execute(
+            f"""
+            UPDATE review_items
+            SET status=CASE
+                  WHEN status IN ('pending','reviewing') THEN 'expired'
+                  ELSE status
+                END,
+                excluded_reason=CASE
+                  WHEN status IN ('pending','reviewing')
+                  THEN COALESCE(excluded_reason,'raw_metadata_ttl')
+                  ELSE excluded_reason
+                END,
+                reviewed_at=CASE
+                  WHEN status IN ('pending','reviewing') THEN ?
+                  ELSE reviewed_at
+                END,
+                batch_id=NULL,review_started_at=NULL,frozen_epoch=NULL,
+                frozen_from=NULL,frozen_to=NULL,frozen_locator_json=NULL,
+                lease_owner=NULL,lease_expires_at=NULL,raw_redacted_at=?,
+                {RAW_CLEAR_ASSIGNMENTS}
+            WHERE raw_redacted_at IS NULL
+              AND raw_metadata_expires_at <= ?
+            """,
+            (iso_utc(now), iso_utc(now), iso_utc(now)),
+        ).rowcount
+        dedupe_cutoff = iso_utc(now)
+        connection.execute(
+            """
+            DELETE FROM candidate_evidence
+            WHERE session_key IN (
+              SELECT session_key FROM review_items
+              WHERE dedupe_expires_at <= ?
+                AND status NOT IN ('pending','reviewing')
+            )
+            """,
+            (dedupe_cutoff,),
+        )
+        dedupe_deleted = connection.execute(
+            """
+            DELETE FROM review_items
+            WHERE dedupe_expires_at <= ?
+              AND status NOT IN ('pending','reviewing')
+            """,
+            (dedupe_cutoff,),
+        ).rowcount
+        connection.execute(
+            """
+            INSERT INTO metadata(key,value) VALUES('last_maintenance_at',?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (iso_utc(now),),
+        )
+        if capacity_expired:
+            connection.execute(
+                """
+                INSERT INTO metadata(key,value)
+                VALUES('capacity_expired_count',?)
+                ON CONFLICT(key) DO UPDATE SET
+                  value=CAST(CAST(value AS INTEGER)+excluded.value AS TEXT)
+                """,
+                (str(capacity_expired),),
+            )
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    return {
+        **counts,
+        "leases_recovered": leases_recovered,
+        "pending_expired": pending_expired,
+        "capacity_expired": capacity_expired,
+        "raw_redacted": raw_redacted,
+        "dedupe_deleted": dedupe_deleted,
+    }
+
+
+def spool_inventory(installation: Installation) -> tuple[int, int, bool]:
+    count = total = 0
+    paths, saturated = bounded_spool_paths(
+        installation, DEFAULTS["spool_limit_files"]
+    )
+    for path in paths:
+        try:
+            info = os.lstat(path)
+        except OSError:
+            continue
+        if (
+            stat.S_ISREG(info.st_mode)
+            and info.st_uid == os.getuid()
+            and stat.S_IMODE(info.st_mode) == 0o600
+        ):
+            count += 1
+            total += info.st_size
+    return count, total, saturated
+
+
+def queue_status(
+    connection: sqlite3.Connection,
+    installation: Installation,
+    now: float,
+) -> dict[str, object]:
+    pending = connection.execute(
+        """
+        SELECT COUNT(*) AS sessions,MIN(pending_since) AS oldest
+        FROM review_items WHERE status='pending'
+        """
+    ).fetchone()
+    generations = int(
+        connection.execute(
+            "SELECT COALESCE(SUM(generation),0) FROM review_items"
+        ).fetchone()[0]
+    )
+    status_counts = {
+        str(row["status"]): int(row["count"])
+        for row in connection.execute(
+            """
+            SELECT status,COUNT(*) AS count
+            FROM review_items GROUP BY status
+            """
+        )
+    }
+    leases = connection.execute(
+        """
+        SELECT
+          COALESCE(SUM(CASE WHEN lease_expires_at>=? THEN 1 ELSE 0 END),0)
+            AS active,
+          COALESCE(SUM(CASE WHEN lease_expires_at<? THEN 1 ELSE 0 END),0)
+            AS expired
+        FROM review_items WHERE status='reviewing'
+        """,
+        (iso_utc(now), iso_utc(now)),
+    ).fetchone()
+    binding_failures = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) FROM review_items
+            WHERE binding_status='pending_epoch'
+               OR error_code IN (
+                 'transcript_rebind_required',
+                 'session_binding_unavailable'
+               )
+            """
+        ).fetchone()[0]
+    )
+    overdue_raw = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) FROM review_items
+            WHERE raw_redacted_at IS NULL
+              AND raw_metadata_expires_at <= ?
+            """,
+            (iso_utc(now),),
+        ).fetchone()[0]
+    )
+    metadata = {
+        str(row["key"]): str(row["value"])
+        for row in connection.execute(
+            """
+            SELECT key,value FROM metadata
+            WHERE key IN (
+              'last_hook_success_at',
+              'last_maintenance_at',
+              'capacity_expired_count'
+            )
+            """
+        )
+    }
+    spool_files, spool_bytes, spool_saturated = spool_inventory(
+        installation
+    )
+    overflow_path = installation.spool / "overflow.events"
+    try:
+        overflow_info = os.lstat(overflow_path)
+        overflow_bytes = (
+            overflow_info.st_size
+            if stat.S_ISREG(overflow_info.st_mode)
+            and overflow_info.st_uid == os.getuid()
+            and stat.S_IMODE(overflow_info.st_mode) == 0o600
+            else 0
+        )
+    except FileNotFoundError:
+        overflow_bytes = 0
+    oldest = pending["oldest"]
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "pending_sessions": int(pending["sessions"]),
+        "pending_generations": int(pending["sessions"]),
+        "generation_count_total": generations,
+        "oldest_pending_age_seconds": (
+            max(0, int(now - parse_iso_utc(str(oldest))))
+            if oldest is not None
+            else None
+        ),
+        "sessions_by_status": status_counts,
+        "leases": {
+            "active": int(leases["active"]),
+            "expired": int(leases["expired"]),
+        },
+        "binding_failures": binding_failures,
+        "spool": {
+            "files": spool_files,
+            "bytes": spool_bytes,
+            "scan_saturated": spool_saturated,
+            "overflow_total": overflow_bytes // len(OVERFLOW_EVENT),
+            "overflow_counter_saturated": (
+                overflow_bytes + len(OVERFLOW_EVENT)
+                > MAX_OVERFLOW_EVENT_BYTES
+            ),
+        },
+        "last_hook_success_at": metadata.get("last_hook_success_at"),
+        "raw_metadata_cleanup": {
+            "overdue_sessions": overdue_raw,
+            "last_maintenance_at": metadata.get("last_maintenance_at"),
+        },
+        "capacity_expired_total": int(
+            metadata.get("capacity_expired_count", "0")
+        ),
+        "checked_at": iso_utc(now),
+    }
 
 
 def enqueue_stop(
@@ -1411,6 +2147,31 @@ def cmd_enqueue_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_maintain(args: argparse.Namespace) -> int:
+    installation = load_installation(Path(args.installation))
+    config = load_config(installation)
+    connection = open_database(installation)
+    try:
+        result = run_maintenance(
+            connection, installation, config, time.time()
+        )
+    finally:
+        connection.close()
+    write_json_stdout(result)
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    installation = load_installation(Path(args.installation))
+    connection = open_database(installation, read_only=True)
+    try:
+        result = queue_status(connection, installation, time.time())
+    finally:
+        connection.close()
+    write_json_stdout(result)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="evolver.py")
     parser.add_argument("--version", action="version", version=VERSION)
@@ -1423,6 +2184,12 @@ def build_parser() -> argparse.ArgumentParser:
     enqueue = commands.add_parser("enqueue-stop")
     enqueue.add_argument("--installation", required=True)
     enqueue.set_defaults(handler=cmd_enqueue_stop)
+    maintain = commands.add_parser("maintain")
+    maintain.add_argument("--installation", required=True)
+    maintain.set_defaults(handler=cmd_maintain)
+    status = commands.add_parser("status")
+    status.add_argument("--installation", required=True)
+    status.set_defaults(handler=cmd_status)
     return parser
 
 

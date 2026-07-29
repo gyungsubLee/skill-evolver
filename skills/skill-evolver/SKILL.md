@@ -10,13 +10,18 @@ to this file and run it only with `/usr/bin/python3 -I`. Read
 `references/runtime.json`; never take the installation locator from an
 environment variable, transcript, or model output.
 
-Status and `maintain` are unavailable in this release; do not run, show, or
-recommend either command. Once installed, Status is read-only: it opens SQLite
-in `mode=ro`, reads only aggregate queue and spool metadata, does not import or
-delete spool files, and does not open transcripts. Once installed, `maintain`
-and future `review` are mutating workflows that require approval scoped to the
-exact command and global data root for that invocation. `review` is also
-unavailable until the Review/Inbox plan is installed.
+- No argument or `status`: run `status --installation
+  /Users/igyeongseob/.codex/skill-evolver/installation.json`.
+  Status is read-only: it opens SQLite in `mode=ro`, reads only aggregate queue
+  and spool metadata, does not import or delete spool files, and does not open
+  transcripts.
+- `maintain`: show the exact `maintain --installation
+  /Users/igyeongseob/.codex/skill-evolver/installation.json` command,
+  then request approval scoped to that exact command and global data root for
+  this invocation. Do not run it before approval.
+
+Future `review` is a mutating workflow and remains unavailable until the
+Review/Inbox plan is installed.
 
 No persistent writable-root grant is permitted. Do not request broad access,
 run scheduled maintenance, call a model automatically, mutate a skill, or

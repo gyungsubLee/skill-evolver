@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+from argparse import Namespace
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
@@ -445,6 +446,56 @@ class RuntimeStoreTests(unittest.TestCase):
             (root / "installation.json").resolve(),
         )
 
+    def test_initialize_rejects_spool_caps_above_hard_max_without_writes(
+        self,
+    ) -> None:
+        limits = {
+            "spool_limit_files": 201,
+            "spool_limit_bytes": 10_485_761,
+        }
+        for key, value in limits.items():
+            with self.subTest(key=key):
+                root = self.base / f"too-large-{key}"
+                with self.assertRaisesRegex(
+                    ValueError, f"invalid_config_{key}"
+                ):
+                    self.runtime.initialize_runtime(
+                        root,
+                        (self.sessions,),
+                        {**self.config, key: value},
+                    )
+                self.assertFalse(root.exists())
+
+    def test_load_config_rejects_tampered_spool_caps_above_hard_max(
+        self,
+    ) -> None:
+        limits = {
+            "spool_limit_files": 201,
+            "spool_limit_bytes": 10_485_761,
+        }
+        for key, value in limits.items():
+            with self.subTest(key=key):
+                installation_path = self.runtime.initialize_runtime(
+                    self.base / f"tampered-{key}",
+                    (self.sessions,),
+                    self.config,
+                )
+                installation = self.runtime.load_installation(
+                    installation_path
+                )
+                payload = json.loads(
+                    installation.config_path.read_text(encoding="utf-8")
+                )
+                payload[key] = value
+                installation.config_path.write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+                installation.config_path.chmod(0o600)
+                with self.assertRaisesRegex(
+                    ValueError, f"invalid_config_{key}"
+                ):
+                    self.runtime.load_config(installation)
+
 
 class SessionCaptureTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -740,6 +791,52 @@ class SessionCaptureTests(unittest.TestCase):
             self.runtime.MAX_OVERFLOW_EVENT_BYTES - 1,
         )
 
+    def test_overflow_counter_rejects_hardlink_without_touching_target(
+        self,
+    ) -> None:
+        outside = self.base / "outside-overflow"
+        outside.write_bytes(b"outside-overflow-content")
+        outside.chmod(0o600)
+        counter = self.installation.spool / "overflow.events"
+        os.link(outside, counter)
+
+        with self.assertRaisesRegex(
+            ValueError, "spool_overflow_permissions"
+        ):
+            self.runtime.record_spool_overflow(self.installation)
+
+        self.assertEqual(
+            outside.read_bytes(), b"outside-overflow-content"
+        )
+
+    def test_overflow_counter_fifo_fails_fast_without_reader(self) -> None:
+        counter = self.installation.spool / "overflow.events"
+        os.mkfifo(counter, 0o600)
+        errors: list[BaseException] = []
+
+        def record() -> None:
+            try:
+                self.runtime.record_spool_overflow(self.installation)
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=record, daemon=True)
+        worker.start()
+        worker.join(timeout=0.25)
+        blocked = worker.is_alive()
+        if blocked:
+            reader = os.open(counter, os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                worker.join(timeout=1)
+            finally:
+                os.close(reader)
+
+        self.assertFalse(blocked)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], ValueError)
+        self.assertEqual(str(errors[0]), "spool_overflow_permissions")
+
     def test_concurrent_overflow_appends_share_one_hard_cap_decision(
         self,
     ) -> None:
@@ -979,12 +1076,12 @@ class ProductionSurfaceTests(unittest.TestCase):
             runtime["installation"],
             "/Users/igyeongseob/.codex/skill-evolver/installation.json",
         )
-        self.assertIn(
+        self.assertNotIn(
             "Status and `maintain` are unavailable in this release",
             skill,
         )
-        self.assertNotIn("- No argument or `status`: run", skill)
-        self.assertNotIn("- `maintain`: show the exact", skill)
+        self.assertIn("- No argument or `status`: run", skill)
+        self.assertIn("- `maintain`: show the exact", skill)
         self.assertIn("Status is read-only", skill)
         self.assertIn("exact command and global data root", skill)
         self.assertIn("No persistent writable-root grant", skill)
@@ -1838,6 +1935,1835 @@ class GenerationStateTests(unittest.TestCase):
         self.assertTrue(first)
         self.assertFalse(second)
         self.assertEqual(count, 1)
+
+
+class MaintenanceStatusTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.runtime = load_runtime()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.sessions = self.base / "sessions"
+        self.excluded = self.base / "excluded"
+        for path in (self.sessions, self.excluded):
+            path.mkdir(mode=0o700)
+        self.config = {
+            "capture_paused": False,
+            "exclude_roots": [str(self.excluded)],
+        }
+        self.workspace = self.base / "workspace"
+        self.workspace.mkdir(mode=0o700)
+        self.installation_path = self.runtime.initialize_runtime(
+            self.base / "data", (self.sessions,), self.config
+        )
+        self.installation = self.runtime.load_installation(
+            self.installation_path
+        )
+        self.runtime_config = self.runtime.load_config(self.installation)
+        self.transcript = self.sessions / "session.jsonl"
+        self.transcript.write_text(
+            '{"payload":{"role":"user"}}\n', encoding="utf-8"
+        )
+
+    def event(self, raw_session_id: str = "maintenance-session"):
+        payload = {
+            "hook_event_name": "Stop",
+            "session_id": raw_session_id,
+            "cwd": str(self.workspace),
+            "transcript_path": str(self.transcript),
+        }
+        event = self.runtime.parse_session_stop(
+            json.dumps(payload).encode(),
+            self.installation,
+            self.runtime_config,
+        )
+        assert event is not None
+        return event
+
+    def test_status_command_opens_read_only_immediately_after_init(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn(
+            "- No argument or `status`: run `status --installation", skill
+        )
+        self.assertIn(
+            "- `maintain`: show the exact `maintain --installation", skill
+        )
+        self.assertNotIn("Status and `maintain` are unavailable", skill)
+        database_before = self.installation.database.read_bytes()
+        root_entries_before = sorted(
+            path.name for path in self.installation.data_root.iterdir()
+        )
+        spool_entries_before = sorted(
+            path.name for path in self.installation.spool.iterdir()
+        )
+        process = run_isolated(
+            "status",
+            "--installation",
+            str(self.installation_path),
+        )
+        self.assertEqual(process.returncode, 0)
+        self.assertEqual(process.stderr, b"")
+        status = json.loads(process.stdout)
+        self.assertEqual(status["pending_sessions"], 0)
+        self.assertEqual(status["spool"]["files"], 0)
+        self.assertEqual(
+            self.installation.database.read_bytes(),
+            database_before,
+        )
+        self.assertEqual(
+            sorted(
+                path.name for path in self.installation.data_root.iterdir()
+            ),
+            root_entries_before,
+        )
+        self.assertEqual(
+            sorted(path.name for path in self.installation.spool.iterdir()),
+            spool_entries_before,
+        )
+
+    def test_spool_import_converges_by_session_and_deletes_invalid_payload(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        event = replace(
+            self.event(), observed_at_ns=int(now * 1_000_000_000)
+        )
+        key = self.runtime.session_key(self.installation, event.session_id)
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                self.installation, self.runtime_config, event, key, now
+            )
+        )
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                self.installation, self.runtime_config, event, key, now + 1
+            )
+        )
+        invalid = self.installation.spool / "invalid.json"
+        invalid.write_text('{"raw_session_id":"secret"}\n', encoding="utf-8")
+        invalid.chmod(0o600)
+        outside = self.base / "outside.json"
+        outside.write_text(
+            '{"private":"do-not-follow"}\n', encoding="utf-8"
+        )
+        linked = self.installation.spool / "linked.json"
+        linked.symlink_to(outside)
+
+        connection = self.runtime.open_database(self.installation)
+        result = self.runtime.import_spool(
+            connection,
+            self.installation,
+            self.runtime_config,
+            now + 2,
+        )
+        rows = connection.execute(
+            "SELECT COUNT(*) FROM review_items"
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(result["spool_imported"], 1)
+        self.assertEqual(result["spool_duplicates"], 1)
+        self.assertEqual(result["spool_invalid_deleted"], 2)
+        self.assertEqual(rows, 1)
+        self.assertEqual(list(self.installation.spool.glob("*.json")), [])
+        self.assertEqual(
+            outside.read_text(encoding="utf-8"),
+            '{"private":"do-not-follow"}\n',
+        )
+
+    def test_spool_import_is_bounded_and_does_not_read_transcripts(self) -> None:
+        now = 2_000_000_000.0
+        event = replace(
+            self.event("no-transcript-read"),
+            observed_at_ns=int(now * 1_000_000_000),
+        )
+        key = self.runtime.session_key(self.installation, event.session_id)
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                self.installation, self.runtime_config, event, key, now
+            )
+        )
+        self.transcript.unlink()
+        connection = self.runtime.open_database(self.installation)
+        imported = self.runtime.import_spool(
+            connection, self.installation, self.runtime_config, now + 1
+        )
+        self.assertEqual(imported["spool_imported"], 1)
+
+        self.transcript.write_text(
+            '{"payload":{"role":"user"}}\n', encoding="utf-8"
+        )
+        saturated = replace(
+            self.event("saturated-spool"),
+            observed_at_ns=int((now + 1) * 1_000_000_000),
+        )
+        saturated_key = self.runtime.session_key(
+            self.installation, saturated.session_id
+        )
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                self.installation,
+                self.runtime_config,
+                saturated,
+                saturated_key,
+                now + 1,
+            )
+        )
+        existing = len(list(self.installation.spool.iterdir()))
+        for index in range(
+            self.runtime.MAX_SPOOL_SCAN_ENTRIES - existing
+        ):
+            entry = self.installation.spool / f"{index:03d}.tmp"
+            entry.write_bytes(b"")
+            entry.chmod(0o600)
+        saturated_result = self.runtime.import_spool(
+            connection, self.installation, self.runtime_config, now + 2
+        )
+        self.assertEqual(saturated_result["spool_scan_saturated"], 1)
+        self.assertEqual(saturated_result["spool_imported"], 1)
+        self.assertEqual(
+            len(list(self.installation.spool.glob("*.json"))), 0
+        )
+        connection.close()
+
+    def test_import_admits_full_payload_cap_with_known_sidecars(self) -> None:
+        now = 2_000_000_000.0
+        event = replace(
+            self.event("full-spool"),
+            observed_at_ns=int(now * 1_000_000_000),
+        )
+        key = self.runtime.session_key(self.installation, event.session_id)
+        payload = self.runtime.spooled_stop_payload(
+            self.installation, event, key, self.runtime_config
+        )
+        lock = self.installation.spool / ".lock"
+        lock.write_bytes(b"")
+        lock.chmod(0o600)
+        overflow = self.installation.spool / "overflow.events"
+        overflow.write_bytes(b"1\n")
+        overflow.chmod(0o600)
+        for index in range(200):
+            path = self.installation.spool / f"{index:03d}.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            path.chmod(0o600)
+
+        connection = self.runtime.open_database(self.installation)
+        result = self.runtime.import_spool(
+            connection, self.installation, self.runtime_config, now + 1
+        )
+        connection.close()
+        self.assertEqual(result["spool_imported"], 1)
+        self.assertEqual(result["spool_duplicates"], 199)
+        self.assertEqual(list(self.installation.spool.glob("*.json")), [])
+
+    def test_saturated_import_drains_near_cap_junk_and_hook_resumes(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        event = replace(
+            self.event("near-cap-session"),
+            observed_at_ns=int(now * 1_000_000_000),
+        )
+        key = self.runtime.session_key(self.installation, event.session_id)
+        payload = self.runtime.spooled_stop_payload(
+            self.installation, event, key, self.runtime_config
+        )
+        lock = self.installation.spool / ".lock"
+        lock.write_bytes(b"")
+        lock.chmod(0o600)
+        overflow = self.installation.spool / "overflow.events"
+        overflow.write_bytes(b"1\n")
+        overflow.chmod(0o600)
+        crash = self.installation.spool / ".crash-partial"
+        crash.write_bytes(b"")
+        crash.chmod(0o600)
+        for index in range(200):
+            path = self.installation.spool / f"{index:03d}.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            path.chmod(0o600)
+
+        blocked = replace(
+            self.event("blocked-at-cap"),
+            observed_at_ns=int((now + 1) * 1_000_000_000),
+        )
+        blocked_key = self.runtime.session_key(
+            self.installation, blocked.session_id
+        )
+        self.assertFalse(
+            self.runtime.spool_session_stop(
+                self.installation,
+                self.runtime_config,
+                blocked,
+                blocked_key,
+                now + 1,
+            )
+        )
+        self.assertEqual(
+            len(list(self.installation.spool.glob("*.json"))), 200
+        )
+
+        connection = self.runtime.open_database(self.installation)
+        saturation: list[int] = []
+        for _ in range(3):
+            if not list(self.installation.spool.glob("*.json")):
+                break
+            result = self.runtime.import_spool(
+                connection,
+                self.installation,
+                self.runtime_config,
+                now + 2,
+            )
+            saturation.append(result["spool_scan_saturated"])
+        connection.close()
+        self.assertIn(1, saturation)
+        self.assertEqual(list(self.installation.spool.glob("*.json")), [])
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                self.installation,
+                self.runtime_config,
+                blocked,
+                blocked_key,
+                now + 3,
+            )
+        )
+        self.assertEqual(
+            len(list(self.installation.spool.glob("*.json"))), 1
+        )
+
+    def test_spool_import_rejects_tampered_expiry_and_future_capture(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        event = replace(
+            self.event("tampered-expiry"),
+            observed_at_ns=int(now * 1_000_000_000),
+        )
+        key = self.runtime.session_key(self.installation, event.session_id)
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                self.installation, self.runtime_config, event, key, now
+            )
+        )
+        expiry_path = next(self.installation.spool.glob("*.json"))
+        expiry_payload = json.loads(expiry_path.read_text(encoding="utf-8"))
+        expiry_payload["expires_at"] = self.runtime.iso_utc(
+            now + 365 * 86_400
+        )
+        expiry_path.write_text(
+            json.dumps(expiry_payload), encoding="utf-8"
+        )
+        expiry_path.chmod(0o600)
+
+        future = replace(
+            self.event("future-capture"),
+            observed_at_ns=int(
+                (
+                    now
+                    + self.runtime.MAX_SPOOL_FUTURE_SKEW_SECONDS
+                    + 1
+                )
+                * 1_000_000_000
+            ),
+        )
+        future_key = self.runtime.session_key(
+            self.installation, future.session_id
+        )
+        future_body = self.runtime.spooled_stop_payload(
+            self.installation,
+            future,
+            future_key,
+            self.runtime_config,
+        )
+        future_path = self.installation.spool / "future.json"
+        future_path.write_text(
+            json.dumps(future_body), encoding="utf-8"
+        )
+        future_path.chmod(0o600)
+
+        connection = self.runtime.open_database(self.installation)
+        result = self.runtime.import_spool(
+            connection, self.installation, self.runtime_config, now
+        )
+        rows = connection.execute(
+            "SELECT COUNT(*) FROM review_items"
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(result["spool_invalid_deleted"], 2)
+        self.assertEqual(result["spool_imported"], 0)
+        self.assertEqual(rows, 0)
+
+    def test_signed_spool_uses_stricter_retention_after_config_change(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        shorter = self.runtime.Config(
+            **{
+                **self.runtime_config.__dict__,
+                "pending_retention_days": 7,
+            }
+        )
+        longer = self.runtime.Config(
+            **{
+                **self.runtime_config.__dict__,
+                "pending_retention_days": 30,
+            }
+        )
+
+        def write_signed(raw_session_id: str, name: str) -> None:
+            event = replace(
+                self.event(raw_session_id),
+                observed_at_ns=int(now * 1_000_000_000),
+            )
+            key = self.runtime.session_key(
+                self.installation, event.session_id
+            )
+            path = self.installation.spool / name
+            path.write_text(
+                json.dumps(
+                    self.runtime.spooled_stop_payload(
+                        self.installation,
+                        event,
+                        key,
+                        self.runtime_config,
+                    )
+                ),
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
+
+        connection = self.runtime.open_database(self.installation)
+        write_signed("config-live", "config-live.json")
+        live = self.runtime.import_spool(
+            connection, self.installation, shorter, now + 1
+        )
+        self.assertEqual(live["spool_imported"], 1)
+        self.assertEqual(live["spool_invalid_deleted"], 0)
+        self.assertEqual(live["spool_expired"], 0)
+
+        write_signed("config-shorter", "config-shorter.json")
+        shortened = self.runtime.import_spool(
+            connection,
+            self.installation,
+            shorter,
+            now + shorter.pending_retention_days * 86_400,
+        )
+        self.assertEqual(shortened["spool_imported"], 0)
+        self.assertEqual(shortened["spool_invalid_deleted"], 0)
+        self.assertEqual(shortened["spool_expired"], 1)
+
+        write_signed("config-longer", "config-longer.json")
+        not_extended = self.runtime.import_spool(
+            connection,
+            self.installation,
+            longer,
+            now + self.runtime_config.pending_retention_days * 86_400,
+        )
+        connection.close()
+        self.assertEqual(not_extended["spool_imported"], 0)
+        self.assertEqual(not_extended["spool_invalid_deleted"], 0)
+        self.assertEqual(not_extended["spool_expired"], 1)
+
+    def test_small_future_capture_cannot_extend_database_ttls(self) -> None:
+        now = 2_000_000_000.0
+        future = replace(
+            self.event("small-future-capture"),
+            observed_at_ns=int(
+                (
+                    now
+                    + self.runtime.MAX_SPOOL_FUTURE_SKEW_SECONDS
+                    - 1
+                )
+                * 1_000_000_000
+            ),
+        )
+        key = self.runtime.session_key(
+            self.installation, future.session_id
+        )
+        payload = self.runtime.spooled_stop_payload(
+            self.installation,
+            future,
+            key,
+            self.runtime_config,
+        )
+        path = self.installation.spool / "small-future.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        path.chmod(0o600)
+
+        connection = self.runtime.open_database(self.installation)
+        result = self.runtime.import_spool(
+            connection, self.installation, self.runtime_config, now
+        )
+        row = connection.execute(
+            """
+            SELECT pending_since,raw_metadata_expires_at,dedupe_expires_at
+            FROM review_items WHERE session_key=?
+            """,
+            (key,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(result["spool_imported"], 1)
+        self.assertEqual(row["pending_since"], self.runtime.iso_utc(now))
+        self.assertEqual(
+            row["raw_metadata_expires_at"],
+            self.runtime.iso_utc(
+                now
+                + self.runtime_config.raw_metadata_ttl_days * 86_400
+            ),
+        )
+        self.assertEqual(
+            row["dedupe_expires_at"],
+            self.runtime.iso_utc(
+                now + self.runtime_config.session_dedupe_days * 86_400
+            ),
+        )
+
+    def test_spool_adapter_rejects_oversize_nonstring_and_noncanonical_fields(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        event = replace(
+            self.event("bounded-adapter"),
+            observed_at_ns=int(now * 1_000_000_000),
+        )
+        key = self.runtime.session_key(self.installation, event.session_id)
+        base = self.runtime.spooled_stop_payload(
+            self.installation, event, key, self.runtime_config
+        )
+        mutations = [
+            {
+                "raw_session_id": "s" * 513,
+                "session_key": self.runtime.session_key(
+                    self.installation, "s" * 513
+                ),
+            },
+            {"diagnostic_turn_id": "t" * 513},
+            {"cwd": "/" + "c" * 4_096},
+            {"transcript_path": 7},
+            {
+                "transcript_path": str(
+                    self.sessions / ".." / "outside.jsonl"
+                )
+            },
+        ]
+        for index, mutation in enumerate(mutations):
+            payload = {**base, **mutation}
+            body = {
+                name: value
+                for name, value in payload.items()
+                if name != "payload_hmac"
+            }
+            payload["payload_hmac"] = self.runtime.spool_payload_hmac(
+                self.installation, body
+            )
+            path = self.installation.spool / f"invalid-{index}.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            path.chmod(0o600)
+
+        connection = self.runtime.open_database(self.installation)
+        result = self.runtime.import_spool(
+            connection, self.installation, self.runtime_config, now
+        )
+        count = connection.execute(
+            "SELECT COUNT(*) FROM review_items"
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(result["spool_invalid_deleted"], len(mutations))
+        self.assertEqual(count, 0)
+        self.assertEqual(list(self.installation.spool.glob("*.json")), [])
+
+    def test_spool_import_preserves_payload_on_transient_read_error(self) -> None:
+        now = 2_000_000_000.0
+        event = replace(
+            self.event("transient-read"),
+            observed_at_ns=int(now * 1_000_000_000),
+        )
+        key = self.runtime.session_key(self.installation, event.session_id)
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                self.installation, self.runtime_config, event, key, now
+            )
+        )
+        path = next(self.installation.spool.glob("*.json"))
+        real_open = os.open
+
+        def fail_target_open(
+            target: object, flags: int, *args: object, **kwargs: object
+        ) -> int:
+            if Path(target) == path:
+                raise OSError(5, "transient read failure")
+            return real_open(target, flags, *args, **kwargs)
+
+        connection = self.runtime.open_database(self.installation)
+        with mock.patch.object(
+            self.runtime.os, "open", side_effect=fail_target_open
+        ), self.assertRaises(OSError):
+            self.runtime.import_spool(
+                connection, self.installation, self.runtime_config, now
+            )
+        rows = connection.execute(
+            "SELECT COUNT(*) FROM review_items"
+        ).fetchone()[0]
+        connection.close()
+        self.assertTrue(path.exists())
+        self.assertEqual(rows, 0)
+
+    def test_spool_import_deletes_nonregular_and_pathological_json(
+        self,
+    ) -> None:
+        directory = self.installation.spool / "directory.json"
+        directory.mkdir(mode=0o700)
+        nested = self.installation.spool / "nested.json"
+        nested.write_text("[" * 2_000 + "]" * 2_000, encoding="utf-8")
+        nested.chmod(0o600)
+        overflow = self.installation.spool / "overflow-time.json"
+        event = replace(
+            self.event("overflow-time"),
+            observed_at_ns=2_000_000_000_000_000_000,
+        )
+        key = self.runtime.session_key(self.installation, event.session_id)
+        overflow_payload = self.runtime.spooled_stop_payload(
+            self.installation, event, key, self.runtime_config
+        )
+        overflow_payload["created_at_ns"] = 10**27
+        overflow_body = {
+            name: value
+            for name, value in overflow_payload.items()
+            if name != "payload_hmac"
+        }
+        overflow_payload["payload_hmac"] = (
+            self.runtime.spool_payload_hmac(
+                self.installation, overflow_body
+            )
+        )
+        overflow.write_text(
+            json.dumps(overflow_payload),
+            encoding="utf-8",
+        )
+        overflow.chmod(0o600)
+        oversized_stat = self.installation.spool / "overflow-stat.json"
+        oversized_payload = self.runtime.spooled_stop_payload(
+            self.installation, event, key, self.runtime_config
+        )
+        oversized_payload["transcript_size"] = 10**30
+        oversized_body = {
+            name: value
+            for name, value in oversized_payload.items()
+            if name != "payload_hmac"
+        }
+        oversized_payload["payload_hmac"] = (
+            self.runtime.spool_payload_hmac(
+                self.installation, oversized_body
+            )
+        )
+        oversized_stat.write_text(
+            json.dumps(oversized_payload), encoding="utf-8"
+        )
+        oversized_stat.chmod(0o600)
+
+        connection = self.runtime.open_database(self.installation)
+        result = self.runtime.import_spool(
+            connection,
+            self.installation,
+            self.runtime_config,
+            2_000_000_000.0,
+        )
+        connection.close()
+        self.assertEqual(result["spool_invalid_deleted"], 4)
+        self.assertFalse(directory.exists())
+        self.assertFalse(nested.exists())
+        self.assertFalse(overflow.exists())
+        self.assertFalse(oversized_stat.exists())
+
+    def test_spool_import_rejects_hardlinked_transcript_without_reading(
+        self,
+    ) -> None:
+        sensitive = self.sessions / "sensitive.json"
+        sensitive.write_text('{"private":"transcript"}\n', encoding="utf-8")
+        sensitive.chmod(0o600)
+        linked = self.installation.spool / "hardlink.json"
+        os.link(sensitive, linked)
+        sensitive_inode = sensitive.stat().st_ino
+        real_read = os.read
+
+        def reject_sensitive_read(descriptor: int, size: int) -> bytes:
+            if os.fstat(descriptor).st_ino == sensitive_inode:
+                raise AssertionError("transcript content read")
+            return real_read(descriptor, size)
+
+        connection = self.runtime.open_database(self.installation)
+        with mock.patch.object(
+            self.runtime.os, "read", side_effect=reject_sensitive_read
+        ):
+            result = self.runtime.import_spool(
+                connection,
+                self.installation,
+                self.runtime_config,
+                2_000_000_000.0,
+            )
+        connection.close()
+        self.assertEqual(result["spool_invalid_deleted"], 1)
+        self.assertFalse(linked.exists())
+        self.assertEqual(
+            sensitive.read_text(encoding="utf-8"),
+            '{"private":"transcript"}\n',
+        )
+
+    def test_swap_before_read_preserves_replacement_target(self) -> None:
+        now = 2_000_000_000.0
+        event = replace(
+            self.event("swap-before-read"),
+            observed_at_ns=int(now * 1_000_000_000),
+        )
+        key = self.runtime.session_key(self.installation, event.session_id)
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                self.installation, self.runtime_config, event, key, now
+            )
+        )
+        path = next(self.installation.spool.glob("*.json"))
+        outside = self.base / "outside-private.json"
+        outside.write_text('{"outside":"preserve"}\n', encoding="utf-8")
+        outside.chmod(0o600)
+        real_open = os.open
+        swapped = False
+
+        def swap_then_open(
+            target: object, flags: int, *args: object, **kwargs: object
+        ) -> int:
+            nonlocal swapped
+            if (
+                not swapped
+                and Path(target) == path
+            ):
+                swapped = True
+                path.unlink()
+                path.symlink_to(outside)
+            return real_open(target, flags, *args, **kwargs)
+
+        connection = self.runtime.open_database(self.installation)
+        with mock.patch.object(
+            self.runtime.os, "open", side_effect=swap_then_open
+        ):
+            result = self.runtime.import_spool(
+                connection, self.installation, self.runtime_config, now
+            )
+        rows = connection.execute(
+            "SELECT COUNT(*) FROM review_items"
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(result["spool_preserved"], 1)
+        self.assertEqual(rows, 0)
+        self.assertTrue(path.is_symlink())
+        self.assertEqual(
+            outside.read_text(encoding="utf-8"),
+            '{"outside":"preserve"}\n',
+        )
+
+    def test_swap_before_unlink_keeps_replacement_after_import(self) -> None:
+        now = 2_000_000_000.0
+        event = replace(
+            self.event("swap-before-unlink"),
+            observed_at_ns=int(now * 1_000_000_000),
+        )
+        key = self.runtime.session_key(self.installation, event.session_id)
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                self.installation, self.runtime_config, event, key, now
+            )
+        )
+        path = next(self.installation.spool.glob("*.json"))
+        real_upsert = self.runtime.upsert_session
+
+        def upsert_then_swap(*args: object, **kwargs: object) -> str:
+            outcome = real_upsert(*args, **kwargs)
+            path.unlink()
+            path.write_text('{"replacement":true}\n', encoding="utf-8")
+            path.chmod(0o600)
+            return outcome
+
+        connection = self.runtime.open_database(self.installation)
+        with mock.patch.object(
+            self.runtime,
+            "upsert_session",
+            side_effect=upsert_then_swap,
+        ):
+            result = self.runtime.import_spool(
+                connection, self.installation, self.runtime_config, now
+            )
+        connection.close()
+        self.assertEqual(result["spool_imported"], 1)
+        self.assertEqual(result["spool_preserved"], 1)
+        self.assertTrue(path.exists())
+        self.assertEqual(
+            path.read_text(encoding="utf-8"),
+            '{"replacement":true}\n',
+        )
+
+    def test_spool_lock_swap_never_opens_or_touches_outside_target(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        event = replace(
+            self.event("lock-swap"),
+            observed_at_ns=int(now * 1_000_000_000),
+        )
+        key = self.runtime.session_key(self.installation, event.session_id)
+        lock_path = self.installation.spool / ".lock"
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o600)
+        outside = self.base / "outside-lock"
+        outside.write_bytes(b"outside-lock-content")
+        outside.chmod(0o600)
+        before = outside.stat()
+        real_open = os.open
+        swapped = False
+
+        def swap_lock_then_open(
+            target: object, flags: int, *args: object, **kwargs: object
+        ) -> int:
+            nonlocal swapped
+            if not swapped and Path(target) == lock_path:
+                swapped = True
+                lock_path.unlink()
+                lock_path.symlink_to(outside)
+            return real_open(target, flags, *args, **kwargs)
+
+        with mock.patch.object(
+            self.runtime.os, "open", side_effect=swap_lock_then_open
+        ), self.assertRaises(OSError):
+            self.runtime.spool_session_stop(
+                self.installation,
+                self.runtime_config,
+                event,
+                key,
+                now,
+            )
+        after = outside.stat()
+        self.assertEqual(outside.read_bytes(), b"outside-lock-content")
+        self.assertEqual(after.st_mtime_ns, before.st_mtime_ns)
+        self.assertTrue(lock_path.is_symlink())
+
+    def test_import_fsync_does_not_hold_spool_lock(self) -> None:
+        now = 2_000_000_000.0
+        first = replace(
+            self.event("fsync-import"),
+            observed_at_ns=int(now * 1_000_000_000),
+        )
+        first_key = self.runtime.session_key(
+            self.installation, first.session_id
+        )
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                self.installation,
+                self.runtime_config,
+                first,
+                first_key,
+                now,
+            )
+        )
+        second = replace(
+            self.event("fsync-enqueue"),
+            observed_at_ns=int((now + 1) * 1_000_000_000),
+        )
+        second_key = self.runtime.session_key(
+            self.installation, second.session_id
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        real_fsync = self.runtime.fsync_directory
+        errors: list[BaseException] = []
+        import_results: list[dict[str, int]] = []
+        hook_results: list[bool] = []
+
+        def blocking_fsync(path: Path) -> None:
+            if (
+                threading.current_thread().name == "spool-importer"
+                and path == self.installation.spool
+                and not entered.is_set()
+            ):
+                entered.set()
+                self.assertTrue(release.wait(1))
+            real_fsync(path)
+
+        def importing() -> None:
+            connection = self.runtime.open_database(self.installation)
+            try:
+                import_results.append(
+                    self.runtime.import_spool(
+                        connection,
+                        self.installation,
+                        self.runtime_config,
+                        now + 1,
+                    )
+                )
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                connection.close()
+
+        def enqueueing() -> None:
+            try:
+                hook_results.append(
+                    self.runtime.spool_session_stop(
+                        self.installation,
+                        self.runtime_config,
+                        second,
+                        second_key,
+                        now + 1,
+                    )
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        with mock.patch.object(
+            self.runtime,
+            "fsync_directory",
+            side_effect=blocking_fsync,
+        ):
+            importer = threading.Thread(
+                target=importing, name="spool-importer"
+            )
+            importer.start()
+            self.assertTrue(entered.wait(1))
+            enqueuer = threading.Thread(
+                target=enqueueing, name="spool-enqueuer"
+            )
+            enqueuer.start()
+            enqueuer.join(timeout=0.25)
+            self.assertFalse(enqueuer.is_alive())
+            self.assertEqual(hook_results, [True])
+            release.set()
+            importer.join(timeout=2)
+
+        self.assertFalse(importer.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(import_results[0]["spool_imported"], 1)
+
+    def test_enqueue_and_import_coordinate_through_spool_lock(self) -> None:
+        now = 2_000_000_000.0
+        first = replace(
+            self.event("importing-session"),
+            observed_at_ns=int(now * 1_000_000_000),
+        )
+        first_key = self.runtime.session_key(
+            self.installation, first.session_id
+        )
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                self.installation,
+                self.runtime_config,
+                first,
+                first_key,
+                now,
+            )
+        )
+        first_path = next(self.installation.spool.glob("*.json"))
+        first_inode = first_path.stat().st_ino
+        second = replace(
+            self.event("concurrent-session"),
+            observed_at_ns=int((now + 1) * 1_000_000_000),
+        )
+        second_key = self.runtime.session_key(
+            self.installation, second.session_id
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        real_read = os.read
+
+        def blocking_read(descriptor: int, size: int) -> bytes:
+            if os.fstat(descriptor).st_ino == first_inode:
+                entered.set()
+                self.assertTrue(release.wait(1))
+            return real_read(descriptor, size)
+
+        import_results: list[dict[str, int]] = []
+        hook_results: list[bool] = []
+        errors: list[BaseException] = []
+
+        def importing() -> None:
+            connection = self.runtime.open_database(self.installation)
+            try:
+                import_results.append(
+                    self.runtime.import_spool(
+                        connection,
+                        self.installation,
+                        self.runtime_config,
+                        now + 1,
+                    )
+                )
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                connection.close()
+
+        def enqueueing() -> None:
+            try:
+                hook_results.append(
+                    self.runtime.spool_session_stop(
+                        self.installation,
+                        self.runtime_config,
+                        second,
+                        second_key,
+                        now + 1,
+                    )
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        with mock.patch.object(
+            self.runtime.os, "read", side_effect=blocking_read
+        ):
+            importer = threading.Thread(target=importing)
+            importer.start()
+            self.assertTrue(entered.wait(1))
+            enqueuer = threading.Thread(target=enqueueing)
+            enqueuer.start()
+            time.sleep(0.01)
+            self.assertTrue(enqueuer.is_alive())
+            release.set()
+            importer.join(timeout=2)
+            enqueuer.join(timeout=2)
+
+        self.assertFalse(importer.is_alive())
+        self.assertFalse(enqueuer.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(import_results[0]["spool_imported"], 1)
+        self.assertEqual(hook_results, [True])
+        self.assertEqual(
+            len(list(self.installation.spool.glob("*.json"))), 1
+        )
+
+    def test_reverse_filename_order_preserves_oldest_ttls_and_newest_locator(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        old = replace(
+            self.event("ordered-session"),
+            observed_at_ns=int(now * 1_000_000_000),
+        )
+        replacement = self.sessions / "ordered-new.jsonl"
+        replacement.write_text(
+            '{"payload":{"role":"assistant"}}\n', encoding="utf-8"
+        )
+        new_payload = {
+            "hook_event_name": "Stop",
+            "session_id": old.session_id,
+            "cwd": str(self.workspace),
+            "transcript_path": str(replacement),
+        }
+        new = self.runtime.parse_session_stop(
+            json.dumps(new_payload).encode(),
+            self.installation,
+            self.runtime_config,
+        )
+        assert new is not None
+        new = replace(
+            new, observed_at_ns=int((now + 1) * 1_000_000_000)
+        )
+        key = self.runtime.session_key(self.installation, old.session_id)
+        for name, event in (("a-new.json", new), ("z-old.json", old)):
+            payload = self.runtime.spooled_stop_payload(
+                self.installation, event, key, self.runtime_config
+            )
+            path = self.installation.spool / name
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            path.chmod(0o600)
+
+        connection = self.runtime.open_database(self.installation)
+        result = self.runtime.import_spool(
+            connection, self.installation, self.runtime_config, now + 2
+        )
+        row = connection.execute(
+            """
+            SELECT transcript_path,last_stop_ns,first_stop_at,pending_since,
+              raw_metadata_expires_at,dedupe_expires_at
+            FROM review_items WHERE session_key=?
+            """,
+            (key,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(result["spool_imported"], 1)
+        self.assertEqual(result["spool_duplicates"], 1)
+        self.assertEqual(row["transcript_path"], str(new.transcript_path))
+        self.assertEqual(row["last_stop_ns"], new.observed_at_ns)
+        self.assertEqual(row["first_stop_at"], self.runtime.iso_utc(now))
+        self.assertEqual(row["pending_since"], self.runtime.iso_utc(now))
+        self.assertEqual(
+            row["raw_metadata_expires_at"],
+            self.runtime.iso_utc(
+                now
+                + self.runtime_config.raw_metadata_ttl_days * 86_400
+            ),
+        )
+        self.assertEqual(
+            row["dedupe_expires_at"],
+            self.runtime.iso_utc(
+                now + self.runtime_config.session_dedupe_days * 86_400
+            ),
+        )
+
+    def test_later_older_replay_tightens_ttls_without_regressing_locator(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        old = replace(
+            self.event("later-old-session"),
+            observed_at_ns=int(now * 1_000_000_000),
+        )
+        replacement = self.sessions / "later-new.jsonl"
+        replacement.write_text(
+            '{"payload":{"role":"assistant"}}\n', encoding="utf-8"
+        )
+        new_payload = {
+            "hook_event_name": "Stop",
+            "session_id": old.session_id,
+            "cwd": str(self.workspace),
+            "transcript_path": str(replacement),
+        }
+        new = self.runtime.parse_session_stop(
+            json.dumps(new_payload).encode(),
+            self.installation,
+            self.runtime_config,
+        )
+        assert new is not None
+        new = replace(
+            new, observed_at_ns=int((now + 100) * 1_000_000_000)
+        )
+        key = self.runtime.session_key(self.installation, old.session_id)
+
+        newer_path = self.installation.spool / "newer.json"
+        newer_path.write_text(
+            json.dumps(
+                self.runtime.spooled_stop_payload(
+                    self.installation, new, key, self.runtime_config
+                )
+            ),
+            encoding="utf-8",
+        )
+        newer_path.chmod(0o600)
+        connection = self.runtime.open_database(self.installation)
+        self.runtime.import_spool(
+            connection, self.installation, self.runtime_config, now + 101
+        )
+
+        older_path = self.installation.spool / "older.json"
+        older_path.write_text(
+            json.dumps(
+                self.runtime.spooled_stop_payload(
+                    self.installation, old, key, self.runtime_config
+                )
+            ),
+            encoding="utf-8",
+        )
+        older_path.chmod(0o600)
+        self.runtime.import_spool(
+            connection, self.installation, self.runtime_config, now + 102
+        )
+        row = connection.execute(
+            """
+            SELECT transcript_path,last_stop_ns,first_stop_at,pending_since,
+              raw_metadata_expires_at,dedupe_expires_at
+            FROM review_items WHERE session_key=?
+            """,
+            (key,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(row["transcript_path"], str(new.transcript_path))
+        self.assertEqual(row["last_stop_ns"], new.observed_at_ns)
+        self.assertEqual(row["first_stop_at"], self.runtime.iso_utc(now))
+        self.assertEqual(row["pending_since"], self.runtime.iso_utc(now))
+        self.assertEqual(
+            row["raw_metadata_expires_at"],
+            self.runtime.iso_utc(
+                now
+                + self.runtime_config.raw_metadata_ttl_days * 86_400
+            ),
+        )
+        self.assertEqual(
+            row["dedupe_expires_at"],
+            self.runtime.iso_utc(
+                now + self.runtime_config.session_dedupe_days * 86_400
+            ),
+        )
+
+    def test_older_replay_tightens_expired_tombstone_without_resurrection(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        limited = self.runtime.Config(
+            **{
+                **self.runtime_config.__dict__,
+                "pending_limit_sessions": 1,
+            }
+        )
+        newer = replace(
+            self.event("expired-replay"),
+            observed_at_ns=int((now + 100) * 1_000_000_000),
+        )
+        key = self.runtime.session_key(
+            self.installation, newer.session_id
+        )
+        connection = self.runtime.open_database(self.installation)
+        self.runtime.upsert_session(
+            connection, newer, key, limited, now + 100
+        )
+        blocker = replace(
+            self.event("capacity-blocker"),
+            observed_at_ns=int((now + 101) * 1_000_000_000),
+        )
+        self.runtime.upsert_session(
+            connection,
+            blocker,
+            self.runtime.session_key(
+                self.installation, blocker.session_id
+            ),
+            limited,
+            now + 101,
+        )
+
+        older = replace(
+            newer, observed_at_ns=int(now * 1_000_000_000)
+        )
+        path = self.installation.spool / "older-expired.json"
+        path.write_text(
+            json.dumps(
+                self.runtime.spooled_stop_payload(
+                    self.installation, older, key, limited
+                )
+            ),
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+        result = self.runtime.import_spool(
+            connection, self.installation, limited, now + 102
+        )
+        row = connection.execute(
+            """
+            SELECT status,raw_session_id,diagnostic_turn_id,cwd,
+              transcript_path,transcript_size,transcript_mtime_ns,
+              transcript_device,transcript_inode,last_stop_ns,first_stop_at,
+              raw_metadata_expires_at,dedupe_expires_at,raw_redacted_at
+            FROM review_items WHERE session_key=?
+            """,
+            (key,),
+        ).fetchone()
+        connection.close()
+
+        self.assertEqual(result["spool_duplicates"], 1)
+        self.assertEqual(row["status"], "expired")
+        for name in (
+            "raw_session_id",
+            "diagnostic_turn_id",
+            "cwd",
+            "transcript_path",
+            "transcript_size",
+            "transcript_mtime_ns",
+            "transcript_device",
+            "transcript_inode",
+        ):
+            self.assertIsNone(row[name])
+        self.assertEqual(row["last_stop_ns"], newer.observed_at_ns)
+        self.assertEqual(row["first_stop_at"], self.runtime.iso_utc(now))
+        self.assertEqual(
+            row["raw_metadata_expires_at"],
+            self.runtime.iso_utc(
+                now + 100 + limited.raw_metadata_ttl_days * 86_400
+            ),
+        )
+        self.assertEqual(
+            row["dedupe_expires_at"],
+            self.runtime.iso_utc(
+                now + limited.session_dedupe_days * 86_400
+            ),
+        )
+        self.assertIsNotNone(row["raw_redacted_at"])
+
+    def test_old_replay_does_not_lower_later_generation_pending_since(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        original = replace(
+            self.event("later-generation"),
+            observed_at_ns=int(now * 1_000_000_000),
+        )
+        key = self.runtime.session_key(
+            self.installation, original.session_id
+        )
+        connection = self.runtime.open_database(self.installation)
+        self.runtime.upsert_session(
+            connection, original, key, self.runtime_config, now
+        )
+        self.runtime.claim_review_generation(
+            connection, key, "generation-one", now + 1, self.runtime_config
+        )
+        connection.execute("BEGIN IMMEDIATE")
+        self.runtime.complete_review_generation(
+            connection,
+            key,
+            "generation-one",
+            "reviewed",
+            None,
+            now + 2,
+        )
+        connection.commit()
+        with self.transcript.open("ab") as stream:
+            stream.write(b'{"payload":{"role":"assistant"}}\n')
+        newer = self.runtime.parse_session_stop(
+            json.dumps(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": original.session_id,
+                    "cwd": str(self.workspace),
+                    "transcript_path": str(self.transcript),
+                }
+            ).encode(),
+            self.installation,
+            self.runtime_config,
+        )
+        assert newer is not None
+        newer = replace(
+            newer, observed_at_ns=int((now + 100) * 1_000_000_000)
+        )
+        self.runtime.upsert_session(
+            connection, newer, key, self.runtime_config, now + 100
+        )
+
+        replay = replace(
+            original, observed_at_ns=int((now - 10) * 1_000_000_000)
+        )
+        replay_path = self.installation.spool / "old-generation.json"
+        replay_path.write_text(
+            json.dumps(
+                self.runtime.spooled_stop_payload(
+                    self.installation,
+                    replay,
+                    key,
+                    self.runtime_config,
+                )
+            ),
+            encoding="utf-8",
+        )
+        replay_path.chmod(0o600)
+        self.runtime.import_spool(
+            connection, self.installation, self.runtime_config, now + 101
+        )
+        row = connection.execute(
+            """
+            SELECT generation,pending_since,last_stop_ns,first_stop_at
+            FROM review_items WHERE session_key=?
+            """,
+            (key,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(row["generation"], 2)
+        self.assertEqual(
+            row["pending_since"], self.runtime.iso_utc(now + 100)
+        )
+        self.assertEqual(row["last_stop_ns"], newer.observed_at_ns)
+        self.assertEqual(
+            row["first_stop_at"], self.runtime.iso_utc(now - 10)
+        )
+
+    def test_same_second_spool_replay_keeps_newest_different_inode(self) -> None:
+        now = 2_000_000_000.25
+        first = self.event("same-second-session")
+        replacement = self.sessions / "replacement.jsonl"
+        replacement.write_text(
+            '{"payload":{"role":"assistant"}}\n', encoding="utf-8"
+        )
+        payload = {
+            "hook_event_name": "Stop",
+            "session_id": first.session_id,
+            "cwd": str(self.workspace),
+            "transcript_path": str(replacement),
+        }
+        second = self.runtime.parse_session_stop(
+            json.dumps(payload).encode(),
+            self.installation,
+            self.runtime_config,
+        )
+        assert second is not None
+        first = replace(
+            first, observed_at_ns=2_000_000_000_250_000_001
+        )
+        second = replace(
+            second, observed_at_ns=2_000_000_000_250_000_002
+        )
+        key = self.runtime.session_key(self.installation, first.session_id)
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                self.installation,
+                self.runtime_config,
+                first,
+                key,
+                now,
+            )
+        )
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                self.installation,
+                self.runtime_config,
+                second,
+                key,
+                now,
+            )
+        )
+        connection = self.runtime.open_database(self.installation)
+        result = self.runtime.import_spool(
+            connection,
+            self.installation,
+            self.runtime_config,
+            now + 1,
+        )
+        row = connection.execute(
+            """
+            SELECT transcript_path,transcript_inode,observed_boundary,
+              last_stop_ns,binding_status
+            FROM review_items WHERE session_key=?
+            """,
+            (key,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(result["spool_imported"], 1)
+        self.assertEqual(result["spool_duplicates"], 1)
+        self.assertEqual(
+            row["transcript_path"], str(second.transcript_path)
+        )
+        self.assertEqual(row["transcript_inode"], second.transcript_inode)
+        self.assertEqual(row["observed_boundary"], second.transcript_size)
+        self.assertEqual(
+            row["last_stop_ns"], 2_000_000_000_250_000_002
+        )
+        self.assertEqual(row["binding_status"], "pending_epoch")
+
+    def test_maintenance_expires_pending_and_spool_raw_data_then_dedupe_row(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        event = self.event()
+        key = self.runtime.session_key(self.installation, event.session_id)
+        connection = self.runtime.open_database(self.installation)
+        self.runtime.upsert_session(
+            connection, event, key, self.runtime_config, now
+        )
+        spooled = replace(
+            self.event("spooled-session"),
+            observed_at_ns=int(now * 1_000_000_000),
+        )
+        spooled_key = self.runtime.session_key(
+            self.installation, spooled.session_id
+        )
+        self.runtime.spool_session_stop(
+            self.installation,
+            self.runtime_config,
+            spooled,
+            spooled_key,
+            now,
+        )
+
+        expired = self.runtime.run_maintenance(
+            connection,
+            self.installation,
+            self.runtime_config,
+            now + 14 * 86_400,
+        )
+        row = connection.execute(
+            """
+            SELECT status,raw_session_id,diagnostic_turn_id,cwd,transcript_path,
+              transcript_size,transcript_mtime_ns,transcript_device,
+              transcript_inode,raw_redacted_at
+            FROM review_items WHERE session_key=?
+            """,
+            (key,),
+        ).fetchone()
+        self.assertEqual(expired["pending_expired"], 1)
+        self.assertEqual(expired["spool_expired"], 1)
+        self.assertEqual(row["status"], "expired")
+        self.assertTrue(
+            all(row[name] is None for name in row.keys()[1:-1])
+        )
+        self.assertIsNotNone(row["raw_redacted_at"])
+        self.assertEqual(list(self.installation.spool.glob("*.json")), [])
+
+        deleted = self.runtime.run_maintenance(
+            connection,
+            self.installation,
+            self.runtime_config,
+            now + 180 * 86_400,
+        )
+        remaining = connection.execute(
+            "SELECT COUNT(*) FROM review_items WHERE session_key=?",
+            (key,),
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(deleted["dedupe_deleted"], 1)
+        self.assertEqual(remaining, 0)
+
+    def test_dedupe_expiry_removes_session_evidence_but_keeps_aggregate(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        event = self.event("evidence-retention")
+        key = self.runtime.session_key(self.installation, event.session_id)
+        connection = self.runtime.open_database(self.installation)
+        self.runtime.upsert_session(
+            connection, event, key, self.runtime_config, now
+        )
+        review_item_id = int(
+            connection.execute(
+                "SELECT id FROM review_items WHERE session_key=?",
+                (key,),
+            ).fetchone()["id"]
+        )
+        candidate = connection.execute(
+            """
+            INSERT INTO candidates(
+              fingerprint,target_identity,target_skill,target_path,
+              problem_category,target_locator,proposal_intent,conflict_group,
+              problem_summary,proposal_summary,validation_plan,risk_level,
+              status,occurrence_count,first_seen_at,last_seen_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "f" * 64,
+                "skill:test",
+                "test",
+                None,
+                "verification",
+                "completion claim",
+                "require verification",
+                None,
+                "summary",
+                "proposal",
+                "run test",
+                "low",
+                "proposed",
+                4,
+                self.runtime.iso_utc(now),
+                self.runtime.iso_utc(now),
+                self.runtime.iso_utc(now),
+            ),
+        )
+        candidate_id = int(candidate.lastrowid)
+        connection.execute(
+            """
+            INSERT INTO candidate_evidence(
+              candidate_id,review_item_id,session_key,generation,signal_type,
+              source_kind,summary,created_at
+            ) VALUES(?,?,?,?,?,?,?,?)
+            """,
+            (
+                candidate_id,
+                review_item_id,
+                key,
+                1,
+                "verification_failure",
+                "user_direct",
+                "summary",
+                self.runtime.iso_utc(now),
+            ),
+        )
+
+        result = self.runtime.run_maintenance(
+            connection,
+            self.installation,
+            self.runtime_config,
+            now + self.runtime_config.session_dedupe_days * 86_400,
+        )
+        remaining_keys = int(
+            connection.execute(
+                """
+                SELECT
+                  (SELECT COUNT(*) FROM review_items WHERE session_key=?)
+                  + (SELECT COUNT(*) FROM candidate_evidence
+                     WHERE session_key=?)
+                """,
+                (key, key),
+            ).fetchone()[0]
+        )
+        evidence_rows = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM candidate_evidence"
+            ).fetchone()[0]
+        )
+        aggregate = connection.execute(
+            "SELECT occurrence_count FROM candidates WHERE id=?",
+            (candidate_id,),
+        ).fetchone()
+        connection.close()
+
+        self.assertEqual(result["dedupe_deleted"], 1)
+        self.assertEqual(remaining_keys, 0)
+        self.assertEqual(evidence_rows, 0)
+        self.assertEqual(aggregate["occurrence_count"], 4)
+
+    def test_maintenance_recovers_lease_and_redacts_reviewed_raw_metadata(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        event = self.event("reviewed-session")
+        reviewed_key = self.runtime.session_key(
+            self.installation, event.session_id
+        )
+        connection = self.runtime.open_database(self.installation)
+        self.runtime.upsert_session(
+            connection, event, reviewed_key, self.runtime_config, now
+        )
+        connection.execute(
+            """
+            UPDATE review_items
+            SET status='reviewed',pending_since=NULL,reviewed_at=?
+            WHERE session_key=?
+            """,
+            (self.runtime.iso_utc(now + 1), reviewed_key),
+        )
+        leased = self.event("leased-session")
+        leased_key = self.runtime.session_key(
+            self.installation, leased.session_id
+        )
+        self.runtime.upsert_session(
+            connection, leased, leased_key, self.runtime_config, now
+        )
+        self.runtime.claim_review_generation(
+            connection, leased_key, "maintenance-owner", now, self.runtime_config
+        )
+
+        status_connection = self.runtime.open_database(
+            self.installation, read_only=True
+        )
+        before = self.runtime.queue_status(
+            status_connection,
+            self.installation,
+            now + self.runtime_config.raw_metadata_ttl_days * 86_400,
+        )
+        status_connection.close()
+        self.assertEqual(
+            before["raw_metadata_cleanup"]["overdue_sessions"], 2
+        )
+        result = self.runtime.run_maintenance(
+            connection,
+            self.installation,
+            self.runtime_config,
+            now + self.runtime_config.raw_metadata_ttl_days * 86_400,
+        )
+        reviewed = connection.execute(
+            """
+            SELECT status,raw_session_id,transcript_path,raw_redacted_at
+            FROM review_items WHERE session_key=?
+            """,
+            (reviewed_key,),
+        ).fetchone()
+        leased_row = connection.execute(
+            """
+            SELECT status,lease_owner,frozen_to
+            FROM review_items WHERE session_key=?
+            """,
+            (leased_key,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(result["leases_recovered"], 1)
+        self.assertEqual(result["raw_redacted"], 1)
+        self.assertEqual(reviewed["status"], "reviewed")
+        self.assertIsNone(reviewed["raw_session_id"])
+        self.assertIsNone(reviewed["transcript_path"])
+        self.assertIsNotNone(reviewed["raw_redacted_at"])
+        self.assertEqual(tuple(leased_row), ("expired", None, None))
+
+    def test_raw_cleanup_is_set_based_above_sqlite_parameter_limits(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        connection.executemany(
+            """
+            INSERT INTO review_items(
+              session_key,raw_session_id,status,last_stop_ns,first_stop_at,
+              last_stop_at,reviewed_at,raw_metadata_expires_at,
+              dedupe_expires_at
+            ) VALUES(?,?,'reviewed',0,?,?,?,?,?)
+            """,
+            [
+                (
+                    f"bulk-{index}",
+                    f"private-{index}",
+                    self.runtime.iso_utc(now - 1),
+                    self.runtime.iso_utc(now - 1),
+                    self.runtime.iso_utc(now - 1),
+                    self.runtime.iso_utc(now),
+                    self.runtime.iso_utc(now + 180 * 86_400),
+                )
+                for index in range(1_100)
+            ],
+        )
+        result = self.runtime.run_maintenance(
+            connection,
+            self.installation,
+            self.runtime_config,
+            now,
+        )
+        remaining_raw = connection.execute(
+            """
+            SELECT COUNT(*) FROM review_items
+            WHERE raw_session_id IS NOT NULL OR raw_redacted_at IS NULL
+            """
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(result["raw_redacted"], 1_100)
+        self.assertEqual(remaining_raw, 0)
+
+    def test_maintenance_rejects_caller_owned_review_transaction(self) -> None:
+        now = 2_000_000_000.0
+        event = replace(
+            self.event("caller-owned-spool"),
+            observed_at_ns=int(now * 1_000_000_000),
+        )
+        key = self.runtime.session_key(self.installation, event.session_id)
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                self.installation, self.runtime_config, event, key, now
+            )
+        )
+        spooled = next(self.installation.spool.glob("*.json"))
+        connection = self.runtime.open_database(self.installation)
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "INSERT INTO metadata(key,value) VALUES('caller-owned','1')"
+        )
+
+        with self.assertRaisesRegex(ValueError, "active_transaction"):
+            self.runtime.run_maintenance(
+                connection,
+                self.installation,
+                self.runtime_config,
+                now,
+            )
+
+        self.assertTrue(connection.in_transaction)
+        self.assertTrue(spooled.exists())
+        connection.rollback()
+        marker = connection.execute(
+            "SELECT value FROM metadata WHERE key='caller-owned'"
+        ).fetchone()
+        connection.close()
+        self.assertIsNone(marker)
+
+    def test_status_reports_sessions_generations_leases_spool_and_cleanup_read_only(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        event = self.event()
+        key = self.runtime.session_key(self.installation, event.session_id)
+        connection = self.runtime.open_database(self.installation)
+        self.runtime.upsert_session(
+            connection, event, key, self.runtime_config, now
+        )
+        connection.execute(
+            "UPDATE review_items SET generation=3 WHERE session_key=?",
+            (key,),
+        )
+        connection.close()
+        waiting = self.installation.spool / "waiting.json"
+        waiting.write_text("{}\n", encoding="utf-8")
+        waiting.chmod(0o600)
+        overflow = self.installation.spool / "overflow.events"
+        overflow.write_bytes(
+            b"1\n" * (self.runtime.MAX_OVERFLOW_EVENT_BYTES // 2 - 1)
+            + b"1"
+        )
+        overflow.chmod(0o600)
+        self.transcript.unlink()
+
+        read_only = self.runtime.open_database(
+            self.installation, read_only=True
+        )
+        status = self.runtime.queue_status(
+            read_only, self.installation, now + 10
+        )
+        read_only.close()
+        self.assertEqual(status["pending_sessions"], 1)
+        self.assertEqual(status["pending_generations"], 1)
+        self.assertEqual(status["generation_count_total"], 3)
+        self.assertEqual(status["leases"], {"active": 0, "expired": 0})
+        self.assertEqual(status["spool"]["files"], 1)
+        self.assertEqual(status["spool"]["bytes"], waiting.stat().st_size)
+        self.assertEqual(status["spool"]["overflow_total"], 32_767)
+        self.assertTrue(status["spool"]["overflow_counter_saturated"])
+        self.assertTrue(waiting.exists())
+
+        captured: list[dict[str, object]] = []
+        with mock.patch.object(
+            self.runtime,
+            "run_maintenance",
+            side_effect=AssertionError("status mutation"),
+        ), mock.patch.object(
+            self.runtime,
+            "import_spool",
+            side_effect=AssertionError("status import"),
+        ), mock.patch.object(
+            self.runtime,
+            "write_json_stdout",
+            side_effect=captured.append,
+        ):
+            result = self.runtime.cmd_status(
+                Namespace(installation=str(self.installation_path))
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(captured[0]["pending_sessions"], 1)
+        self.assertTrue(waiting.exists())
+
+    def test_status_reports_bounded_partial_inventory_when_saturated(
+        self,
+    ) -> None:
+        for index in range(self.runtime.MAX_SPOOL_SCAN_ENTRIES):
+            path = self.installation.spool / f"{index:03d}.json"
+            path.write_text("{}\n", encoding="utf-8")
+            path.chmod(0o600)
+        before = sorted(
+            path.name for path in self.installation.spool.iterdir()
+        )
+        connection = self.runtime.open_database(
+            self.installation, read_only=True
+        )
+        status = self.runtime.queue_status(
+            connection, self.installation, 2_000_000_000.0
+        )
+        connection.close()
+        self.assertEqual(status["spool"]["files"], 200)
+        self.assertTrue(status["spool"]["scan_saturated"])
+        self.assertEqual(
+            sorted(path.name for path in self.installation.spool.iterdir()),
+            before,
+        )
+
+    def test_status_admits_full_payload_cap_with_known_sidecars(self) -> None:
+        lock = self.installation.spool / ".lock"
+        lock.write_bytes(b"")
+        lock.chmod(0o600)
+        overflow = self.installation.spool / "overflow.events"
+        overflow.write_bytes(b"1\n")
+        overflow.chmod(0o600)
+        for index in range(200):
+            path = self.installation.spool / f"{index:03d}.json"
+            path.write_text("{}\n", encoding="utf-8")
+            path.chmod(0o600)
+        connection = self.runtime.open_database(
+            self.installation, read_only=True
+        )
+        status = self.runtime.queue_status(
+            connection, self.installation, 2_000_000_000.0
+        )
+        connection.close()
+        self.assertEqual(status["spool"]["files"], 200)
+        self.assertFalse(status["spool"]["scan_saturated"])
+
+    def test_parser_exposes_exact_status_and_maintain_commands(self) -> None:
+        status = self.runtime.build_parser().parse_args(
+            ["status", "--installation", str(self.installation_path)]
+        )
+        maintain = self.runtime.build_parser().parse_args(
+            ["maintain", "--installation", str(self.installation_path)]
+        )
+        self.assertIs(status.handler, self.runtime.cmd_status)
+        self.assertIs(maintain.handler, self.runtime.cmd_maintain)
 
 
 if __name__ == "__main__":
