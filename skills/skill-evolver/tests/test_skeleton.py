@@ -64,6 +64,24 @@ class SkeletonTests(unittest.TestCase):
         self.assertIn("must not write the v2 root by default", skill)
         self.assertNotIn("After every task", skill)
 
+    def test_readme_stages_exact_private_v2_gate_inventory(self) -> None:
+        readme = (PLUGIN_ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn('GATE_FIXTURE_ROOT="$(mktemp -d)"', readme)
+        self.assertIn('--fixture-root "$GATE_FIXTURE_ROOT"', readme)
+        self.assertIn('chmod 0600 "$GATE_FIXTURE_ROOT"/*.v2.structure.json', readme)
+        for name in (
+            "session-stop-cli.v2.structure.json",
+            "session-stop-desktop.v2.structure.json",
+            "session-transcript-cli.v2.structure.json",
+            "session-transcript-desktop.v2.structure.json",
+            "access-cli.v2.structure.json",
+            "access-desktop.v2.structure.json",
+        ):
+            self.assertIn(
+                f'cp "$FIXTURE_ROOT/{name}" "$GATE_FIXTURE_ROOT/{name}"', readme
+            )
+
     def test_runtime_works_under_isolated_python(self) -> None:
         result = run_isolated("--version")
         self.assertEqual(result.returncode, 0, result.stderr.decode())

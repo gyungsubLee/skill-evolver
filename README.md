@@ -187,12 +187,31 @@ The v2 gate reads the immutable canonical v1 predecessor exactly at
 `docs/feasibility-report.json`; do not copy, rename, or regenerate it. It writes
 only the two v2 output names below.
 
+The exact fixture inventory is security-sensitive. The shared fixture directory
+intentionally also contains v1 and synthetic fixtures, so stage only the six v2
+structure files into a fresh private directory before running the gate:
+
 ```bash
+GATE_FIXTURE_ROOT="$(mktemp -d)"
+cp "$FIXTURE_ROOT/session-stop-cli.v2.structure.json" "$GATE_FIXTURE_ROOT/session-stop-cli.v2.structure.json"
+cp "$FIXTURE_ROOT/session-stop-desktop.v2.structure.json" "$GATE_FIXTURE_ROOT/session-stop-desktop.v2.structure.json"
+cp "$FIXTURE_ROOT/session-transcript-cli.v2.structure.json" "$GATE_FIXTURE_ROOT/session-transcript-cli.v2.structure.json"
+cp "$FIXTURE_ROOT/session-transcript-desktop.v2.structure.json" "$GATE_FIXTURE_ROOT/session-transcript-desktop.v2.structure.json"
+cp "$FIXTURE_ROOT/access-cli.v2.structure.json" "$GATE_FIXTURE_ROOT/access-cli.v2.structure.json"
+cp "$FIXTURE_ROOT/access-desktop.v2.structure.json" "$GATE_FIXTURE_ROOT/access-desktop.v2.structure.json"
+chmod 0600 "$GATE_FIXTURE_ROOT"/*.v2.structure.json
 /usr/bin/python3 -I "$EVOLVER" probe-v2-gate \
-  --fixture-root "$FIXTURE_ROOT" \
+  --fixture-root "$GATE_FIXTURE_ROOT" \
   --predecessor-json "$PLUGIN_ROOT/docs/feasibility-report.json" \
   --output-json "$PLUGIN_ROOT/docs/feasibility-report-v2.json" \
   --output-markdown "$PLUGIN_ROOT/docs/feasibility-report-v2.md"
+rm "$GATE_FIXTURE_ROOT/session-stop-cli.v2.structure.json"
+rm "$GATE_FIXTURE_ROOT/session-stop-desktop.v2.structure.json"
+rm "$GATE_FIXTURE_ROOT/session-transcript-cli.v2.structure.json"
+rm "$GATE_FIXTURE_ROOT/session-transcript-desktop.v2.structure.json"
+rm "$GATE_FIXTURE_ROOT/access-cli.v2.structure.json"
+rm "$GATE_FIXTURE_ROOT/access-desktop.v2.structure.json"
+rmdir "$GATE_FIXTURE_ROOT"
 ```
 
 Before raw cleanup, remove the plugin and marketplace entry. Finally run scrub
