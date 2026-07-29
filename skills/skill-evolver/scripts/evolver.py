@@ -363,6 +363,9 @@ def improvement_policy_digest(policy: bytes) -> str:
 
 FRONTMATTER_KEY = re.compile(r"[A-Za-z][A-Za-z0-9_-]*\Z")
 FRONTMATTER_FORBIDDEN_PREFIXES = ("!", "&", "*", "{", "[", "`")
+FRONTMATTER_IMPLICIT_NON_STRINGS = frozenset(
+    {"null", "true", "false", "yes", "no", "on", "off", "y", "n"}
+)
 
 
 def _frontmatter_scalar(
@@ -395,9 +398,16 @@ def _frontmatter_scalar(
             raise ValueError("invalid_skill_frontmatter")
         return decoded, index + 1
     if value.startswith("'"):
-        if len(value) < 2 or not value.endswith("'"):
+        if not re.fullmatch(r"'(?:[^']|'')*'", value):
             raise ValueError("invalid_skill_frontmatter")
         return value[1:-1].replace("''", "'"), index + 1
+    if (
+        not (value[0].isalpha() or value[0] == "_")
+        or value.casefold() in FRONTMATTER_IMPLICIT_NON_STRINGS
+        or re.search(r"\s#", value)
+        or re.search(r":(?:\s|$)", value)
+    ):
+        raise ValueError("invalid_skill_frontmatter")
     return value, index + 1
 
 
