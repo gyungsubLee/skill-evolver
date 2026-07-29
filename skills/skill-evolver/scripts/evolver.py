@@ -586,13 +586,13 @@ def parse_session_stop(
     transcript = transcript_value.resolve(strict=True)
     if not within(transcript, installation.transcript_roots):
         raise ValueError("transcript_outside_roots")
+    observed_at_ns = time.time_ns()
     descriptor = os.open(
         str(transcript),
         os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
     )
     try:
         info = os.fstat(descriptor)
-        observed_at_ns = time.time_ns()
     finally:
         os.close(descriptor)
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
@@ -759,15 +759,25 @@ def upsert_session(
                 and int(row["transcript_inode"]) == event.transcript_inode
             )
             observed_boundary = int(row["observed_boundary"])
+            same_boundary = event.transcript_size == observed_boundary
+            same_path = str(row["transcript_path"]) == str(
+                event.transcript_path
+            )
+            same_mtime = (
+                int(row["transcript_mtime_ns"])
+                == event.transcript_mtime_ns
+            )
             prior_time_ns = int(row["last_stop_ns"])
             # ponytail: an equal clock tick keeps the current locator unless
-            # the same inode grew; add a per-process sequence only if future
-            # platforms cannot provide sufficient timestamp precision.
+            # the same inode grew or its same-size locator changed; add a
+            # per-process sequence only if future platforms cannot provide
+            # sufficient timestamp precision.
             stale_observation = event_time_ns < prior_time_ns or (
                 event_time_ns == prior_time_ns
                 and (
                     not same_identity
-                    or event.transcript_size <= observed_boundary
+                    or event.transcript_size < observed_boundary
+                    or (same_boundary and same_path and same_mtime)
                 )
             )
             if stale_observation:
@@ -777,7 +787,17 @@ def upsert_session(
                     event.transcript_size < observed_boundary
                 )
                 pending_binding = row["binding_status"] == "pending_epoch"
-                needs_rebind = pending_binding or not same_identity or shrank
+                same_size_locator_change = (
+                    same_identity
+                    and same_boundary
+                    and (not same_path or not same_mtime)
+                )
+                needs_rebind = (
+                    pending_binding
+                    or not same_identity
+                    or shrank
+                    or same_size_locator_change
+                )
                 new_work = needs_rebind or (
                     same_identity
                     and event.transcript_size > int(row["reviewed_boundary"])
@@ -855,6 +875,8 @@ def adopt_transcript_epoch(
     connection: sqlite3.Connection,
     session_key_value: str,
     embedded_session_key: str,
+    path: Path,
+    mtime_ns: int,
     device: int,
     inode: int,
     boundary: int,
@@ -865,6 +887,16 @@ def adopt_transcript_epoch(
         raise ValueError("invalid_epoch_binding_mode")
     if not hmac.compare_digest(session_key_value, embedded_session_key):
         raise ValueError("embedded_session_mismatch")
+    if (
+        not isinstance(path, Path)
+        or not path.is_absolute()
+        or any(
+            type(value) is not int or value < 0
+            for value in (mtime_ns, device, inode, boundary)
+        )
+    ):
+        raise ValueError("invalid_epoch_locator")
+    descriptor = -1
     connection.execute("BEGIN IMMEDIATE")
     try:
         row = connection.execute(
@@ -876,9 +908,37 @@ def adopt_transcript_epoch(
         if row["binding_status"] != "pending_epoch":
             raise ValueError("epoch_adoption_not_required")
         if (
-            int(row["transcript_device"]) != device
+            str(row["transcript_path"]) != str(path)
+            or int(row["transcript_mtime_ns"]) != mtime_ns
+            or int(row["transcript_device"]) != device
             or int(row["transcript_inode"]) != inode
+            or int(row["transcript_size"]) != boundary
             or int(row["observed_boundary"]) != boundary
+        ):
+            raise ValueError("epoch_locator_changed")
+        try:
+            if path.is_symlink() or path.resolve(strict=True) != path:
+                raise ValueError("epoch_locator_changed")
+            descriptor = os.open(
+                str(path),
+                os.O_RDONLY
+                | os.O_NONBLOCK
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            info = os.fstat(descriptor)
+        except OSError:
+            raise ValueError("epoch_locator_changed") from None
+        expected_stat = (boundary, mtime_ns, device, inode)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or (
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_dev,
+                info.st_ino,
+            )
+            != expected_stat
         ):
             raise ValueError("epoch_locator_changed")
         epoch = int(row["transcript_epoch"]) + 1
@@ -891,11 +951,27 @@ def adopt_transcript_epoch(
             """,
             (epoch, iso_utc(now), session_key_value),
         )
+        final_info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(final_info.st_mode)
+            or final_info.st_uid != os.getuid()
+            or (
+                final_info.st_size,
+                final_info.st_mtime_ns,
+                final_info.st_dev,
+                final_info.st_ino,
+            )
+            != expected_stat
+        ):
+            raise ValueError("epoch_locator_changed")
         connection.commit()
         return epoch
     except BaseException:
         connection.rollback()
         raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _recover_expired_review_leases(
@@ -1007,7 +1083,7 @@ def heartbeat_review_generation(
     changed = connection.execute(
         """
         UPDATE review_items
-        SET lease_expires_at=?
+        SET lease_expires_at=MAX(lease_expires_at,?)
         WHERE session_key=? AND status='reviewing' AND lease_owner=?
           AND lease_expires_at>=?
         """,
@@ -1033,74 +1109,96 @@ def complete_review_generation(
         raise ValueError("invalid_review_outcome")
     if outcome == "excluded" and not reason:
         raise ValueError("missing_exclusion_reason")
-    connection.execute("BEGIN IMMEDIATE")
-    try:
-        row = connection.execute(
-            """
-            SELECT * FROM review_items
-            WHERE session_key=? AND status='reviewing' AND lease_owner=?
-              AND lease_expires_at>=?
-            """,
-            (session_key_value, owner, iso_utc(now)),
-        ).fetchone()
-        if row is None:
-            raise ValueError("review_lease_unavailable")
-        frozen_to = int(row["frozen_to"])
-        new_work = (
-            row["binding_status"] != "accepted"
-            or int(row["transcript_epoch"]) != int(row["frozen_epoch"])
-            or int(row["observed_boundary"]) > frozen_to
-        )
-        status = "pending" if new_work else outcome
-        generation = int(row["generation"]) + int(new_work)
-        pending_since = iso_utc(now) if new_work else None
-        connection.execute(
-            """
-            UPDATE review_items
-            SET status=?,generation=?,reviewed_boundary=?,reviewed_at=?,
-                pending_since=?,excluded_reason=?,batch_id=NULL,
-                review_started_at=NULL,frozen_epoch=NULL,frozen_from=NULL,
-                frozen_to=NULL,frozen_locator_json=NULL,lease_owner=NULL,
-                lease_expires_at=NULL
-            WHERE session_key=?
-            """,
-            (
-                status,
-                generation,
-                frozen_to,
-                iso_utc(now),
-                pending_since,
-                reason if outcome == "excluded" else None,
-                session_key_value,
-            ),
-        )
-        connection.commit()
-        return {
-            "session_key": session_key_value,
-            "status": status,
-            "generation": generation,
-            "reviewed_boundary": frozen_to,
+    if not connection.in_transaction:
+        raise ValueError("active_review_transaction_required")
+    row = connection.execute(
+        """
+        SELECT * FROM review_items
+        WHERE session_key=? AND status='reviewing' AND lease_owner=?
+          AND lease_expires_at>=?
+        """,
+        (session_key_value, owner, iso_utc(now)),
+    ).fetchone()
+    if row is None:
+        raise ValueError("review_lease_unavailable")
+    frozen_to = int(row["frozen_to"])
+    current_locator_json = canonical_json_bytes(
+        {
+            "path": str(row["transcript_path"]),
+            "size": int(row["transcript_size"]),
+            "mtime_ns": int(row["transcript_mtime_ns"]),
+            "device": int(row["transcript_device"]),
+            "inode": int(row["transcript_inode"]),
         }
-    except BaseException:
-        connection.rollback()
-        raise
+    ).decode("utf-8")
+    new_work = (
+        row["binding_status"] != "accepted"
+        or int(row["transcript_epoch"]) != int(row["frozen_epoch"])
+        or int(row["observed_boundary"]) > frozen_to
+        or row["frozen_locator_json"] != current_locator_json
+    )
+    status = "pending" if new_work else outcome
+    generation = int(row["generation"]) + int(new_work)
+    pending_since = iso_utc(now) if new_work else None
+    connection.execute(
+        """
+        UPDATE review_items
+        SET status=?,generation=?,reviewed_boundary=?,reviewed_at=?,
+            pending_since=?,excluded_reason=?,batch_id=NULL,
+            review_started_at=NULL,frozen_epoch=NULL,frozen_from=NULL,
+            frozen_to=NULL,frozen_locator_json=NULL,lease_owner=NULL,
+            lease_expires_at=NULL
+        WHERE session_key=?
+        """,
+        (
+            status,
+            generation,
+            frozen_to,
+            iso_utc(now),
+            pending_since,
+            reason if outcome == "excluded" and not new_work else None,
+            session_key_value,
+        ),
+    )
+    return {
+        "session_key": session_key_value,
+        "status": status,
+        "generation": generation,
+        "reviewed_boundary": frozen_to,
+    }
 
 
 def record_candidate_evidence(
     connection: sqlite3.Connection,
     candidate_id: int,
     review_item_id: int,
+    owner: str,
+    expected_generation: int,
     signal_type: str,
     source_kind: str,
     summary: str,
     now: float,
 ) -> bool:
+    if not connection.in_transaction:
+        raise ValueError("active_review_transaction_required")
+    if (
+        not isinstance(owner, str)
+        or not owner
+        or len(owner.encode("utf-8")) > 128
+        or type(expected_generation) is not int
+        or expected_generation < 1
+    ):
+        raise ValueError("review_evidence_lease_unavailable")
     row = connection.execute(
-        "SELECT session_key,generation FROM review_items WHERE id=?",
-        (review_item_id,),
+        """
+        SELECT session_key,generation FROM review_items
+        WHERE id=? AND status='reviewing' AND lease_owner=?
+          AND generation=? AND lease_expires_at>=?
+        """,
+        (review_item_id, owner, expected_generation, iso_utc(now)),
     ).fetchone()
     if row is None:
-        raise ValueError("review_item_missing")
+        raise ValueError("review_evidence_lease_unavailable")
     changed = connection.execute(
         """
         INSERT OR IGNORE INTO candidate_evidence(
