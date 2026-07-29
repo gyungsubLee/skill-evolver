@@ -2772,16 +2772,26 @@ the checked-in `./skill-evolver` plugin.
 - Consumes: one session row, accepted transcript identity, and explicit review
   ownership.
 - Produces:
-  `adopt_transcript_epoch(connection, session_key_value, embedded_session_key, device, inode, boundary, binding_mode, now) -> int`,
+  `adopt_transcript_epoch(connection, session_key_value, embedded_session_key, path, mtime_ns, device, inode, boundary, binding_mode, now) -> int`,
   `claim_review_generation(connection, session_key_value, owner, now, config) -> dict[str, object]`,
   `heartbeat_review_generation(connection, session_key_value, owner, now, config) -> bool`,
   `complete_review_generation(connection, session_key_value, owner, outcome, reason, now) -> dict[str, object]`,
   `recover_expired_review_leases(connection, now) -> int`, and
-  `record_candidate_evidence(...) -> bool`.
+  `record_candidate_evidence(connection, candidate_id, review_item_id, owner, expected_generation, signal_type, source_kind, summary, now) -> bool`.
 - `adopt_transcript_epoch` receives the HMAC of the embedded transcript session
   ID from the later explicit Review adapter. It never parses a transcript and
-  rejects a nonmatching key or any binding mode other than
-  `embedded_session_id`.
+  rejects a nonmatching key, any binding mode other than
+  `embedded_session_id`, or any stored/live mismatch across canonical path,
+  mtime, device, inode, and size.
+- Capture timestamps the Stop before opening and `fstat`-ing its transcript.
+  Same-inode, same-size path or mtime changes are not duplicates: they require
+  `pending_epoch`.
+- Candidate insertion, evidence insertion, and review completion share one
+  caller-owned `BEGIN IMMEDIATE` transaction. Evidence is accepted only for
+  the active lease owner, exact generation, and an unexpired lease.
+- Completion compares the full frozen/current locator. Reopening clears
+  `excluded_reason`, whether work arrives during review or after a terminal
+  exclusion; duplicate and stale Stops preserve a terminal exclusion.
 
 - [ ] **Step 1: Add failing frozen-boundary, epoch, lease, and evidence tests**
 
@@ -2810,7 +2820,9 @@ class GenerationStateTests(unittest.TestCase):
         self.installation = self.runtime.load_installation(self.installation_path)
         self.runtime_config = self.runtime.load_config(self.installation)
         self.transcript = self.sessions / "session.jsonl"
-        self.transcript.write_text('{"payload":{"role":"user"}}\n', encoding="utf-8")
+        self.transcript.write_text(
+            '{"payload":{"role":"user"}}\n', encoding="utf-8"
+        )
         self.payload = {
             "hook_event_name": "Stop",
             "session_id": "generation-session",
@@ -2825,7 +2837,45 @@ class GenerationStateTests(unittest.TestCase):
             self.installation, self.payload["session_id"]
         )
 
-    def test_stop_during_review_preserves_frozen_locator_and_reopens_generation(self) -> None:
+    def insert_candidate(
+        self,
+        connection: sqlite3.Connection,
+        fingerprint: str,
+        now: float,
+    ) -> int:
+        cursor = connection.execute(
+            """
+            INSERT INTO candidates(
+              fingerprint,target_identity,target_skill,target_path,
+              problem_category,target_locator,proposal_intent,conflict_group,
+              problem_summary,proposal_summary,validation_plan,risk_level,
+              status,first_seen_at,last_seen_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                fingerprint,
+                "skill:test",
+                "test",
+                None,
+                "verification",
+                "completion claim",
+                "require verification",
+                None,
+                "summary",
+                "proposal",
+                "run test",
+                "low",
+                "proposed",
+                self.runtime.iso_utc(now),
+                self.runtime.iso_utc(now),
+                self.runtime.iso_utc(now),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    def test_stop_during_review_preserves_frozen_locator_and_reopens_generation(
+        self,
+    ) -> None:
         now = 2_000_000_000.0
         connection = self.runtime.open_database(self.installation)
         claim = self.runtime.claim_review_generation(
@@ -2857,8 +2907,11 @@ class GenerationStateTests(unittest.TestCase):
         self.assertEqual(during["status"], "reviewing")
         self.assertGreater(during["observed_boundary"], frozen_to)
         self.assertEqual(during["frozen_to"], frozen_to)
-        self.assertEqual(json.loads(during["frozen_locator_json"]), frozen_locator)
+        self.assertEqual(
+            json.loads(during["frozen_locator_json"]), frozen_locator
+        )
 
+        connection.execute("BEGIN IMMEDIATE")
         completed = self.runtime.complete_review_generation(
             connection,
             self.key,
@@ -2867,6 +2920,7 @@ class GenerationStateTests(unittest.TestCase):
             None,
             now + 20,
         )
+        connection.commit()
         self.assertEqual(completed["status"], "pending")
         self.assertEqual(completed["generation"], 2)
         self.assertEqual(completed["reviewed_boundary"], frozen_to)
@@ -2906,15 +2960,170 @@ class GenerationStateTests(unittest.TestCase):
         self.assertIsNone(row["frozen_locator_json"])
         self.assertIsNone(row["lease_owner"])
 
-    def test_different_inode_needs_explicit_embedded_binding_before_epoch_reset(self) -> None:
+    def test_heartbeat_is_persistent_owned_live_and_monotonic(self) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        observer = self.runtime.open_database(self.installation)
+        self.runtime.claim_review_generation(
+            connection, self.key, "owner-a", now, self.runtime_config
+        )
+        expected_expiry = self.runtime.iso_utc(
+            now + 10 + self.runtime_config.lease_seconds
+        )
+        self.assertTrue(
+            self.runtime.heartbeat_review_generation(
+                connection,
+                self.key,
+                "owner-a",
+                now + 10,
+                self.runtime_config,
+            )
+        )
+        persisted = observer.execute(
+            "SELECT lease_expires_at FROM review_items WHERE session_key=?",
+            (self.key,),
+        ).fetchone()
+        self.assertEqual(persisted["lease_expires_at"], expected_expiry)
+
+        self.assertTrue(
+            self.runtime.heartbeat_review_generation(
+                connection,
+                self.key,
+                "owner-a",
+                now + 5,
+                self.runtime_config,
+            )
+        )
+        self.assertFalse(
+            self.runtime.heartbeat_review_generation(
+                connection,
+                self.key,
+                "owner-b",
+                now + 11,
+                self.runtime_config,
+            )
+        )
+        self.assertFalse(
+            self.runtime.heartbeat_review_generation(
+                connection,
+                self.key,
+                "owner-a",
+                now + self.runtime_config.lease_seconds + 11,
+                self.runtime_config,
+            )
+        )
+        persisted = observer.execute(
+            "SELECT lease_expires_at FROM review_items WHERE session_key=?",
+            (self.key,),
+        ).fetchone()
+        observer.close()
+        connection.close()
+        self.assertEqual(persisted["lease_expires_at"], expected_expiry)
+
+    def test_stop_timestamp_precedes_transcript_snapshot(self) -> None:
+        order: list[str] = []
+        real_open = self.runtime.os.open
+
+        def tracked_open(*args: object, **kwargs: object) -> int:
+            order.append("open")
+            return real_open(*args, **kwargs)
+
+        def tracked_time_ns() -> int:
+            order.append("time")
+            return 123_456_789
+
+        with mock.patch.object(
+            self.runtime.os, "open", side_effect=tracked_open
+        ), mock.patch.object(
+            self.runtime.time, "time_ns", side_effect=tracked_time_ns
+        ):
+            event = self.runtime.parse_session_stop(
+                self.raw, self.installation, self.runtime_config
+            )
+
+        assert event is not None
+        self.assertEqual(event.observed_at_ns, 123_456_789)
+        self.assertEqual(order, ["time", "open"])
+
+    def test_same_size_mtime_change_requires_epoch_binding(self) -> None:
+        connection = self.runtime.open_database(self.installation)
+        before = self.transcript.stat()
+        os.utime(
+            self.transcript,
+            ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000),
+        )
+        event = self.runtime.parse_session_stop(
+            self.raw, self.installation, self.runtime_config
+        )
+        assert event is not None
+        self.assertEqual(event.transcript_inode, before.st_ino)
+        self.assertEqual(event.transcript_size, before.st_size)
+        self.runtime.upsert_session(
+            connection,
+            event,
+            self.key,
+            self.runtime_config,
+            2_000_000_001.0,
+        )
+        row = connection.execute(
+            """
+            SELECT binding_status,error_code
+            FROM review_items WHERE session_key=?
+            """,
+            (self.key,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(
+            tuple(row),
+            ("pending_epoch", "transcript_rebind_required"),
+        )
+
+    def test_same_size_path_change_requires_epoch_binding(self) -> None:
+        moved = self.sessions / "moved.jsonl"
+        before = self.transcript.stat()
+        self.transcript.rename(moved)
+        event = self.runtime.parse_session_stop(
+            json.dumps({**self.payload, "transcript_path": str(moved)}).encode(),
+            self.installation,
+            self.runtime_config,
+        )
+        assert event is not None
+        self.assertEqual(event.transcript_inode, before.st_ino)
+        self.assertEqual(event.transcript_size, before.st_size)
+        connection = self.runtime.open_database(self.installation)
+        self.runtime.upsert_session(
+            connection,
+            event,
+            self.key,
+            self.runtime_config,
+            2_000_000_001.0,
+        )
+        row = connection.execute(
+            """
+            SELECT binding_status,error_code
+            FROM review_items WHERE session_key=?
+            """,
+            (self.key,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(
+            tuple(row),
+            ("pending_epoch", "transcript_rebind_required"),
+        )
+
+    def test_different_inode_needs_explicit_embedded_binding_before_epoch_reset(
+        self,
+    ) -> None:
         now = 2_000_000_000.0
         connection = self.runtime.open_database(self.installation)
         self.runtime.claim_review_generation(
             connection, self.key, "owner-a", now, self.runtime_config
         )
+        connection.execute("BEGIN IMMEDIATE")
         self.runtime.complete_review_generation(
             connection, self.key, "owner-a", "reviewed", None, now + 1
         )
+        connection.commit()
         replacement = self.sessions / "replacement.jsonl"
         replacement.write_text(
             '{"payload":{"session_id":"generation-session","role":"user"}}\n',
@@ -2942,99 +3151,492 @@ class GenerationStateTests(unittest.TestCase):
             """,
             (self.key,),
         ).fetchone()
-        self.assertEqual(tuple(before), (0, self.transcript.stat().st_size, "pending_epoch", 2))
-        with self.assertRaisesRegex(ValueError, "transcript_binding_required"):
+        self.assertEqual(
+            tuple(before),
+            (
+                0,
+                self.transcript.stat().st_size,
+                "pending_epoch",
+                2,
+            ),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "transcript_binding_required"
+        ):
             self.runtime.claim_review_generation(
                 connection, self.key, "owner-b", now + 3, self.runtime_config
             )
-        with self.assertRaisesRegex(ValueError, "embedded_session_mismatch"):
+        with self.assertRaisesRegex(
+            ValueError, "embedded_session_mismatch"
+        ):
             self.runtime.adopt_transcript_epoch(
                 connection,
                 self.key,
                 "0" * 64,
+                event.transcript_path,
+                event.transcript_mtime_ns,
                 event.transcript_device,
                 event.transcript_inode,
                 event.transcript_size,
                 "embedded_session_id",
                 now + 4,
             )
+        replacement_info = replacement.stat()
+        os.utime(
+            replacement,
+            ns=(
+                replacement_info.st_atime_ns,
+                event.transcript_mtime_ns + 1_000_000_000,
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "epoch_locator_changed"):
+            self.runtime.adopt_transcript_epoch(
+                connection,
+                self.key,
+                self.key,
+                event.transcript_path,
+                event.transcript_mtime_ns,
+                event.transcript_device,
+                event.transcript_inode,
+                event.transcript_size,
+                "embedded_session_id",
+                now + 5,
+            )
+        refreshed = self.runtime.parse_session_stop(
+            json.dumps(
+                {**self.payload, "transcript_path": str(replacement)}
+            ).encode(),
+            self.installation,
+            self.runtime_config,
+        )
+        assert refreshed is not None
+        self.runtime.upsert_session(
+            connection,
+            refreshed,
+            self.key,
+            self.runtime_config,
+            now + 5,
+        )
         epoch = self.runtime.adopt_transcript_epoch(
             connection,
             self.key,
             self.key,
-            event.transcript_device,
-            event.transcript_inode,
-            event.transcript_size,
+            refreshed.transcript_path,
+            refreshed.transcript_mtime_ns,
+            refreshed.transcript_device,
+            refreshed.transcript_inode,
+            refreshed.transcript_size,
             "embedded_session_id",
-            now + 5,
+            now + 6,
         )
         claim = self.runtime.claim_review_generation(
-            connection, self.key, "owner-b", now + 6, self.runtime_config
+            connection, self.key, "owner-b", now + 7, self.runtime_config
         )
         connection.close()
         self.assertEqual(epoch, 1)
         self.assertEqual(claim["transcript_epoch"], 1)
         self.assertEqual(claim["review_from"], 0)
-        self.assertEqual(claim["review_to"], event.transcript_size)
+        self.assertEqual(claim["review_to"], refreshed.transcript_size)
 
-    def test_candidate_evidence_is_unique_across_session_generations(self) -> None:
+    def test_evidence_requires_owned_live_generation_transaction(self) -> None:
         now = 2_000_000_000.0
         connection = self.runtime.open_database(self.installation)
         row = connection.execute(
             "SELECT id FROM review_items WHERE session_key=?",
             (self.key,),
         ).fetchone()
-        cursor = connection.execute(
-            """
-            INSERT INTO candidates(
-              fingerprint,target_identity,target_skill,target_path,
-              problem_category,target_locator,proposal_intent,conflict_group,
-              problem_summary,proposal_summary,validation_plan,risk_level,
-              status,first_seen_at,last_seen_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
+        review_item_id = int(row["id"])
+        candidate_id = self.insert_candidate(connection, "a" * 64, now)
+
+        with self.assertRaisesRegex(
+            ValueError, "active_review_transaction_required"
+        ):
+            self.runtime.record_candidate_evidence(
+                connection,
+                candidate_id,
+                review_item_id,
+                "owner-a",
+                1,
+                "verification_failure",
+                "user_direct",
+                "no transaction",
+                now,
+            )
+
+        connection.execute("BEGIN IMMEDIATE")
+        with self.assertRaisesRegex(
+            ValueError, "review_evidence_lease_unavailable"
+        ):
+            self.runtime.record_candidate_evidence(
+                connection,
+                candidate_id,
+                review_item_id,
+                "owner-a",
+                1,
+                "verification_failure",
+                "user_direct",
+                "pending row",
+                now,
+            )
+        connection.rollback()
+
+        claim = self.runtime.claim_review_generation(
+            connection, self.key, "owner-a", now, self.runtime_config
+        )
+        connection.execute("BEGIN IMMEDIATE")
+        invalid_claims = (
+            ("owner-a", True, now + 1),
+            ("owner-b", int(claim["generation"]), now + 1),
+            ("owner-a", int(claim["generation"]) + 1, now + 1),
             (
-                "f" * 64,
-                "skill:test",
-                "test",
-                None,
-                "verification",
-                "completion claim",
-                "require verification",
-                None,
-                "summary",
-                "proposal",
-                "run test",
-                "low",
-                "proposed",
-                self.runtime.iso_utc(now),
-                self.runtime.iso_utc(now),
-                self.runtime.iso_utc(now),
+                "owner-a",
+                int(claim["generation"]),
+                now + self.runtime_config.lease_seconds + 1,
             ),
         )
-        candidate_id = int(cursor.lastrowid)
+        for owner, generation, observed_at in invalid_claims:
+            with self.subTest(
+                owner=owner,
+                generation=generation,
+                observed_at=observed_at,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "review_evidence_lease_unavailable"
+                ):
+                    self.runtime.record_candidate_evidence(
+                        connection,
+                        candidate_id,
+                        review_item_id,
+                        owner,
+                        generation,
+                        "verification_failure",
+                        "user_direct",
+                        "invalid lease",
+                        observed_at,
+                    )
+        connection.rollback()
+        connection.close()
+
+    def test_evidence_and_completion_commit_or_rollback_together(self) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        claim = self.runtime.claim_review_generation(
+            connection, self.key, "owner-a", now, self.runtime_config
+        )
+        row = connection.execute(
+            "SELECT id FROM review_items WHERE session_key=?",
+            (self.key,),
+        ).fetchone()
+        review_item_id = int(row["id"])
+
+        connection.execute("BEGIN IMMEDIATE")
+        candidate_id = self.insert_candidate(connection, "b" * 64, now)
+        self.assertTrue(
+            self.runtime.record_candidate_evidence(
+                connection,
+                candidate_id,
+                review_item_id,
+                "owner-a",
+                int(claim["generation"]),
+                "verification_failure",
+                "user_direct",
+                "rollback evidence",
+                now + 1,
+            )
+        )
+        self.runtime.complete_review_generation(
+            connection, self.key, "owner-a", "reviewed", None, now + 2
+        )
+        connection.rollback()
+        rolled_back = connection.execute(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM candidates) AS candidates,
+              (SELECT COUNT(*) FROM candidate_evidence) AS evidence,
+              status
+            FROM review_items WHERE session_key=?
+            """,
+            (self.key,),
+        ).fetchone()
+        self.assertEqual(tuple(rolled_back), (0, 0, "reviewing"))
+
+        connection.execute("BEGIN IMMEDIATE")
+        candidate_id = self.insert_candidate(connection, "b" * 64, now)
+        self.assertTrue(
+            self.runtime.record_candidate_evidence(
+                connection,
+                candidate_id,
+                review_item_id,
+                "owner-a",
+                int(claim["generation"]),
+                "verification_failure",
+                "user_direct",
+                "committed evidence",
+                now + 3,
+            )
+        )
+        completed = self.runtime.complete_review_generation(
+            connection, self.key, "owner-a", "reviewed", None, now + 4
+        )
+        connection.commit()
+        committed = connection.execute(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM candidates) AS candidates,
+              (SELECT COUNT(*) FROM candidate_evidence) AS evidence,
+              status
+            FROM review_items WHERE session_key=?
+            """,
+            (self.key,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(completed["status"], "reviewed")
+        self.assertEqual(tuple(committed), (1, 1, "reviewed"))
+
+    def test_completion_reopens_when_current_locator_differs(self) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        claim = self.runtime.claim_review_generation(
+            connection, self.key, "owner-a", now, self.runtime_config
+        )
+        connection.execute(
+            """
+            UPDATE review_items
+            SET transcript_mtime_ns=transcript_mtime_ns+1
+            WHERE session_key=?
+            """,
+            (self.key,),
+        )
+        connection.execute("BEGIN IMMEDIATE")
+        completed = self.runtime.complete_review_generation(
+            connection,
+            self.key,
+            "owner-a",
+            "reviewed",
+            None,
+            now + 1,
+        )
+        connection.commit()
+        row = connection.execute(
+            "SELECT status,generation FROM review_items WHERE session_key=?",
+            (self.key,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(completed["status"], "pending")
+        self.assertEqual(completed["reviewed_boundary"], claim["review_to"])
+        self.assertEqual(tuple(row), ("pending", 2))
+
+    def test_concurrent_stop_clears_exclusion_when_reopened(self) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        self.runtime.claim_review_generation(
+            connection, self.key, "owner-a", now, self.runtime_config
+        )
+        connection.execute(
+            """
+            UPDATE review_items SET excluded_reason='prior exclusion'
+            WHERE session_key=?
+            """,
+            (self.key,),
+        )
+        with self.transcript.open("ab") as stream:
+            stream.write(b'{"payload":{"role":"assistant"}}\n')
+        event = self.runtime.parse_session_stop(
+            self.raw, self.installation, self.runtime_config
+        )
+        assert event is not None
+        self.runtime.upsert_session(
+            connection, event, self.key, self.runtime_config, now + 1
+        )
+        during = connection.execute(
+            """
+            SELECT status,excluded_reason
+            FROM review_items WHERE session_key=?
+            """,
+            (self.key,),
+        ).fetchone()
+        self.assertEqual(tuple(during), ("reviewing", "prior exclusion"))
+        connection.execute("BEGIN IMMEDIATE")
+        completed = self.runtime.complete_review_generation(
+            connection,
+            self.key,
+            "owner-a",
+            "excluded",
+            "current generation excluded",
+            now + 2,
+        )
+        connection.commit()
+        row = connection.execute(
+            """
+            SELECT status,excluded_reason
+            FROM review_items WHERE session_key=?
+            """,
+            (self.key,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(completed["status"], "pending")
+        self.assertEqual(tuple(row), ("pending", None))
+
+    def test_later_stop_clears_completed_exclusion_when_reopened(self) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        self.runtime.claim_review_generation(
+            connection, self.key, "owner-a", now, self.runtime_config
+        )
+        connection.execute("BEGIN IMMEDIATE")
+        completed = self.runtime.complete_review_generation(
+            connection,
+            self.key,
+            "owner-a",
+            "excluded",
+            "not a reusable skill issue",
+            now + 1,
+        )
+        connection.commit()
+        excluded = connection.execute(
+            """
+            SELECT status,generation,excluded_reason
+            FROM review_items WHERE session_key=?
+            """,
+            (self.key,),
+        ).fetchone()
+        self.assertEqual(completed["status"], "excluded")
+        self.assertEqual(
+            tuple(excluded),
+            ("excluded", 1, "not a reusable skill issue"),
+        )
+
+        with self.transcript.open("ab") as stream:
+            stream.write(b'{"payload":{"role":"assistant"}}\n')
+        event = self.runtime.parse_session_stop(
+            self.raw, self.installation, self.runtime_config
+        )
+        assert event is not None
+        self.runtime.upsert_session(
+            connection, event, self.key, self.runtime_config, now + 2
+        )
+        reopened = connection.execute(
+            """
+            SELECT status,generation,excluded_reason
+            FROM review_items WHERE session_key=?
+            """,
+            (self.key,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(tuple(reopened), ("pending", 2, None))
+
+    def test_duplicate_and_stale_stop_preserve_terminal_exclusion(self) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        self.runtime.claim_review_generation(
+            connection, self.key, "owner-a", now, self.runtime_config
+        )
+        connection.execute("BEGIN IMMEDIATE")
+        self.runtime.complete_review_generation(
+            connection,
+            self.key,
+            "owner-a",
+            "excluded",
+            "terminal exclusion",
+            now + 1,
+        )
+        connection.commit()
+
+        duplicate = self.runtime.parse_session_stop(
+            self.raw, self.installation, self.runtime_config
+        )
+        assert duplicate is not None
+        self.assertEqual(
+            self.runtime.upsert_session(
+                connection,
+                duplicate,
+                self.key,
+                self.runtime_config,
+                now + 2,
+            ),
+            "duplicate",
+        )
+        self.assertEqual(
+            self.runtime.upsert_session(
+                connection,
+                replace(duplicate, observed_at_ns=0),
+                self.key,
+                self.runtime_config,
+                now + 3,
+            ),
+            "stale",
+        )
+        row = connection.execute(
+            """
+            SELECT status,generation,excluded_reason
+            FROM review_items WHERE session_key=?
+            """,
+            (self.key,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(
+            tuple(row),
+            ("excluded", 1, "terminal exclusion"),
+        )
+
+    def test_candidate_evidence_is_unique_across_session_generations(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        first_claim = self.runtime.claim_review_generation(
+            connection, self.key, "owner-a", now, self.runtime_config
+        )
+        row = connection.execute(
+            "SELECT id FROM review_items WHERE session_key=?",
+            (self.key,),
+        ).fetchone()
+        candidate_id = self.insert_candidate(connection, "f" * 64, now)
+        connection.execute("BEGIN IMMEDIATE")
         first = self.runtime.record_candidate_evidence(
             connection,
             candidate_id,
             int(row["id"]),
+            "owner-a",
+            int(first_claim["generation"]),
             "verification_failure",
             "user_direct",
             "sanitized evidence",
             now,
         )
-        connection.execute(
-            "UPDATE review_items SET generation=2 WHERE id=?",
-            (int(row["id"]),),
+        self.runtime.complete_review_generation(
+            connection, self.key, "owner-a", "reviewed", None, now + 1
         )
+        connection.commit()
+
+        with self.transcript.open("ab") as stream:
+            stream.write(b'{"payload":{"role":"assistant"}}\n')
+        event = self.runtime.parse_session_stop(
+            self.raw, self.installation, self.runtime_config
+        )
+        assert event is not None
+        self.runtime.upsert_session(
+            connection, event, self.key, self.runtime_config, now + 2
+        )
+        second_claim = self.runtime.claim_review_generation(
+            connection, self.key, "owner-b", now + 3, self.runtime_config
+        )
+        connection.execute("BEGIN IMMEDIATE")
         second = self.runtime.record_candidate_evidence(
             connection,
             candidate_id,
             int(row["id"]),
+            "owner-b",
+            int(second_claim["generation"]),
             "verification_failure",
             "user_direct",
             "same session later generation",
-            now + 1,
+            now + 4,
         )
+        self.runtime.complete_review_generation(
+            connection, self.key, "owner-b", "reviewed", None, now + 5
+        )
+        connection.commit()
         count = connection.execute(
             "SELECT COUNT(*) FROM candidate_evidence"
         ).fetchone()[0]
@@ -3055,10 +3657,140 @@ Run:
   -v
 ```
 
-Expected: FAIL because the epoch adoption, review lease, completion, recovery,
-and evidence functions do not exist.
+Expected: FAIL before the Task 5 implementation. Besides the missing generation
+APIs, the hardening tests expose timestamp-after-snapshot ordering,
+same-size locator changes being treated as duplicates, partial locator
+adoption, shortening heartbeats, helper-owned completion transactions,
+unauthorized evidence, incomplete completion locator checks, and stale
+exclusion reasons after a reopen.
 
-- [ ] **Step 3: Implement explicit epoch adoption and immutable review claims**
+- [ ] **Step 3: Harden capture ordering and same-size locator transitions**
+
+In `parse_session_stop()`, take the observation timestamp before the
+descriptor snapshot:
+
+```python
+    observed_at_ns = time.time_ns()
+    descriptor = os.open(
+        str(transcript),
+        os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        info = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+```
+
+Keep `observed_at_ns=observed_at_ns` in the returned
+`CapturedSessionStop`.
+
+In the existing-row branch of `upsert_session()`, classify a same-inode,
+same-size path or mtime change as rebind work. Clear a terminal exclusion only
+when real new work reopens it:
+
+```python
+            same_identity = (
+                int(row["transcript_device"]) == event.transcript_device
+                and int(row["transcript_inode"]) == event.transcript_inode
+            )
+            observed_boundary = int(row["observed_boundary"])
+            same_boundary = event.transcript_size == observed_boundary
+            same_path = str(row["transcript_path"]) == str(
+                event.transcript_path
+            )
+            same_mtime = (
+                int(row["transcript_mtime_ns"])
+                == event.transcript_mtime_ns
+            )
+            prior_time_ns = int(row["last_stop_ns"])
+            # ponytail: an equal clock tick keeps the current locator unless
+            # the same inode grew or its same-size locator changed; add a
+            # per-process sequence only if future platforms cannot provide
+            # sufficient timestamp precision.
+            stale_observation = event_time_ns < prior_time_ns or (
+                event_time_ns == prior_time_ns
+                and (
+                    not same_identity
+                    or event.transcript_size < observed_boundary
+                    or (same_boundary and same_path and same_mtime)
+                )
+            )
+            if stale_observation:
+                outcome = "stale"
+            else:
+                shrank = same_identity and (
+                    event.transcript_size < observed_boundary
+                )
+                pending_binding = row["binding_status"] == "pending_epoch"
+                same_size_locator_change = (
+                    same_identity
+                    and same_boundary
+                    and (not same_path or not same_mtime)
+                )
+                needs_rebind = (
+                    pending_binding
+                    or not same_identity
+                    or shrank
+                    or same_size_locator_change
+                )
+                new_work = needs_rebind or (
+                    same_identity
+                    and event.transcript_size > int(row["reviewed_boundary"])
+                )
+                status = str(row["status"])
+                generation = int(row["generation"])
+                pending_since = row["pending_since"]
+                excluded_reason = row["excluded_reason"]
+                if status not in {"pending", "reviewing"} and new_work:
+                    reserve_pending_session(connection, config, now)
+                    status = "pending"
+                    generation += 1
+                    pending_since = now_text
+                    excluded_reason = None
+                elif status == "pending" and pending_since is None:
+                    pending_since = now_text
+                binding_status = (
+                    "pending_epoch" if needs_rebind else "accepted"
+                )
+                error_code = (
+                    "transcript_rebind_required" if needs_rebind else None
+                )
+                connection.execute(
+                    """
+                    UPDATE review_items
+                    SET raw_session_id=?,diagnostic_turn_id=?,generation=?,
+                        status=?,binding_status=?,cwd=?,transcript_path=?,
+                        transcript_size=?,transcript_mtime_ns=?,
+                        transcript_device=?,transcript_inode=?,
+                        observed_boundary=?,last_stop_ns=?,last_stop_at=?,
+                        pending_since=?,excluded_reason=?,error_code=?
+                    WHERE session_key=?
+                    """,
+                    (
+                        event.session_id,
+                        event.diagnostic_turn_id,
+                        generation,
+                        status,
+                        binding_status,
+                        str(event.cwd),
+                        str(event.transcript_path),
+                        event.transcript_size,
+                        event.transcript_mtime_ns,
+                        event.transcript_device,
+                        event.transcript_inode,
+                        event.transcript_size,
+                        event_time_ns,
+                        now_text,
+                        pending_since,
+                        excluded_reason,
+                        error_code,
+                        key,
+                    ),
+                )
+                outcome = "advanced" if new_work else "duplicate"
+```
+
+- [ ] **Step 4: Implement live-validated epoch adoption and immutable review claims**
 
 Add after `upsert_session()` in `evolver.py`:
 
@@ -3067,6 +3799,8 @@ def adopt_transcript_epoch(
     connection: sqlite3.Connection,
     session_key_value: str,
     embedded_session_key: str,
+    path: Path,
+    mtime_ns: int,
     device: int,
     inode: int,
     boundary: int,
@@ -3077,6 +3811,16 @@ def adopt_transcript_epoch(
         raise ValueError("invalid_epoch_binding_mode")
     if not hmac.compare_digest(session_key_value, embedded_session_key):
         raise ValueError("embedded_session_mismatch")
+    if (
+        not isinstance(path, Path)
+        or not path.is_absolute()
+        or any(
+            type(value) is not int or value < 0
+            for value in (mtime_ns, device, inode, boundary)
+        )
+    ):
+        raise ValueError("invalid_epoch_locator")
+    descriptor = -1
     connection.execute("BEGIN IMMEDIATE")
     try:
         row = connection.execute(
@@ -3088,9 +3832,37 @@ def adopt_transcript_epoch(
         if row["binding_status"] != "pending_epoch":
             raise ValueError("epoch_adoption_not_required")
         if (
-            int(row["transcript_device"]) != device
+            str(row["transcript_path"]) != str(path)
+            or int(row["transcript_mtime_ns"]) != mtime_ns
+            or int(row["transcript_device"]) != device
             or int(row["transcript_inode"]) != inode
+            or int(row["transcript_size"]) != boundary
             or int(row["observed_boundary"]) != boundary
+        ):
+            raise ValueError("epoch_locator_changed")
+        try:
+            if path.is_symlink() or path.resolve(strict=True) != path:
+                raise ValueError("epoch_locator_changed")
+            descriptor = os.open(
+                str(path),
+                os.O_RDONLY
+                | os.O_NONBLOCK
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            info = os.fstat(descriptor)
+        except OSError:
+            raise ValueError("epoch_locator_changed") from None
+        expected_stat = (boundary, mtime_ns, device, inode)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or (
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_dev,
+                info.st_ino,
+            )
+            != expected_stat
         ):
             raise ValueError("epoch_locator_changed")
         epoch = int(row["transcript_epoch"]) + 1
@@ -3103,11 +3875,27 @@ def adopt_transcript_epoch(
             """,
             (epoch, iso_utc(now), session_key_value),
         )
+        final_info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(final_info.st_mode)
+            or final_info.st_uid != os.getuid()
+            or (
+                final_info.st_size,
+                final_info.st_mtime_ns,
+                final_info.st_dev,
+                final_info.st_ino,
+            )
+            != expected_stat
+        ):
+            raise ValueError("epoch_locator_changed")
         connection.commit()
         return epoch
     except BaseException:
         connection.rollback()
         raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _recover_expired_review_leases(
@@ -3209,7 +3997,7 @@ def claim_review_generation(
         raise
 ```
 
-- [ ] **Step 4: Implement heartbeat, completion, and evidence uniqueness**
+- [ ] **Step 5: Implement monotonic heartbeat and atomic evidence completion**
 
 Add after `claim_review_generation()`:
 
@@ -3224,7 +4012,7 @@ def heartbeat_review_generation(
     changed = connection.execute(
         """
         UPDATE review_items
-        SET lease_expires_at=?
+        SET lease_expires_at=MAX(lease_expires_at,?)
         WHERE session_key=? AND status='reviewing' AND lease_owner=?
           AND lease_expires_at>=?
         """,
@@ -3250,74 +4038,96 @@ def complete_review_generation(
         raise ValueError("invalid_review_outcome")
     if outcome == "excluded" and not reason:
         raise ValueError("missing_exclusion_reason")
-    connection.execute("BEGIN IMMEDIATE")
-    try:
-        row = connection.execute(
-            """
-            SELECT * FROM review_items
-            WHERE session_key=? AND status='reviewing' AND lease_owner=?
-              AND lease_expires_at>=?
-            """,
-            (session_key_value, owner, iso_utc(now)),
-        ).fetchone()
-        if row is None:
-            raise ValueError("review_lease_unavailable")
-        frozen_to = int(row["frozen_to"])
-        new_work = (
-            row["binding_status"] != "accepted"
-            or int(row["transcript_epoch"]) != int(row["frozen_epoch"])
-            or int(row["observed_boundary"]) > frozen_to
-        )
-        status = "pending" if new_work else outcome
-        generation = int(row["generation"]) + int(new_work)
-        pending_since = iso_utc(now) if new_work else None
-        connection.execute(
-            """
-            UPDATE review_items
-            SET status=?,generation=?,reviewed_boundary=?,reviewed_at=?,
-                pending_since=?,excluded_reason=?,batch_id=NULL,
-                review_started_at=NULL,frozen_epoch=NULL,frozen_from=NULL,
-                frozen_to=NULL,frozen_locator_json=NULL,lease_owner=NULL,
-                lease_expires_at=NULL
-            WHERE session_key=?
-            """,
-            (
-                status,
-                generation,
-                frozen_to,
-                iso_utc(now),
-                pending_since,
-                reason if outcome == "excluded" else None,
-                session_key_value,
-            ),
-        )
-        connection.commit()
-        return {
-            "session_key": session_key_value,
-            "status": status,
-            "generation": generation,
-            "reviewed_boundary": frozen_to,
+    if not connection.in_transaction:
+        raise ValueError("active_review_transaction_required")
+    row = connection.execute(
+        """
+        SELECT * FROM review_items
+        WHERE session_key=? AND status='reviewing' AND lease_owner=?
+          AND lease_expires_at>=?
+        """,
+        (session_key_value, owner, iso_utc(now)),
+    ).fetchone()
+    if row is None:
+        raise ValueError("review_lease_unavailable")
+    frozen_to = int(row["frozen_to"])
+    current_locator_json = canonical_json_bytes(
+        {
+            "path": str(row["transcript_path"]),
+            "size": int(row["transcript_size"]),
+            "mtime_ns": int(row["transcript_mtime_ns"]),
+            "device": int(row["transcript_device"]),
+            "inode": int(row["transcript_inode"]),
         }
-    except BaseException:
-        connection.rollback()
-        raise
+    ).decode("utf-8")
+    new_work = (
+        row["binding_status"] != "accepted"
+        or int(row["transcript_epoch"]) != int(row["frozen_epoch"])
+        or int(row["observed_boundary"]) > frozen_to
+        or row["frozen_locator_json"] != current_locator_json
+    )
+    status = "pending" if new_work else outcome
+    generation = int(row["generation"]) + int(new_work)
+    pending_since = iso_utc(now) if new_work else None
+    connection.execute(
+        """
+        UPDATE review_items
+        SET status=?,generation=?,reviewed_boundary=?,reviewed_at=?,
+            pending_since=?,excluded_reason=?,batch_id=NULL,
+            review_started_at=NULL,frozen_epoch=NULL,frozen_from=NULL,
+            frozen_to=NULL,frozen_locator_json=NULL,lease_owner=NULL,
+            lease_expires_at=NULL
+        WHERE session_key=?
+        """,
+        (
+            status,
+            generation,
+            frozen_to,
+            iso_utc(now),
+            pending_since,
+            reason if outcome == "excluded" and not new_work else None,
+            session_key_value,
+        ),
+    )
+    return {
+        "session_key": session_key_value,
+        "status": status,
+        "generation": generation,
+        "reviewed_boundary": frozen_to,
+    }
 
 
 def record_candidate_evidence(
     connection: sqlite3.Connection,
     candidate_id: int,
     review_item_id: int,
+    owner: str,
+    expected_generation: int,
     signal_type: str,
     source_kind: str,
     summary: str,
     now: float,
 ) -> bool:
+    if not connection.in_transaction:
+        raise ValueError("active_review_transaction_required")
+    if (
+        not isinstance(owner, str)
+        or not owner
+        or len(owner.encode("utf-8")) > 128
+        or type(expected_generation) is not int
+        or expected_generation < 1
+    ):
+        raise ValueError("review_evidence_lease_unavailable")
     row = connection.execute(
-        "SELECT session_key,generation FROM review_items WHERE id=?",
-        (review_item_id,),
+        """
+        SELECT session_key,generation FROM review_items
+        WHERE id=? AND status='reviewing' AND lease_owner=?
+          AND generation=? AND lease_expires_at>=?
+        """,
+        (review_item_id, owner, expected_generation, iso_utc(now)),
     ).fetchone()
     if row is None:
-        raise ValueError("review_item_missing")
+        raise ValueError("review_evidence_lease_unavailable")
     changed = connection.execute(
         """
         INSERT OR IGNORE INTO candidate_evidence(
@@ -3339,7 +4149,13 @@ def record_candidate_evidence(
     return changed == 1
 ```
 
-- [ ] **Step 5: Run generation tests and verify GREEN**
+The Review adapter owns the write boundary. Its success path must execute
+`BEGIN IMMEDIATE`, insert/update the candidate, call
+`record_candidate_evidence()`, call `complete_review_generation()`, and then
+commit. Any failure rolls that whole unit back; neither helper commits or rolls
+back independently.
+
+- [ ] **Step 6: Run generation tests and verify GREEN**
 
 Run:
 
@@ -3350,13 +4166,27 @@ Run:
   -v
 ```
 
-Expected: all tests PASS. A concurrent Stop changes only the latest observed
-state, completion advances only to the frozen boundary and opens generation 2,
-lease expiry leaves the cursor at zero, different inode stays in epoch 0 until
-the matching embedded session key is supplied, and repeated evidence from
-generation 2 does not create an independent occurrence.
+Expected: all tests PASS. Specifically:
 
-- [ ] **Step 6: Commit generation state**
+- Capture records `observed_at_ns` before transcript open/`fstat`.
+- Same-size path or mtime changes enter `pending_epoch`.
+- Epoch adoption accepts only the exact stored and live canonical path, mtime,
+  device, inode, and size, including an unchanged second `fstat` before commit.
+- Heartbeats persist across connections, require the live owner, and never
+  shorten an expiry because the update uses `MAX`.
+- Candidate insertion, authorized evidence, and completion commit or roll back
+  together under the caller's `BEGIN IMMEDIATE`; evidence rejects a pending
+  row, wrong owner, wrong or non-integer generation, and expired lease.
+- Completion advances only through the frozen boundary and reopens if binding,
+  epoch, boundary, or any frozen locator field differs.
+- Reopening during review or after terminal exclusion clears
+  `excluded_reason`; duplicate and stale Stops leave terminal status,
+  generation, and reason unchanged.
+- Lease expiry leaves the review cursor unchanged, and evidence from a later
+  generation does not create a second occurrence for the same candidate and
+  session.
+
+- [ ] **Step 7: Commit generation state**
 
 ```bash
 git add \
