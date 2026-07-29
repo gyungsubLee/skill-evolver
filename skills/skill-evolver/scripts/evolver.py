@@ -362,7 +362,22 @@ def improvement_policy_digest(policy: bytes) -> str:
 
 
 FRONTMATTER_KEY = re.compile(r"[A-Za-z][A-Za-z0-9_-]*\Z")
-FRONTMATTER_FORBIDDEN_PREFIXES = ("!", "&", "*", "{", "[", "`")
+FRONTMATTER_FORBIDDEN_PREFIXES = (
+    "!",
+    "&",
+    "*",
+    "{",
+    "[",
+    "]",
+    "}",
+    ",",
+    "#",
+    "|",
+    ">",
+    "%",
+    "@",
+    "`",
+)
 FRONTMATTER_IMPLICIT_NON_STRINGS = frozenset(
     {"null", "true", "false", "yes", "no", "on", "off", "y", "n"}
 )
@@ -372,6 +387,8 @@ def _frontmatter_scalar(
     lines: list[str],
     index: int,
     encoded: str,
+    *,
+    require_string: bool,
 ) -> tuple[str, int]:
     value = encoded.strip()
     if value in {">", ">-", "|", "|-"}:
@@ -402,10 +419,19 @@ def _frontmatter_scalar(
             raise ValueError("invalid_skill_frontmatter")
         return value[1:-1].replace("''", "'"), index + 1
     if (
-        not (value[0].isalpha() or value[0] == "_")
-        or value.casefold() in FRONTMATTER_IMPLICIT_NON_STRINGS
-        or re.search(r"\s#", value)
+        re.search(r"\s#", value)
         or re.search(r":(?:\s|$)", value)
+        or (
+            value[0] in "-?"
+            and (len(value) == 1 or value[1].isspace())
+        )
+        or (
+            require_string
+            and (
+                not (value[0].isalpha() or value[0] == "_")
+                or value.casefold() in FRONTMATTER_IMPLICIT_NON_STRINGS
+            )
+        )
     ):
         raise ValueError("invalid_skill_frontmatter")
     return value, index + 1
@@ -443,10 +469,18 @@ def parse_frontmatter_scalars(
         key, encoded = line.split(":", 1)
         if not FRONTMATTER_KEY.fullmatch(key) or key in fields:
             raise ValueError("invalid_skill_frontmatter")
-        value, cursor = _frontmatter_scalar(header, cursor, encoded)
-        fields[key] = unicodedata.normalize(
+        value, cursor = _frontmatter_scalar(
+            header,
+            cursor,
+            encoded,
+            require_string=key in {"name", "description"},
+        )
+        normalized = unicodedata.normalize(
             "NFC", " ".join(value.split())
         )
+        if not normalized:
+            raise ValueError("invalid_skill_frontmatter")
+        fields[key] = normalized
     try:
         name = fields["name"]
         description = fields["description"]

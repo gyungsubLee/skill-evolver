@@ -247,6 +247,11 @@ class FrontmatterScalarTests(unittest.TestCase):
         self.runtime = load_runtime()
 
     def test_plain_quoted_and_folded_scalars(self) -> None:
+        metadata_scalars = (
+            b"---\nname: metadata\ndescription: Metadata safe.\n"
+            b"disable-model-invocation: true\npriority: 2\n"
+            b"released: 2026-07-30\n---\n"
+        )
         cases = (
             (
                 b"---\nname: plain\ndescription: Plain description.\n---\n",
@@ -261,6 +266,7 @@ class FrontmatterScalarTests(unittest.TestCase):
                 b"  second line\nlicense: local\n---\n",
                 ("folded", "first line second line"),
             ),
+            (metadata_scalars, ("metadata", "Metadata safe.")),
         )
         for raw, expected in cases:
             with self.subTest(expected=expected):
@@ -268,6 +274,36 @@ class FrontmatterScalarTests(unittest.TestCase):
                     self.runtime.parse_frontmatter_scalars(raw, 65_536),
                     expected,
                 )
+        with tempfile.TemporaryDirectory() as temporary:
+            skills = Path(temporary).resolve() / "skills"
+            skills.mkdir(mode=0o700)
+            skill_dir = skills / "metadata"
+            skill_dir.mkdir(mode=0o700)
+            skill = skill_dir / "SKILL.md"
+            skill.write_bytes(metadata_scalars)
+            skill.chmod(0o600)
+            review = replace(
+                self.runtime.load_review_runtime(),
+                mutable_skill_roots=(skills,),
+            )
+            snapshot = self.runtime.build_catalog_snapshot(review)
+        self.assertEqual(
+            [
+                (
+                    entry.identity,
+                    entry.display_name,
+                    entry.description,
+                )
+                for entry in snapshot.entries
+            ],
+            [
+                (
+                    "user-skill:metadata",
+                    "metadata",
+                    "Metadata safe.",
+                )
+            ],
+        )
 
     def test_parser_rejects_non_scalar_duplicate_and_overflow(self) -> None:
         invalid = (
@@ -286,6 +322,18 @@ class FrontmatterScalarTests(unittest.TestCase):
             b"---\nname: special\ndescription: .inf\n---\n",
             b"---\nname: mapping\ndescription: foo: bar\n---\n",
             b"---\nname: mapping\ndescription: foo:\n---\n",
+            b"---\nname: safe\ndescription: Safe.\nextra:\n  child: value\n---\n",
+            b"---\nname: safe\ndescription: Safe.\nextra: [one, two]\n---\n",
+            b"---\nname: safe\ndescription: Safe.\nextra: {child: value}\n---\n",
+            b"---\nname: safe\ndescription: Safe.\nextra: *alias\n---\n",
+            b"---\nname: safe\ndescription: Safe.\nextra: &anchor\n---\n",
+            b"---\nname: safe\ndescription: Safe.\nextra: !tag\n---\n",
+            b"---\nname: safe\ndescription: Safe.\nextra: 'bad' tail'\n---\n",
+            b"---\nname: safe\ndescription: Safe.\nextra: safe # hidden\n---\n",
+            b"---\nname: safe\ndescription: Safe.\nextra: foo: bar\n---\n",
+            b'---\nname: safe\ndescription: Safe.\nextra: ""\n---\n',
+            b"---\nname: safe\ndescription: Safe.\nextra: ''\n---\n",
+            b"---\nname: safe\ndescription: Safe.\nextra: - item\n---\n",
             b"---\nname: one\nname: two\ndescription: duplicate\n---\n",
             b"---\nname: missing-description\n---\n",
             b"name: no-frontmatter\ndescription: invalid\n",
