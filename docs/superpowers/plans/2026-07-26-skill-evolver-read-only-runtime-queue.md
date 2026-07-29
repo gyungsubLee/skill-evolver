@@ -1,3 +1,9 @@
+> **SUPERSEDED — DO NOT EXECUTE**
+>
+> Replaced by `docs/superpowers/plans/2026-07-28-skill-evolver-session-runtime-queue.md`.
+> No task, command, code block, or completion criterion in this turn-level plan
+> may be executed. It is retained only as historical context.
+
 # Skill Evolver Read-only Runtime Queue Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

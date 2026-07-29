@@ -1,6 +1,8 @@
 # Skill Evolver Implementation Roadmap
 
 **Purpose:** Turn `skill-evolver/docs/superpowers/specs/2026-07-26-skill-evolver-design.md`
+plus the approved
+`skill-evolver/docs/superpowers/specs/2026-07-28-skill-evolver-session-capture-amendment-design.md`
 into a gate-driven sequence of independently executable implementation plans.
 
 **Roadmap status:** Defined. A document existing does not mean its release gate
@@ -32,7 +34,7 @@ amendment; it never authorizes skipping ahead.
   UI, automatic evaluation, automatic apply, Git commit, push, and pull-request
   creation are outside this roadmap.
 - Every child plan inherits the security, privacy, retention, concurrency, and
-  completion requirements of the source design.
+  completion requirements of the base design plus approved session amendment.
 
 ## Document Roles
 
@@ -47,10 +49,10 @@ amendment; it never authorizes skipping ahead.
 
 | Order | Release | Plan | Entry gate | Exit artifact |
 | ---: | --- | --- | --- | --- |
-| 0 | Feasibility | `2026-07-26-skill-evolver-feasibility-spike.md` | Source design reviewed | `skill-evolver/docs/feasibility-report.json` |
-| 1 | Read-only MVP | `2026-07-26-skill-evolver-read-only-runtime-queue.md` | Feasibility decision is `PASS` | production capture, SQLite schema v1, queue/status integration report |
-| 2 | Read-only MVP | `2026-07-26-skill-evolver-read-only-review-inbox.md` | Runtime/queue integration suite passes | manual review and candidate-inbox report |
-| 3 | Read-only MVP | `2026-07-26-skill-evolver-read-only-quality-gate.md` | Review/inbox suite passes with zero target-skill writes | immutable Read-only quality report |
+| 0 | Feasibility | `2026-07-26-skill-evolver-feasibility-spike.md` plus `2026-07-28-skill-evolver-session-capture-amendment.md` | Base design and session amendment approved | `skill-evolver/docs/feasibility-report-v2.json` |
+| 1 | Read-only MVP | `2026-07-28-skill-evolver-session-runtime-queue.md` | `feasibility-report-v2.json` has schema `2`, decision `PASS`, and next action `write_session_runtime_queue_plan` | production session capture, SQLite schema v1, queue/status integration report |
+| 2 | Read-only MVP | `2026-07-26-skill-evolver-read-only-review-inbox.md` after a session-contract rewrite | Runtime/queue integration suite passes and the Review plan consumes generations rather than turn rows | manual review and candidate-inbox report |
+| 3 | Read-only MVP | `2026-07-26-skill-evolver-read-only-quality-gate.md` after a session-evidence rewrite | Review/inbox suite passes with zero target-skill writes and the Quality plan counts independent sessions rather than turns or generations | immutable Read-only quality report |
 | 4 | Evaluate | `2026-07-26-skill-evolver-evaluate-runner-spike.md` | Read-only quality decision is `PASS` | pinned runner contract and reproducible probe report |
 | 5 | Evaluate | `2026-07-26-skill-evolver-evaluate-prepare.md` | Runner spike decision is `PASS` | immutable base, candidate, harness, diff, and evaluation spec |
 | 6 | Evaluate | `2026-07-26-skill-evolver-evaluate-execution.md` | Prepare artifacts pass digest and immutability checks | evaluation report bound to the full spec digest |
@@ -62,11 +64,15 @@ amendment; it never authorizes skipping ahead.
 
 ```mermaid
 flowchart TD
-    F["0. Feasibility Spike"] --> FG{"PASS?"}
-    FG -->|No| FR["Amend design for session-level capture"]
+    F["0. Feasibility Spike and Session Amendment"] --> FG{"Schema-v2 PASS?"}
+    FG -->|No| FR["Keep Runtime and Queue blocked"]
     FG -->|Yes| Q["1. Runtime and Queue"]
-    Q --> R["2. Review and Inbox"]
-    R --> G["3. Read-only Quality Gate"]
+    Q --> RA{"Review plan session-amended?"}
+    RA -->|No| RB["Keep Review blocked"]
+    RA -->|Yes| R["2. Review and Inbox"]
+    R --> QA{"Quality plan session-amended?"}
+    QA -->|No| QB["Keep Quality blocked"]
+    QA -->|Yes| G["3. Read-only Quality Gate"]
     G --> GG{"Quality PASS?"}
     GG -->|No| GR["Revise transcript adapter or review policy"]
     GG -->|Yes| RS["4. Runner Spike"]
@@ -86,8 +92,12 @@ flowchart TD
 
 Failure routes have these fixed meanings:
 
-- Feasibility failure creates a design amendment for session-level capture.
-  It does not create or execute the Read-only runtime plan.
+- A missing or failing schema-v2 report keeps Runtime/Queue blocked. The
+  approved session amendment and a fresh immutable report must resolve the
+  gate; the superseded turn-level Runtime Queue plan is never executed.
+- An unamended Review or Quality plan stays blocked. Both executable plans must
+  consume session generations while counting distinct `session_key` values—not
+  turns or later generations—as independent evidence.
 - Read-only quality failure returns to the transcript adapter or improvement
   policy. It does not activate runner, prepare, or evaluate commands.
 - Runner failure leaves `prepare` and `evaluate` unavailable in the installed
@@ -111,6 +121,8 @@ skill-evolver/
 ├── docs/
 │   ├── feasibility-report.json
 │   ├── feasibility-report.md
+│   ├── feasibility-report-v2.json
+│   ├── feasibility-report-v2.md
 │   └── release-reports/
 └── skills/
     └── skill-evolver/
@@ -123,6 +135,7 @@ skill-evolver/
         ├── evals/
         │   └── evals.json
         └── tests/
+            ├── feasibility_probe.py
             ├── fixtures/
             ├── support.py
             ├── test_installation.py
@@ -153,7 +166,6 @@ skill-evolver/
 ├── identity.key
 ├── evolver.db
 ├── spool/
-│   └── quarantine/
 ├── staging/
 ├── snapshots/
 └── reports/
@@ -163,7 +175,7 @@ Database migrations are release-bound:
 
 | Schema version | Owning plan | Tables and columns activated |
 | ---: | --- | --- |
-| 1 | Runtime/Queue | `review_batches`, `review_items`, `candidates`, `candidate_evidence`, `metadata`; no `ready_evaluation_id` |
+| 1 | Runtime/Queue | `review_batches`, one `review_items` row per `session_key` with generation/epoch/observed/reviewed/frozen state, `candidates`, session-unique `candidate_evidence`, and `metadata`; no `ready_evaluation_id` |
 | 2 | Evaluate/Prepare | `evaluations` and nullable `candidates.ready_evaluation_id` |
 | 3 | Apply/Versioning | `apply_operations`, `versions`, apply/undo indexes |
 
@@ -175,30 +187,49 @@ migration.
 
 ### Feasibility → Runtime/Queue
 
-The Runtime/Queue plan consumes:
+The Runtime/Queue plan consumes the following exact authoritative fields from
+`skill-evolver/docs/feasibility-report-v2.json`:
 
-- `skill-evolver/docs/feasibility-report.json` with decision `PASS`
-- the sanitized CLI and Desktop Stop fixtures
-- sanitized transcript pointer-path and provenance layouts
-- proof that the Hook and explicit skill process share the fixed private root
+- `schema_version: 2`
+- `decision: "PASS"`
+- `next_action: "write_session_runtime_queue_plan"`
+- predecessor path `docs/feasibility-report.json` with SHA-256
+  `ced4503adb44bd041de063c04e0c6c64d0831370fc12e96a920fe97244d8ae15`
+- six `true` checks: CLI/Desktop `session_stop_contract`,
+  `asymmetric_access`, and `session_transcript_supported`
+- CLI and Desktop `stop_keys` exactly
+  `["cwd", "hook_event_name", "session_id", "transcript_path"]`
+- CLI and Desktop `binding_modes` exactly `["same_file_identity"]`
+- CLI and Desktop `session_id_pointer_paths` exactly
+  `["/payload/session_id"]`
+- CLI and Desktop `provenance_pointer_paths` exactly `["/payload/role"]`
 
-The report values are treated as runtime adapter inputs. Implementers do not
-guess field names or broaden filesystem access if a required value is absent.
+The access fixtures additionally bind the asymmetric runtime contract: the
+Hook reads and writes the fixed global root, ordinary skill execution reads it
+but cannot write it by default, and each review or maintenance mutation needs
+explicit approval scoped to the exact command and root. Implementers do not
+guess fields, require `turn_id`, grant a persistent writable root, or broaden
+filesystem access if any exact value is absent.
 
 ### Runtime/Queue → Review/Inbox
 
 The capture plan produces:
 
 - validated `installation.json`, `config.json`, and `identity.key`
-- SQLite schema version 1
-- HMAC event-key deduplication
-- pending `review_items` bounded to the Hook-time transcript stat
-- atomic spool fallback and explicit mutating-command import
-- retention/capacity primitives
-- status-only health snapshot
+- SQLite schema version 1 with one `review_items` row per HMAC
+  `session_key`
+- optional diagnostic `turn_id`, never used as a key or transcript boundary
+- session generation, `transcript_epoch`, observed, reviewed, and
+  lease-frozen boundary state
+- Stop upsert, atomic bounded spool fallback, and explicit scoped maintenance
+- session-based retention/capacity primitives and transcript-free read-only
+  status
+- candidate evidence uniqueness by candidate fingerprint, `session_key`, and
+  signal type
 
-The Review/Inbox plan must use these records and must not introduce another
-queue or copy transcript bodies into SQLite.
+The Review/Inbox plan must be rewritten to use these records before execution.
+It must not introduce another queue, require a turn span, count another
+generation as independent evidence, or copy transcript bodies into SQLite.
 
 ### Review/Inbox → Read-only Quality Gate
 
@@ -212,20 +243,24 @@ The review plan produces:
   and inspect behavior
 - at most one candidate per session and three new candidates per batch
 
-The quality plan measures these exact outputs and does not rewrite them to make
-the gate pass.
+Before execution, the Quality plan must be rewritten to measure independent
+sessions by distinct `session_key`. It must not use a turn count or count later
+generations of the same session as additional evidence. After that contract
+rewrite, it measures these exact outputs and does not alter results to make the
+gate pass.
 
 ### Read-only Quality Gate → Evaluate Runner
 
 The immutable quality report records:
 
-- reviewed session and turn counts
+- reviewed independent-session counts; later generations of one session do not
+  increase independent evidence
 - user-marked evaluation-worth count
 - target-skill attribution errors
 - external-content adoption incidents
 - the exact review policy and transcript adapter digests
 
-Evaluate work starts only when at least 10 sessions or 30 turns were reviewed,
+Evaluate work starts only when at least 10 independent sessions were reviewed,
 evaluation-worth rate is at least 50%, target-skill misattribution is at most
 20%, and external-content adoption incidents equal zero.
 
@@ -255,17 +290,21 @@ parent snapshot, not an ambiguous version label.
 
 ### Feasibility gate
 
-- Two independent real Stop observations exist for CLI and Desktop.
-- The Hook-time transcript prefix maps turn ID and provenance without reading
-  past the captured boundary.
-- The Hook and explicit skill process share the fixed private root under the
-  default workspace-write policy.
+- `feasibility-report-v2.json` has the exact schema, decision, next action,
+  predecessor digest, checks, and surface fields listed in the upstream
+  interface contract.
+- Two independent real sessions exist for CLI and Desktop, with stable
+  session/provenance pointers and no required turn span.
+- The frozen session prefix is complete and does not read past its captured
+  boundary.
+- Hook read/write, default skill read plus write denial, and explicit scoped
+  skill write all pass on both surfaces.
 
 ### Read-only gate
 
 - Hook capture is idempotent and silent.
 - Status does not read transcripts or mutate the spool.
-- Review respects the 5-session, 20-turn, 2-MiB-per-session, 100-message, and
+- Review respects the 5-session, 2-MiB-per-session, 100-record, and
   8-MiB-per-batch limits.
 - No installed skill, staging tree, or snapshot is modified.
 - The quality thresholds in the preceding interface contract pass.
