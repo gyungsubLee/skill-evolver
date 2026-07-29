@@ -4,9 +4,9 @@
 
 **Goal:** Replace the schema-v2 feasibility probe with a production `Stop` Hook that converges repeated Stops into one private SQLite row per session, preserves generation and frozen review boundaries, falls back to a bounded spool, and exposes transcript-free read-only status.
 
-**Architecture:** Keep the established self-contained `evolver.py` entrypoint because `/usr/bin/python3 -I` does not load sibling runtime modules. The Hook validates only its bounded envelope and transcript file stat, derives an HMAC `session_key`, and performs one short session upsert; explicit review later resolves transcript identity and parses only a frozen prefix. SQLite owns session/generation state, lease recovery, evidence uniqueness, retention, and health, while a private atomic spool absorbs short write contention.
+**Architecture:** Keep the established self-contained `evolver.py` entrypoint because `/usr/bin/python3 -I` does not load sibling runtime modules. The Hook validates only its bounded envelope and transcript file stat, derives an HMAC `session_key`, and performs one short session upsert; explicit review later resolves transcript identity and parses only a frozen prefix. SQLite owns session/generation state, lease recovery, evidence uniqueness, retention, and health. Writers use short zero-wait rollback-journal transactions, while a private atomic spool absorbs immediate write contention.
 
-**Tech Stack:** macOS Codex CLI/Desktop, `/usr/bin/python3` 3.9+, Python standard library (`argparse`, `calendar`, `dataclasses`, `fcntl`, `hashlib`, `hmac`, `json`, `os`, `pathlib`, `secrets`, `shutil`, `sqlite3`, `stat`, `tempfile`, `time`, `unittest`, `urllib.parse`), SQLite WAL, Codex plugin matcher-free `Stop` command Hook.
+**Tech Stack:** macOS Codex CLI/Desktop, `/usr/bin/python3` 3.9+, Python standard library (`argparse`, `calendar`, `dataclasses`, `fcntl`, `hashlib`, `hmac`, `json`, `os`, `pathlib`, `secrets`, `shutil`, `sqlite3`, `stat`, `tempfile`, `time`, `unittest`, `urllib.parse`), SQLite `journal_mode=DELETE`, Codex plugin matcher-free `Stop` command Hook.
 
 ## Global Constraints
 
@@ -53,10 +53,12 @@
   skill, emits no stdout/stderr, and exits `0` on every path.
 - Bare `$skill-evolver` and `$skill-evolver status` use SQLite read-only mode,
   do not import or clean the spool, and do not open transcripts.
-- Initialization creates the staged schema in rollback-journal mode, atomically
-  places the complete root, then uses one controlled final-path writer to
-  switch to WAL and create its private sidecars before an immediate read-only
-  status open.
+- Initialization closes a complete staged `journal_mode=DELETE` database,
+  atomically places the root, and proves an immediate SQLite `mode=ro` status
+  open that needs no directory write or auxiliary journal file. WAL is
+  intentionally excluded: Python's standard library cannot request
+  `SQLITE_FCNTL_PERSIST_WAL`, so closing the final writer may remove the files
+  on which a read-only open would depend.
 - Review and maintenance mutations require approval scoped to the exact command
   and global data root for that invocation. No permanent writable-root grant is
   requested or documented.
@@ -359,9 +361,11 @@ Expected: only the eleven listed test/harness paths are committed.
   `initialize_runtime(data_root, transcript_roots, config) -> Path`,
   `load_installation(path) -> Installation`,
   `load_config(installation) -> Config`, and
-  `open_database(installation, busy_ms=1000, read_only=False, *,
-  enable_wal=True) -> sqlite3.Connection`. `enable_wal=False` is used only for
-  the staged schema before final placement.
+  `open_database(installation, read_only=False) -> sqlite3.Connection`.
+- Every connection sets `busy_timeout=0`. Writers require
+  `journal_mode=DELETE`, and each mutation owns one short explicit transaction
+  or one autocommit statement so contention immediately reaches the Hook's
+  bounded spool fallback.
 - SQLite produces one unique `review_items.session_key`, session generation and
   epoch boundaries, frozen locator state, batch/evidence tables, and no
   turn-count or event-key columns.
@@ -463,10 +467,17 @@ class RuntimeStoreTests(unittest.TestCase):
             self.base / "data", (self.sessions,), self.config
         )
         installation = self.runtime.load_installation(installation_path)
-        for suffix in ("-wal", "-shm"):
-            sidecar = Path(f"{installation.database}{suffix}")
-            self.assertTrue(sidecar.is_file())
-            self.assertEqual(stat.S_IMODE(sidecar.stat().st_mode), 0o600)
+        expected_entries = {
+            "config.json",
+            "evolver.db",
+            "identity.key",
+            "installation.json",
+            "spool",
+        }
+        self.assertEqual(
+            {path.name for path in installation.data_root.iterdir()},
+            expected_entries,
+        )
         connection = None
         installation.data_root.chmod(0o500)
         try:
@@ -479,13 +490,11 @@ class RuntimeStoreTests(unittest.TestCase):
                         "PRAGMA journal_mode"
                     ).fetchone()[0]
                 ).lower(),
-                "wal",
+                "delete",
             )
             self.assertEqual(
-                connection.execute(
-                    "SELECT value FROM metadata WHERE key='journal_mode'"
-                ).fetchone()[0],
-                "wal",
+                connection.execute("PRAGMA busy_timeout").fetchone()[0],
+                0,
             )
             with self.assertRaises(sqlite3.OperationalError):
                 connection.execute(
@@ -496,6 +505,10 @@ class RuntimeStoreTests(unittest.TestCase):
             if connection is not None:
                 connection.close()
             installation.data_root.chmod(0o700)
+        self.assertEqual(
+            {path.name for path in installation.data_root.iterdir()},
+            expected_entries,
+        )
 
     def test_environment_cannot_redirect_installation(self) -> None:
         installation_path = self.runtime.initialize_runtime(
@@ -517,8 +530,7 @@ class RuntimeStoreTests(unittest.TestCase):
             self.base / "data", (self.sessions,), self.config
         )
         installation = self.runtime.load_installation(installation_path)
-        for suffix in ("", "-wal", "-shm"):
-            Path(f"{installation.database}{suffix}").unlink(missing_ok=True)
+        installation.database.unlink()
         broken = """
         CREATE TABLE should_rollback(id INTEGER PRIMARY KEY);
         CREATE TABLE broken(
@@ -537,6 +549,9 @@ class RuntimeStoreTests(unittest.TestCase):
         connection.close()
         self.assertNotIn("should_rollback", tables)
         self.assertEqual(version, 0)
+        self.assertFalse(
+            Path(f"{installation.database}-journal").exists()
+        )
 
     def test_newer_schema_and_symlinked_transcript_root_fail_closed(self) -> None:
         installation_path = self.runtime.initialize_runtime(
@@ -585,6 +600,35 @@ class RuntimeStoreTests(unittest.TestCase):
         """
         with mock.patch.object(self.runtime, "SCHEMA_SQL", broken):
             with self.assertRaises(sqlite3.Error):
+                self.runtime.initialize_runtime(
+                    root, (self.sessions,), self.config
+                )
+        self.assertFalse(root.exists())
+        installation_path = self.runtime.initialize_runtime(
+            root, (self.sessions,), self.config
+        )
+        self.assertEqual(
+            installation_path.resolve(),
+            (root / "installation.json").resolve(),
+        )
+
+    def test_failed_post_placement_status_check_removes_root(self) -> None:
+        root = self.base / "post-placement-failure"
+        real_open_database = self.runtime.open_database
+
+        def fail_read_only(installation, read_only=False):
+            if read_only:
+                raise sqlite3.OperationalError("status open failed")
+            return real_open_database(installation, read_only=read_only)
+
+        with mock.patch.object(
+            self.runtime,
+            "open_database",
+            side_effect=fail_read_only,
+        ):
+            with self.assertRaisesRegex(
+                sqlite3.OperationalError, "status open failed"
+            ):
                 self.runtime.initialize_runtime(
                     root, (self.sessions,), self.config
                 )
@@ -929,28 +973,18 @@ def initialize_runtime(
             staging / "identity.key", secrets.token_bytes(32)
         )
         installation = load_installation(staging_installation)
-        connection = open_database(installation, enable_wal=False)
+        connection = open_database(installation)
         connection.close()
         atomic_write_json(
             staging_installation,
             {**installation_payload, "data_root": str(root)},
         )
+        fsync_directory(staging)
         os.replace(staging, root)
         placed = True
         fsync_directory(root.parent)
 
         installation = load_installation(root / "installation.json")
-        connection = open_database(installation)
-        try:
-            # This final-path write creates the WAL/SHM sidecars required by a
-            # read-only SQLite status process after the writer closes.
-            connection.execute(
-                "INSERT INTO metadata(key,value) VALUES('journal_mode','wal')"
-            )
-        finally:
-            connection.close()
-        for suffix in ("-wal", "-shm"):
-            private_file(Path(f"{installation.database}{suffix}"))
         status_connection = open_database(installation, read_only=True)
         status_connection.close()
         fsync_directory(root)
@@ -1016,10 +1050,7 @@ def load_config(installation: Installation) -> Config:
 
 def open_database(
     installation: Installation,
-    busy_ms: int = 1_000,
     read_only: bool = False,
-    *,
-    enable_wal: bool = True,
 ) -> sqlite3.Connection:
     if installation.database.exists():
         private_file(installation.database)
@@ -1032,55 +1063,48 @@ def open_database(
         connection = sqlite3.connect(
             database,
             uri=True,
-            timeout=busy_ms / 1_000,
+            timeout=0,
             isolation_level=None,
         )
     else:
         connection = sqlite3.connect(
             str(installation.database),
-            timeout=busy_ms / 1_000,
+            timeout=0,
             isolation_level=None,
         )
+        os.chmod(installation.database, 0o600)
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute(f"PRAGMA busy_timeout = {int(busy_ms)}")
-    if read_only:
-        connection.execute("PRAGMA query_only = ON")
-    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    if version > SCHEMA_VERSION:
-        connection.close()
-        raise ValueError("unsupported_database_schema")
-    if version == 0:
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 0")
         if read_only:
-            connection.close()
-            raise ValueError("database_uninitialized")
-        try:
+            connection.execute("PRAGMA query_only = ON")
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version > SCHEMA_VERSION:
+            raise ValueError("unsupported_database_schema")
+        mode = str(
+            connection.execute(
+                "PRAGMA journal_mode"
+                if read_only or version
+                else "PRAGMA journal_mode = DELETE"
+            ).fetchone()[0]
+        )
+        if mode.lower() != "delete":
+            raise ValueError("delete_journal_required")
+        if version == 0:
+            if read_only:
+                raise ValueError("database_uninitialized")
             connection.executescript(
                 "BEGIN IMMEDIATE;\n"
                 + SCHEMA_SQL
                 + f"\nPRAGMA user_version = {SCHEMA_VERSION};\n"
                 + "COMMIT;\n"
             )
-        except BaseException:
-            if connection.in_transaction:
-                connection.rollback()
-            connection.close()
-            raise
-    if not read_only:
-        requested_mode = "WAL" if enable_wal else "DELETE"
-        mode = str(
-            connection.execute(
-                f"PRAGMA journal_mode = {requested_mode}"
-            ).fetchone()[0]
-        )
-        if mode.lower() != requested_mode.lower():
-            connection.close()
-            raise ValueError(
-                "wal_unavailable"
-                if enable_wal
-                else "delete_journal_unavailable"
-            )
-        os.chmod(installation.database, 0o600)
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        connection.close()
+        raise
     return connection
 
 
@@ -1131,11 +1155,11 @@ Run:
   -v
 ```
 
-Expected: all store tests PASS, including DELETE-mode staged schema creation,
-the controlled final-path WAL transition, an immediate `mode=ro` open after
-initialization, read-only SQLite rejecting a write, an unsafe pre-existing root
-remaining untouched, exact private-file modes, and a failed schema transaction
-leaving `user_version == 0`.
+Expected: all store tests PASS, including a staged `journal_mode=DELETE`
+database with zero busy timeout, an immediate `mode=ro` open while its directory
+is not writable, no auxiliary files created by that status open, read-only
+SQLite rejecting a write, exact private-file modes, schema rollback leaving
+`user_version == 0`, and cleanup after both pre- and post-placement failures.
 
 - [ ] **Step 5: Commit the store**
 
@@ -1168,6 +1192,8 @@ Expected: only the runtime and focused test file are committed.
   silent `enqueue-stop` command.
 - The Hook observes transcript path/stat only. It never reads transcript bytes
   and never increments `transcript_epoch`.
+- SQLite write contention is not waited out: `busy_timeout=0` makes the Hook
+  attempt one short transaction before using the bounded spool.
 - Spool fallback streams at most 201 directory entries before failing
   conservatively, validates only the bounded selected JSON files, and records
   overflow under a separate bounded nonblocking lock on the counter itself.
@@ -1330,16 +1356,20 @@ class SessionCaptureTests(unittest.TestCase):
             )
         barrier = threading.Barrier(2)
         failures: list[BaseException] = []
+        locked: list[sqlite3.OperationalError] = []
 
         def capture(event, key) -> None:
-            connection = self.runtime.open_database(
-                self.installation, busy_ms=2_000
-            )
+            connection = self.runtime.open_database(self.installation)
             try:
                 barrier.wait(timeout=2)
                 self.runtime.upsert_session(
                     connection, event, key, limited, 2_000_000_000.0
                 )
+            except sqlite3.OperationalError as error:
+                if "locked" in str(error).lower():
+                    locked.append(error)
+                else:
+                    failures.append(error)
             except BaseException as error:
                 failures.append(error)
             finally:
@@ -1355,6 +1385,7 @@ class SessionCaptureTests(unittest.TestCase):
             worker.join(timeout=4)
         self.assertTrue(all(not worker.is_alive() for worker in workers))
         self.assertEqual(failures, [])
+        self.assertLessEqual(len(locked), 1)
         connection = self.runtime.open_database(self.installation)
         pending = connection.execute(
             "SELECT COUNT(*) FROM review_items WHERE status='pending'"
@@ -1411,18 +1442,21 @@ class SessionCaptureTests(unittest.TestCase):
         self.assertEqual(row["observed_boundary"], new_event.transcript_size)
         self.assertEqual(row["last_stop_ns"], new_event.observed_at_ns)
 
-    def test_lock_fallback_is_bounded_and_counts_overflow(self) -> None:
+    def test_writer_contention_immediately_uses_bounded_spool(self) -> None:
         limited = self.runtime.Config(
             **{
                 **self.runtime_config.__dict__,
                 "spool_limit_files": 1,
             }
         )
-        with mock.patch.object(
-            self.runtime,
-            "upsert_session",
-            side_effect=sqlite3.OperationalError("database is locked"),
-        ):
+        blocker = self.runtime.open_database(self.installation)
+        self.assertEqual(
+            blocker.execute("PRAGMA busy_timeout").fetchone()[0],
+            0,
+        )
+        blocker.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+        try:
             first = self.runtime.enqueue_stop(
                 self.installation,
                 limited,
@@ -1435,6 +1469,10 @@ class SessionCaptureTests(unittest.TestCase):
                     {**self.payload, "session_id": "raw-session-2"}
                 ).encode(),
             )
+        finally:
+            blocker.rollback()
+            blocker.close()
+        self.assertLess(time.monotonic() - started, 0.25)
         self.assertEqual(first, "spooled")
         self.assertEqual(second, "overflow")
         self.assertEqual(
@@ -2122,7 +2160,7 @@ def enqueue_stop(
     now = time.time()
     key = session_key(installation, event.session_id)
     try:
-        connection = open_database(installation, busy_ms=75)
+        connection = open_database(installation)
         try:
             return upsert_session(
                 connection,
@@ -2178,11 +2216,12 @@ Run:
 ```
 
 Expected: all tests PASS. Missing `turn_id` queues successfully, repeated Stops
-produce one session row, capacity is one pending session in the focused test,
-the spool caps at one file there, its directory scan stops at entry 201, unsafe
-spool files fail closed, concurrent overflow appends never exceed 64 KiB,
-invalid JSONL transcript content is never parsed, and every Hook subprocess is
-silent with exit code `0`.
+produce one session row, zero-wait real writer contention uses the bounded spool,
+capacity is one pending session in the focused test, the spool caps at one file
+there, its directory scan stops at entry 201, unsafe spool files fail closed,
+concurrent overflow appends never exceed 64 KiB, invalid JSONL transcript
+content is never parsed, and every Hook subprocess is silent with exit code
+`0`.
 
 - [ ] **Step 7: Commit session capture**
 
@@ -4314,12 +4353,14 @@ Expected:
   64-KiB overflow counter cannot exceed its cap and discloses saturation.
   Malformed and 14-day-expired raw spool payloads are deleted, raw row metadata
   is cleared by 30 days, and HMAC dedupe rows are removed after 180 days.
-- Initialization builds the staged schema in DELETE mode, switches to WAL only
-  after final placement under a controlled writer, and proves an immediate
-  read-only status open. Status uses SQLite `mode=ro`, stats but does not import
-  the spool, opens no transcript, and reports pending sessions/generations,
-  oldest age, leases, excluded/expired/binding failures, spool
-  count/bytes/overflow, last Hook success, and raw cleanup health.
+- Initialization closes a complete staged `journal_mode=DELETE` database,
+  atomically places it, and proves an immediate `mode=ro` status open without a
+  directory write or auxiliary journal file. All connections use zero busy
+  timeout; short writer transactions fail immediately into the bounded Hook
+  spool. Status stats but does not import the spool, opens no transcript, and
+  reports pending sessions/generations, oldest age, leases,
+  excluded/expired/binding failures, spool count/bytes/overflow, last Hook
+  success, and raw cleanup health.
 - Review and maintenance writes require approval for the exact invocation and
   global root. No persistent write grant is created.
 - The Hook has no model call, transcript parsing/read, network access, skill
