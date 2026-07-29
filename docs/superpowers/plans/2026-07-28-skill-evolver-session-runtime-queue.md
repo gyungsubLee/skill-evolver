@@ -3373,6 +3373,7 @@ Expected: only the two listed files are committed.
 
 **Files:**
 - Modify: `skill-evolver/skills/skill-evolver/scripts/evolver.py`
+- Modify: `skill-evolver/skills/skill-evolver/SKILL.md`
 - Modify: `skill-evolver/skills/skill-evolver/tests/test_capture.py`
 
 **Interfaces:**
@@ -3438,6 +3439,10 @@ class MaintenanceStatusTests(unittest.TestCase):
         return event
 
     def test_status_command_opens_read_only_immediately_after_init(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("- No argument or `status`: run `status --installation", skill)
+        self.assertIn("- `maintain`: show the exact `maintain --installation", skill)
+        self.assertNotIn("Status and `maintain` are unavailable", skill)
         database_before = self.installation.database.read_bytes()
         process = run_isolated(
             "status",
@@ -3700,7 +3705,8 @@ Run:
 ```
 
 Expected: FAIL because `import_spool`, `run_maintenance`, `queue_status`,
-`maintain`, and `status` do not exist.
+`maintain`, and `status` do not exist and the explicit skill still marks the
+two commands unavailable.
 
 - [ ] **Step 3: Implement bounded spool import without transcript reads**
 
@@ -4150,6 +4156,20 @@ Add these blocks before `return parser` in `build_parser()`:
     status.set_defaults(handler=cmd_status)
 ```
 
+Replace the temporary unavailable-command paragraph in `SKILL.md` with:
+
+```markdown
+- No argument or `status`: run `status --installation
+  /Users/igyeongseob/.codex/skill-evolver/installation.json`.
+  Status is read-only: it opens SQLite in `mode=ro`, reads only aggregate queue
+  and spool metadata, does not import or delete spool files, and does not open
+  transcripts.
+- `maintain`: show the exact `maintain --installation
+  /Users/igyeongseob/.codex/skill-evolver/installation.json` command,
+  then request approval scoped to that exact command and global data root for
+  this invocation. Do not run it before approval.
+```
+
 - [ ] **Step 6: Run maintenance/status tests and verify GREEN**
 
 Run:
@@ -4173,11 +4193,12 @@ fits below the 64-KiB cap.
 ```bash
 git add \
   skill-evolver/skills/skill-evolver/scripts/evolver.py \
+  skill-evolver/skills/skill-evolver/SKILL.md \
   skill-evolver/skills/skill-evolver/tests/test_capture.py
 git commit -m "feat(skill-evolver): maintain session queue privacy"
 ```
 
-Expected: only the two listed files are committed.
+Expected: only the three listed files are committed.
 
 ---
 
