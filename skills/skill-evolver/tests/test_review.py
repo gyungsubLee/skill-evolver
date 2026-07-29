@@ -567,3 +567,482 @@ class TrustedCatalogTests(unittest.TestCase):
             "user-skill:long-description",
             [entry.identity for entry in rebuilt.entries],
         )
+
+
+class FrozenTranscriptTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.runtime = load_runtime()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name).resolve()
+        self.sessions = self.base / "sessions"
+        self.workspace = self.base / "workspace"
+        self.sessions.mkdir(mode=0o700)
+        self.workspace.mkdir(mode=0o700)
+        self.installation_path = self.runtime.initialize_runtime(
+            self.base / "data",
+            (self.sessions,),
+            {"capture_paused": False, "exclude_roots": []},
+        )
+        self.installation = self.runtime.load_installation(
+            self.installation_path
+        )
+        self.config = self.runtime.load_config(self.installation)
+        self.review = self.runtime.load_review_runtime()
+        self.fixture_lines = (
+            TEST_ROOT / "fixtures/review-current-layout.jsonl"
+        ).read_bytes().splitlines(keepends=True)
+
+    def capture_and_claim(
+        self,
+        lines: list[bytes],
+        *,
+        reviewed_boundary: int,
+        session_id: str = "fixture-session",
+        owner: str = "review-owner",
+        now: float = 2_000_000_000.0,
+    ):
+        transcript = self.sessions / f"{session_id}.jsonl"
+        transcript.write_bytes(b"".join(lines))
+        payload = {
+            "hook_event_name": "Stop",
+            "session_id": session_id,
+            "cwd": str(self.workspace),
+            "transcript_path": str(transcript),
+        }
+        event = self.runtime.parse_session_stop(
+            json.dumps(payload).encode(),
+            self.installation,
+            self.config,
+        )
+        assert event is not None
+        key = self.runtime.session_key(self.installation, session_id)
+        connection = self.runtime.open_database(self.installation)
+        self.runtime.upsert_session(
+            connection, event, key, self.config, now
+        )
+        connection.execute(
+            """
+            UPDATE review_items SET reviewed_boundary=?
+            WHERE session_key=?
+            """,
+            (reviewed_boundary, key),
+        )
+        self.runtime.claim_review_generation(
+            connection, key, owner, now + 1, self.config
+        )
+        row = connection.execute(
+            "SELECT * FROM review_items WHERE session_key=?",
+            (key,),
+        ).fetchone()
+        frozen = self.runtime.frozen_transcript_from_row(row)
+        return connection, transcript, frozen
+
+
+class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
+    def test_half_open_delta_reverse_context_and_provenance(self) -> None:
+        context_end = sum(len(line) for line in self.fixture_lines[:4])
+        connection, transcript, frozen = self.capture_and_claim(
+            self.fixture_lines[:13],
+            reviewed_boundary=context_end,
+        )
+        try:
+            with transcript.open("ab") as stream:
+                stream.write(self.fixture_lines[13])
+            exported = self.runtime.read_frozen_transcript(
+                self.installation,
+                frozen,
+                self.config,
+                self.review,
+            )
+        finally:
+            connection.close()
+        self.assertEqual(
+            [record.text for record in exported.records],
+            [
+                "sanitized context record",
+                "sanitized direct correction",
+                "sanitized assistant context",
+                "sanitized verification failure",
+                "sanitized custom output",
+            ],
+        )
+        self.assertEqual(
+            [record.source_kind for record in exported.records],
+            [
+                "user_direct",
+                "user_direct",
+                "assistant",
+                "tool_output",
+                "tool_output",
+            ],
+        )
+        self.assertEqual(exported.records[0].scope, "context_only")
+        self.assertFalse(exported.records[0].evidence_eligible)
+        self.assertTrue(
+            all(
+                record.scope == "delta"
+                and record.evidence_eligible
+                for record in exported.records[1:]
+            )
+        )
+        canonical = self.runtime.canonical_json_bytes(
+            [
+                {
+                    "source_kind": record.source_kind,
+                    "text": record.text,
+                    "evidence_eligible": record.evidence_eligible,
+                    "scope": record.scope,
+                }
+                for record in exported.records
+            ]
+        )
+        self.assertEqual(
+            exported.canonical_records_bytes, len(canonical)
+        )
+        self.assertEqual(
+            exported.delta_source_bytes,
+            frozen.frozen_to - frozen.frozen_from,
+        )
+        self.assertLessEqual(
+            exported.delta_source_bytes + exported.context_source_bytes,
+            2_097_152,
+        )
+        self.assertFalse(exported.read_path_changed)
+        self.assertNotIn(
+            "sanitized unread suffix",
+            [record.text for record in exported.records],
+        )
+
+    def test_initial_and_repeated_session_meta_use_session_hmac(self) -> None:
+        context_end = sum(len(line) for line in self.fixture_lines[:4])
+        connection, _, frozen = self.capture_and_claim(
+            self.fixture_lines[:13],
+            reviewed_boundary=context_end,
+        )
+        try:
+            exported = self.runtime.read_frozen_transcript(
+                self.installation,
+                frozen,
+                self.config,
+                self.review,
+            )
+            self.assertGreater(len(exported.records), 0)
+        finally:
+            connection.close()
+
+        mismatched = list(self.fixture_lines[:13])
+        mismatched[0] = mismatched[0].replace(
+            b"fixture-session", b"fixture-session-mismatch"
+        )
+        mismatched[4] = mismatched[4].replace(
+            b"fixture-session", b"foreign-session"
+        )
+        connection, _, frozen = self.capture_and_claim(
+            mismatched,
+            reviewed_boundary=sum(
+                len(line) for line in mismatched[:4]
+            ),
+            session_id="fixture-session-mismatch",
+        )
+        try:
+            with self.assertRaises(
+                self.runtime.TranscriptAdapterError
+            ) as raised:
+                self.runtime.read_frozen_transcript(
+                    self.installation,
+                    frozen,
+                    self.config,
+                    self.review,
+                )
+            self.assertEqual(raised.exception.code, "unsupported_transcript")
+            self.assertFalse(raised.exception.retryable)
+        finally:
+            connection.close()
+
+        wrong_initial = list(self.fixture_lines[:13])
+        wrong_initial[0] = wrong_initial[0].replace(
+            b"fixture-session", b"foreign-session"
+        )
+        connection, _, frozen = self.capture_and_claim(
+            wrong_initial,
+            reviewed_boundary=0,
+            session_id="fixture-session-wrong-initial",
+        )
+        try:
+            with self.assertRaises(
+                self.runtime.TranscriptAdapterError
+            ) as raised:
+                self.runtime.read_frozen_transcript(
+                    self.installation,
+                    frozen,
+                    self.config,
+                    self.review,
+                )
+            self.assertEqual(raised.exception.code, "unsupported_transcript")
+            self.assertFalse(raised.exception.retryable)
+        finally:
+            connection.close()
+
+    def test_lone_surrogate_session_meta_is_typed_terminal(
+        self,
+    ) -> None:
+        session_id = "surrogate-session-meta"
+        header = (
+            b'{"type":"session_meta","payload":'
+            b'{"session_id":"\\ud800"}}\n'
+        )
+        connection, _, frozen = self.capture_and_claim(
+            [header, self.fixture_lines[5]],
+            reviewed_boundary=0,
+            session_id=session_id,
+        )
+        try:
+            with self.assertRaises(
+                self.runtime.TranscriptAdapterError
+            ) as raised:
+                self.runtime.read_frozen_transcript(
+                    self.installation,
+                    frozen,
+                    self.config,
+                    self.review,
+                )
+            self.assertEqual(
+                raised.exception.code,
+                "unsupported_transcript",
+            )
+            self.assertFalse(raised.exception.retryable)
+        finally:
+            connection.close()
+
+    def test_lone_surrogate_export_text_is_typed_terminal(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "message",
+                b'{"type":"response_item","payload":'
+                b'{"type":"message","role":"user","content":'
+                b'[{"type":"input_text","text":"\\ud800"}]}}\n',
+            ),
+            (
+                "function_call_output",
+                b'{"type":"response_item","payload":'
+                b'{"type":"function_call_output",'
+                b'"output":"\\ud800"}}\n',
+            ),
+            (
+                "custom_tool_call_output",
+                b'{"type":"response_item","payload":'
+                b'{"type":"custom_tool_call_output",'
+                b'"output":"\\ud800"}}\n',
+            ),
+        )
+        for item_type, unsafe in cases:
+            with self.subTest(item_type=item_type):
+                session_id = f"surrogate-{item_type}"
+                header = (
+                    b'{"type":"session_meta","payload":'
+                    b'{"session_id":"'
+                    + session_id.encode("utf-8")
+                    + b'"}}\n'
+                )
+                connection, _, frozen = self.capture_and_claim(
+                    [header, unsafe],
+                    reviewed_boundary=len(header),
+                    session_id=session_id,
+                )
+                try:
+                    with self.assertRaises(
+                        self.runtime.TranscriptAdapterError
+                    ) as raised:
+                        self.runtime.read_frozen_transcript(
+                            self.installation,
+                            frozen,
+                            self.config,
+                            self.review,
+                        )
+                    self.assertEqual(
+                        raised.exception.code,
+                        "unsupported_transcript",
+                    )
+                    self.assertFalse(raised.exception.retryable)
+                finally:
+                    connection.close()
+
+        record = self.runtime.TranscriptRecord(
+            source_kind="user_direct",
+            text=chr(0xD800),
+            evidence_eligible=True,
+            scope="delta",
+            byte_start=0,
+            byte_end=1,
+        )
+        with self.assertRaises(
+            self.runtime.TranscriptAdapterError
+        ) as canonical:
+            self.runtime._canonical_transcript_records((record,))
+        self.assertEqual(
+            canonical.exception.code,
+            "unsupported_transcript",
+        )
+        self.assertFalse(canonical.exception.retryable)
+
+    def test_unknown_telemetry_is_ignored_but_unknown_evidence_fails(self) -> None:
+        safe = [
+            self.fixture_lines[0],
+            b'{"type":"future_telemetry","payload":{"counter":9}}\n',
+            self.fixture_lines[5],
+        ]
+        connection, _, frozen = self.capture_and_claim(
+            safe, reviewed_boundary=len(safe[0])
+        )
+        try:
+            exported = self.runtime.read_frozen_transcript(
+                self.installation,
+                frozen,
+                self.config,
+                self.review,
+            )
+            self.assertEqual(
+                [record.text for record in exported.records],
+                ["sanitized direct correction"],
+            )
+        finally:
+            connection.close()
+
+        hostile = [
+            self.fixture_lines[0].replace(
+                b"fixture-session", b"unknown-evidence-session"
+            ),
+            b'{"type":"future_record","payload":{"content":"unknown"}}\n',
+        ]
+        connection, _, frozen = self.capture_and_claim(
+            hostile,
+            reviewed_boundary=len(hostile[0]),
+            session_id="unknown-evidence-session",
+        )
+        try:
+            with self.assertRaises(
+                self.runtime.TranscriptAdapterError
+            ) as raised:
+                self.runtime.read_frozen_transcript(
+                    self.installation,
+                    frozen,
+                    self.config,
+                    self.review,
+                )
+            self.assertEqual(raised.exception.code, "unsupported_transcript")
+            self.assertFalse(raised.exception.retryable)
+        finally:
+            connection.close()
+
+    def test_evidence_shape_depth_and_node_overflow_are_terminal(
+        self,
+    ) -> None:
+        deep_payload: object = {"leaf": 0}
+        for _ in range(350):
+            deep_payload = {"nested": deep_payload}
+        cases = (
+            ("deep-evidence-shape", deep_payload),
+            (
+                "wide-evidence-shape",
+                {"values": list(range(4_097))},
+            ),
+        )
+        for session_id, payload in cases:
+            with self.subTest(session_id=session_id):
+                header = (
+                    json.dumps(
+                        {
+                            "type": "session_meta",
+                            "payload": {"session_id": session_id},
+                        },
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+                unknown = (
+                    json.dumps(
+                        {
+                            "type": "future_record",
+                            "payload": payload,
+                        },
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+                connection, _, frozen = self.capture_and_claim(
+                    [header, unknown],
+                    reviewed_boundary=len(header),
+                    session_id=session_id,
+                )
+                try:
+                    with self.assertRaises(
+                        self.runtime.TranscriptAdapterError
+                    ) as raised:
+                        self.runtime.read_frozen_transcript(
+                            self.installation,
+                            frozen,
+                            self.config,
+                            self.review,
+                        )
+                    self.assertEqual(
+                        raised.exception.code,
+                        "unsupported_transcript",
+                    )
+                    self.assertFalse(raised.exception.retryable)
+                finally:
+                    connection.close()
+
+    def test_context_yields_to_exact_delta_for_bytes_and_records(self) -> None:
+        header = (
+            b'{"type":"session_meta","payload":'
+            b'{"session_id":"bounded-context"}}\n'
+        )
+        context = [
+            (
+                b'{"type":"response_item","payload":{"type":"message",'
+                b'"role":"assistant","content":[{"type":"output_text",'
+                + f'"text":"context-{index:03d}"'.encode()
+                + b"}]}}\n"
+            )
+            for index in range(150)
+        ]
+        delta = (
+            b'{"type":"response_item","payload":{"type":"message",'
+            b'"role":"user","content":[{"type":"input_text",'
+            b'"text":"delta-record"}]}}\n'
+        )
+        reviewed = len(header) + sum(len(line) for line in context)
+        connection, _, frozen = self.capture_and_claim(
+            [header, *context, delta],
+            reviewed_boundary=reviewed,
+            session_id="bounded-context",
+        )
+        limited = replace(
+            self.config,
+            max_transcript_bytes=len(delta) + len(context[-1]),
+            max_transcript_records=2,
+        )
+        try:
+            exported = self.runtime.read_frozen_transcript(
+                self.installation,
+                frozen,
+                limited,
+                self.review,
+            )
+        finally:
+            connection.close()
+        self.assertEqual(
+            [record.text for record in exported.records],
+            ["context-149", "delta-record"],
+        )
+        self.assertEqual(
+            [record.scope for record in exported.records],
+            ["context_only", "delta"],
+        )
+        self.assertLessEqual(
+            exported.delta_source_bytes + exported.context_source_bytes,
+            limited.max_transcript_bytes,
+        )

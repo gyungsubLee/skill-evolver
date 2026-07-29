@@ -20,7 +20,7 @@ import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence, TypedDict
 from urllib.parse import quote
 
 VERSION = "skill-evolver 0.1.0"
@@ -269,6 +269,648 @@ class CatalogAdapterError(ValueError):
     def __init__(self, code: str):
         self.code = code
         super().__init__(code)
+
+
+SESSION_META_MAX_BYTES = 65_536
+TRANSCRIPT_EVIDENCE_SHAPE_MAX_NODES = 4_096
+TRANSCRIPT_EVIDENCE_SHAPE_MAX_DEPTH = 64
+TRANSCRIPT_RETRYABLE_CODES = frozenset(
+    {"transcript_missing", "transcript_changed", "transcript_partial"}
+)
+TRANSCRIPT_TERMINAL_CODES = frozenset(
+    {"oversized_session", "unsupported_transcript"}
+)
+
+
+@dataclass(frozen=True)
+class TranscriptLocator:
+    path: Path
+    size: int
+    mtime_ns: int
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class FrozenTranscript:
+    review_item_id: int
+    session_key: str
+    generation: int
+    transcript_epoch: int
+    frozen_from: int
+    frozen_to: int
+    locator: TranscriptLocator
+    read_path: Path
+
+
+@dataclass(frozen=True)
+class TranscriptRecord:
+    source_kind: str
+    text: str
+    evidence_eligible: bool
+    scope: str
+    byte_start: int
+    byte_end: int
+
+
+@dataclass(frozen=True)
+class TranscriptExport:
+    records: tuple[TranscriptRecord, ...]
+    delta_source_bytes: int
+    context_source_bytes: int
+    canonical_records_bytes: int
+    read_path_changed: bool
+
+
+class TranscriptAdapterError(ValueError):
+    def __init__(self, code: str, *, retryable: bool):
+        self.code = code
+        self.retryable = retryable
+        super().__init__(code)
+
+
+def _transcript_error(code: str) -> TranscriptAdapterError:
+    if code in TRANSCRIPT_RETRYABLE_CODES:
+        return TranscriptAdapterError(code, retryable=True)
+    if code in TRANSCRIPT_TERMINAL_CODES:
+        return TranscriptAdapterError(code, retryable=False)
+    raise ValueError("invalid_transcript_error_code")
+
+
+def transcript_locator_payload(
+    locator: TranscriptLocator,
+) -> dict[str, object]:
+    return {
+        "path": str(locator.path),
+        "size": locator.size,
+        "mtime_ns": locator.mtime_ns,
+        "device": locator.device,
+        "inode": locator.inode,
+    }
+
+
+def transcript_locator_digest(locator: TranscriptLocator) -> str:
+    return sha256_json(transcript_locator_payload(locator))
+
+
+def frozen_transcript_from_row(row: sqlite3.Row) -> FrozenTranscript:
+    try:
+        locator_payload = json.loads(str(row["frozen_locator_json"]))
+        if (
+            not isinstance(locator_payload, dict)
+            or set(locator_payload)
+            != {"path", "size", "mtime_ns", "device", "inode"}
+        ):
+            raise ValueError("invalid_frozen_transcript")
+        locator = TranscriptLocator(
+            path=Path(locator_payload["path"]),
+            size=locator_payload["size"],
+            mtime_ns=locator_payload["mtime_ns"],
+            device=locator_payload["device"],
+            inode=locator_payload["inode"],
+        )
+        frozen = FrozenTranscript(
+            review_item_id=int(row["id"]),
+            session_key=str(row["session_key"]),
+            generation=int(row["generation"]),
+            transcript_epoch=int(row["frozen_epoch"]),
+            frozen_from=int(row["frozen_from"]),
+            frozen_to=int(row["frozen_to"]),
+            locator=locator,
+            read_path=Path(str(row["transcript_path"])),
+        )
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        raise ValueError("invalid_frozen_transcript") from None
+    integers = (
+        frozen.review_item_id,
+        frozen.generation,
+        frozen.transcript_epoch,
+        frozen.frozen_from,
+        frozen.frozen_to,
+        locator.size,
+        locator.mtime_ns,
+        locator.device,
+        locator.inode,
+    )
+    if (
+        frozen.review_item_id < 1
+        or frozen.generation < 1
+        or not frozen.session_key
+        or not frozen.read_path.is_absolute()
+        or not locator.path.is_absolute()
+        or any(type(value) is not int or value < 0 for value in integers)
+        or frozen.frozen_to <= frozen.frozen_from
+        or locator.size != frozen.frozen_to
+    ):
+        raise ValueError("invalid_frozen_transcript")
+    return frozen
+
+
+def transcript_adapter_contract(
+    runtime: ReviewRuntime,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "format": "current-codex-jsonl-v1",
+        "boundary": "half-open",
+        "session_binding": "session-meta-hmac",
+        "text_encoding": "strict-utf-8",
+        "read_past_frozen_to": False,
+        "context": "bounded-reverse-complete-records",
+        "content_identity_fields": [
+            "size",
+            "mtime_ns",
+            "device",
+            "inode",
+        ],
+        "source_kinds": ["assistant", "tool_output", "user_direct"],
+        "evidence_scope": "delta-only",
+        "retryable_codes": sorted(TRANSCRIPT_RETRYABLE_CODES),
+        "terminal_codes": sorted(TRANSCRIPT_TERMINAL_CODES),
+        "limits": {
+            "session_bytes": runtime.max_transcript_bytes,
+            "session_records": runtime.max_transcript_records,
+            "session_meta_bytes": SESSION_META_MAX_BYTES,
+            "evidence_shape_nodes": (
+                TRANSCRIPT_EVIDENCE_SHAPE_MAX_NODES
+            ),
+            "evidence_shape_depth": (
+                TRANSCRIPT_EVIDENCE_SHAPE_MAX_DEPTH
+            ),
+        },
+        "recognized": {
+            "export": [
+                "response_item/message/assistant",
+                "response_item/message/user",
+                "response_item/function_call_output",
+                "response_item/custom_tool_call_output",
+            ],
+            "ignore": [
+                "agent_message",
+                "compacted",
+                "event_msg",
+                "inter_agent_communication_metadata",
+                "response_item/agent_message",
+                "response_item/function_call",
+                "response_item/reasoning",
+                "response_item/tool_search_call",
+                "response_item/tool_search_output",
+                "tool_search_call",
+                "tool_search_output",
+                "turn_context",
+                "world_state",
+            ],
+        },
+    }
+
+
+def transcript_adapter_digest(runtime: ReviewRuntime) -> str:
+    return sha256_json(transcript_adapter_contract(runtime))
+
+
+TRANSCRIPT_IGNORED_TYPES = frozenset(
+    {
+        "agent_message",
+        "compacted",
+        "event_msg",
+        "inter_agent_communication_metadata",
+        "tool_search_call",
+        "tool_search_output",
+        "turn_context",
+        "world_state",
+    }
+)
+RESPONSE_ITEM_IGNORED_TYPES = frozenset(
+    {
+        "agent_message",
+        "function_call",
+        "reasoning",
+        "tool_search_call",
+        "tool_search_output",
+    }
+)
+
+
+class TranscriptRecordMapping(TypedDict):
+    source_kind: str
+    text: str
+    evidence_eligible: bool
+    scope: str
+
+
+def _validated_transcript_text(
+    value: object,
+    *,
+    maximum_bytes: Optional[int] = None,
+    allow_empty: bool = True,
+) -> str:
+    if not isinstance(value, str) or (not allow_empty and not value):
+        raise _transcript_error("unsupported_transcript")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise _transcript_error("unsupported_transcript") from None
+    if maximum_bytes is not None and len(encoded) > maximum_bytes:
+        raise _transcript_error("unsupported_transcript")
+    return value
+
+
+def _canonical_transcript_records(
+    records: Sequence[TranscriptRecord],
+) -> bytes:
+    payload: list[TranscriptRecordMapping] = [
+        {
+            "source_kind": _validated_transcript_text(
+                record.source_kind
+            ),
+            "text": _validated_transcript_text(record.text),
+            "evidence_eligible": record.evidence_eligible,
+            "scope": _validated_transcript_text(record.scope),
+        }
+        for record in records
+    ]
+    try:
+        return canonical_json_bytes(payload)
+    except UnicodeEncodeError:
+        raise _transcript_error("unsupported_transcript") from None
+
+
+def _contains_evidence_shape(value: object) -> bool:
+    pending: list[tuple[object, int]] = [(value, 0)]
+    scheduled = 1
+    while pending:
+        current, depth = pending.pop()
+        if depth > TRANSCRIPT_EVIDENCE_SHAPE_MAX_DEPTH:
+            raise _transcript_error("unsupported_transcript")
+        if isinstance(current, dict):
+            role = current.get("role")
+            if role in {"user", "assistant"}:
+                return True
+            if any(
+                key in current
+                for key in ("message", "content", "output")
+            ):
+                return True
+            children = current.values()
+        elif isinstance(current, list):
+            children = current
+        else:
+            continue
+        for child in children:
+            scheduled += 1
+            if scheduled > TRANSCRIPT_EVIDENCE_SHAPE_MAX_NODES:
+                raise _transcript_error("unsupported_transcript")
+            child_depth = depth + 1
+            if child_depth > TRANSCRIPT_EVIDENCE_SHAPE_MAX_DEPTH:
+                raise _transcript_error("unsupported_transcript")
+            pending.append((child, child_depth))
+    return False
+
+
+def _validate_session_meta(
+    value: object,
+    installation: Installation,
+    expected_session_key: str,
+) -> None:
+    if not isinstance(value, dict):
+        raise _transcript_error("unsupported_transcript")
+    raw_session_id = _validated_transcript_text(
+        value.get("session_id"),
+        maximum_bytes=512,
+        allow_empty=False,
+    )
+    if not hmac.compare_digest(
+        session_key(installation, raw_session_id),
+        expected_session_key,
+    ):
+        raise _transcript_error("unsupported_transcript")
+
+
+def _message_texts(payload: Mapping[str, object]) -> list[str]:
+    content = payload.get("content")
+    if not isinstance(content, list):
+        raise _transcript_error("unsupported_transcript")
+    texts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            raise _transcript_error("unsupported_transcript")
+        item_type = item.get("type")
+        text = item.get("text")
+        if item_type in {"input_text", "output_text"}:
+            texts.append(_validated_transcript_text(text))
+        elif item_type == "encrypted_content":
+            continue
+        else:
+            raise _transcript_error("unsupported_transcript")
+    return texts
+
+
+def _classify_transcript_object(
+    value: object,
+    installation: Installation,
+    frozen: FrozenTranscript,
+    *,
+    evidence_eligible: bool,
+    byte_start: int,
+    byte_end: int,
+) -> list[TranscriptRecord]:
+    if not isinstance(value, dict):
+        if evidence_eligible:
+            raise _transcript_error("unsupported_transcript")
+        return []
+    record_type = value.get("type")
+    payload = value.get("payload")
+    if record_type == "session_meta":
+        _validate_session_meta(
+            payload, installation, frozen.session_key
+        )
+        return []
+    if record_type in TRANSCRIPT_IGNORED_TYPES:
+        return []
+    if record_type != "response_item":
+        if evidence_eligible and _contains_evidence_shape(value):
+            raise _transcript_error("unsupported_transcript")
+        return []
+    if not isinstance(payload, dict):
+        if evidence_eligible:
+            raise _transcript_error("unsupported_transcript")
+        return []
+    item_type = payload.get("type")
+    if item_type in RESPONSE_ITEM_IGNORED_TYPES:
+        return []
+    scope = "delta" if evidence_eligible else "context_only"
+    if item_type == "message":
+        role = payload.get("role")
+        if role in {"developer", "system"}:
+            return []
+        if role not in {"user", "assistant"}:
+            if evidence_eligible and _contains_evidence_shape(payload):
+                raise _transcript_error("unsupported_transcript")
+            return []
+        source_kind = "user_direct" if role == "user" else "assistant"
+        return [
+            TranscriptRecord(
+                source_kind=source_kind,
+                text=text,
+                evidence_eligible=evidence_eligible,
+                scope=scope,
+                byte_start=byte_start,
+                byte_end=byte_end,
+            )
+            for text in _message_texts(payload)
+        ]
+    if item_type in {
+        "function_call_output",
+        "custom_tool_call_output",
+    }:
+        output_value = payload.get("output")
+        if not isinstance(output_value, str):
+            if evidence_eligible:
+                raise _transcript_error("unsupported_transcript")
+            return []
+        output = _validated_transcript_text(output_value)
+        return [
+            TranscriptRecord(
+                source_kind="tool_output",
+                text=output,
+                evidence_eligible=evidence_eligible,
+                scope=scope,
+                byte_start=byte_start,
+                byte_end=byte_end,
+            )
+        ]
+    if evidence_eligible:
+        raise _transcript_error("unsupported_transcript")
+    return []
+
+
+def _parse_jsonl_records(
+    raw: bytes,
+    base_offset: int,
+    installation: Installation,
+    frozen: FrozenTranscript,
+    *,
+    evidence_eligible: bool,
+) -> list[TranscriptRecord]:
+    records: list[TranscriptRecord] = []
+    cursor = 0
+    for line in raw.splitlines(keepends=True):
+        if not line.endswith(b"\n"):
+            raise _transcript_error(
+                "transcript_partial"
+                if evidence_eligible
+                else "unsupported_transcript"
+            )
+        try:
+            value = json.loads(line)
+        except (
+            RecursionError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ):
+            if evidence_eligible:
+                raise _transcript_error("unsupported_transcript") from None
+            cursor += len(line)
+            continue
+        records.extend(
+            _classify_transcript_object(
+                value,
+                installation,
+                frozen,
+                evidence_eligible=evidence_eligible,
+                byte_start=base_offset + cursor,
+                byte_end=base_offset + cursor + len(line),
+            )
+        )
+        cursor += len(line)
+    return records
+
+
+def _read_exact_at(
+    descriptor: int,
+    start: int,
+    length: int,
+) -> bytes:
+    chunks: list[bytes] = []
+    offset = start
+    remaining = length
+    while remaining:
+        chunk = os.pread(descriptor, remaining, offset)
+        if not chunk:
+            raise _transcript_error("transcript_changed")
+        chunks.append(chunk)
+        offset += len(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _initial_session_meta(
+    descriptor: int,
+    installation: Installation,
+    frozen: FrozenTranscript,
+) -> None:
+    length = min(frozen.frozen_to, SESSION_META_MAX_BYTES + 1)
+    prefix = _read_exact_at(descriptor, 0, length)
+    newline = prefix.find(b"\n")
+    if newline < 0 or newline + 1 > SESSION_META_MAX_BYTES:
+        raise _transcript_error("unsupported_transcript")
+    line = prefix[: newline + 1]
+    try:
+        value = json.loads(line)
+    except (
+        RecursionError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ):
+        raise _transcript_error("unsupported_transcript") from None
+    if not isinstance(value, dict) or value.get("type") != "session_meta":
+        raise _transcript_error("unsupported_transcript")
+    _validate_session_meta(
+        value.get("payload"), installation, frozen.session_key
+    )
+
+
+def _bounded_reverse_context(
+    descriptor: int,
+    frozen_from: int,
+    maximum: int,
+) -> tuple[int, bytes]:
+    if frozen_from <= 0 or maximum <= 0:
+        return frozen_from, b""
+    start = max(0, frozen_from - maximum)
+    raw = _read_exact_at(descriptor, start, frozen_from - start)
+    if start:
+        preceding = _read_exact_at(descriptor, start - 1, 1)
+        if preceding != b"\n":
+            newline = raw.find(b"\n")
+            if newline < 0:
+                return frozen_from, b""
+            start += newline + 1
+            raw = raw[newline + 1 :]
+    if raw and not raw.endswith(b"\n"):
+        return frozen_from, b""
+    return start, raw
+
+
+def _open_frozen_transcript(
+    installation: Installation,
+    frozen: FrozenTranscript,
+) -> int:
+    try:
+        requested = frozen.read_path
+        if (
+            requested.is_symlink()
+            or requested.resolve(strict=True) != requested
+            or not within(requested, installation.transcript_roots)
+        ):
+            raise _transcript_error("transcript_changed")
+        return os.open(
+            str(requested),
+            os.O_RDONLY
+            | os.O_NONBLOCK
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except FileNotFoundError:
+        raise _transcript_error("transcript_missing") from None
+    except TranscriptAdapterError:
+        raise
+    except OSError:
+        raise _transcript_error("transcript_changed") from None
+
+
+def _stable_frozen_stat(
+    info: os.stat_result,
+    frozen: FrozenTranscript,
+) -> tuple[int, int, int, int]:
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or (info.st_dev, info.st_ino)
+        != (frozen.locator.device, frozen.locator.inode)
+        or info.st_size < frozen.frozen_to
+        or (
+            info.st_size == frozen.locator.size
+            and info.st_mtime_ns != frozen.locator.mtime_ns
+        )
+    ):
+        raise _transcript_error("transcript_changed")
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+    )
+
+
+def read_frozen_transcript(
+    installation: Installation,
+    frozen: FrozenTranscript,
+    config: Config,
+    runtime: ReviewRuntime,
+) -> TranscriptExport:
+    byte_limit = min(
+        config.max_transcript_bytes, runtime.max_transcript_bytes
+    )
+    record_limit = min(
+        config.max_transcript_records, runtime.max_transcript_records
+    )
+    delta_length = frozen.frozen_to - frozen.frozen_from
+    if delta_length > byte_limit:
+        raise _transcript_error("oversized_session")
+    descriptor = _open_frozen_transcript(installation, frozen)
+    try:
+        before = _stable_frozen_stat(os.fstat(descriptor), frozen)
+        _initial_session_meta(descriptor, installation, frozen)
+        delta = _read_exact_at(
+            descriptor, frozen.frozen_from, delta_length
+        )
+        if not delta.endswith(b"\n"):
+            raise _transcript_error("transcript_partial")
+        delta_records = _parse_jsonl_records(
+            delta,
+            frozen.frozen_from,
+            installation,
+            frozen,
+            evidence_eligible=True,
+        )
+        if len(delta_records) > record_limit:
+            raise _transcript_error("oversized_session")
+        context_start, context = _bounded_reverse_context(
+            descriptor,
+            frozen.frozen_from,
+            byte_limit - len(delta),
+        )
+        context_records = _parse_jsonl_records(
+            context,
+            context_start,
+            installation,
+            frozen,
+            evidence_eligible=False,
+        )
+        remaining_records = record_limit - len(delta_records)
+        if len(context_records) > remaining_records:
+            context_records = context_records[-remaining_records:]
+            if not remaining_records:
+                context_records = []
+        after = _stable_frozen_stat(os.fstat(descriptor), frozen)
+        if after != before:
+            raise _transcript_error("transcript_changed")
+    finally:
+        os.close(descriptor)
+    records = tuple([*context_records, *delta_records])
+    canonical = _canonical_transcript_records(records)
+    return TranscriptExport(
+        records=records,
+        delta_source_bytes=len(delta),
+        context_source_bytes=len(context),
+        canonical_records_bytes=len(canonical),
+        read_path_changed=frozen.read_path != frozen.locator.path,
+    )
 
 
 @dataclass(frozen=True)

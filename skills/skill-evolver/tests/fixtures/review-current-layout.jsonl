@@ -1,0 +1,14 @@
+{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"session_id":"fixture-session"}}
+{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"sanitized context record"}]}}
+{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","count":7}}
+{"timestamp":"2026-01-01T00:00:03Z","type":"turn_context","payload":{"cwd":"/sanitized/workspace"}}
+{"timestamp":"2026-01-01T00:00:04Z","type":"session_meta","payload":{"session_id":"fixture-session"}}
+{"timestamp":"2026-01-01T00:00:05Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"sanitized direct correction"}]}}
+{"timestamp":"2026-01-01T00:00:06Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"sanitized assistant context"}]}}
+{"timestamp":"2026-01-01T00:00:07Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-sanitized","output":"sanitized verification failure"}}
+{"timestamp":"2026-01-01T00:00:08Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"custom-sanitized","output":"sanitized custom output"}}
+{"timestamp":"2026-01-01T00:00:09Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"ignored reasoning"}]}}
+{"timestamp":"2026-01-01T00:00:10Z","type":"event_msg","payload":{"type":"user_message","message":"ignored duplicate"}}
+{"timestamp":"2026-01-01T00:00:11Z","type":"world_state","payload":{"state":"ignored telemetry"}}
+{"timestamp":"2026-01-01T00:00:12Z","type":"future_telemetry","payload":{"counter":1}}
+{"timestamp":"2026-01-01T00:00:13Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"sanitized unread suffix"}]}}
