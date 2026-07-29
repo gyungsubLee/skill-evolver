@@ -1,7 +1,7 @@
 {
   "name": "skill-evolver",
-  "version": "0.0.2",
-  "description": "Probe Codex Stop Hook and transcript feasibility before building Skill Evolver.",
+  "version": "0.1.0",
+  "description": "Queue bounded Codex sessions for explicit skill-improvement review.",
   "skills": "./skills/",
   "hooks": "./hooks/hooks.json"
 }

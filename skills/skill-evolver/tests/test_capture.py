@@ -933,5 +933,58 @@ class SessionCaptureTests(unittest.TestCase):
             self.assertEqual(process.stderr, b"")
 
 
+class ProductionSurfaceTests(unittest.TestCase):
+    def test_only_main_stop_is_an_automatic_writer(self) -> None:
+        manifest = json.loads(
+            (PLUGIN_ROOT / ".codex-plugin/plugin.json").read_text(encoding="utf-8")
+        )
+        hooks = json.loads(
+            (PLUGIN_ROOT / "hooks/hooks.json").read_text(encoding="utf-8")
+        )
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        runtime = json.loads(
+            (SKILL_ROOT / "references/runtime.json").read_text(encoding="utf-8")
+        )
+        command = hooks["hooks"]["Stop"][0]["hooks"][0]["command"]
+        marketplace = json.loads(
+            (
+                PLUGIN_ROOT.parent / ".agents/plugins/marketplace.json"
+            ).read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(marketplace["name"], "skill-evolver-dev")
+        self.assertEqual(
+            marketplace["plugins"],
+            [
+                {
+                    "name": "skill-evolver",
+                    "source": {
+                        "source": "local",
+                        "path": "./skill-evolver",
+                    },
+                    "policy": {
+                        "installation": "AVAILABLE",
+                        "authentication": "ON_INSTALL",
+                    },
+                    "category": "Developer Tools",
+                }
+            ],
+        )
+        self.assertEqual(manifest["version"], "0.1.0")
+        self.assertEqual(set(hooks["hooks"]), {"Stop"})
+        self.assertNotIn("matcher", hooks["hooks"]["Stop"][0])
+        self.assertIn(" enqueue-stop ", command)
+        self.assertNotIn("probe-", command)
+        self.assertEqual(
+            runtime["installation"],
+            "/Users/igyeongseob/.codex/skill-evolver/installation.json",
+        )
+        self.assertIn("Status is read-only", skill)
+        self.assertIn("exact command and global data root", skill)
+        self.assertIn("No persistent writable-root grant", skill)
+        self.assertIn("Never invoke after an ordinary task", skill)
+        self.assertNotIn("SubagentStop", json.dumps(hooks))
+
+
 if __name__ == "__main__":
     unittest.main()
