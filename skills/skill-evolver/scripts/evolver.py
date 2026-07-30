@@ -3351,6 +3351,8 @@ def candidate_evidence_aggregate_key(candidate_id: object) -> str:
 CANDIDATE_SESSION_LINK_MAX_BYTES = 512
 CANDIDATE_EVIDENCE_AGGREGATE_MAX_BYTES = 4_096
 CANDIDATE_REDACTION_VALUE_MAX_BYTES = 4_096
+CANDIDATE_TARGET_PATH_MAX_BYTES = 4_096
+CANDIDATE_INSPECT_EVIDENCE_MAX = 200
 
 
 def redacted_marker(value: object) -> str:
@@ -3648,6 +3650,336 @@ def display_id(prefix: object, value: object) -> str:
     ):
         raise ValueError("invalid_display_id")
     return f"{prefix}-{value:03d}"
+
+
+def parse_candidate_display_id(value: object) -> int:
+    if type(value) is not str:
+        raise ValueError("invalid_candidate_id")
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError:
+        raise ValueError("invalid_candidate_id") from None
+    if (
+        re.fullmatch(
+            r"C-(?:00[1-9]|0[1-9][0-9]|[1-9][0-9]{2,})",
+            value,
+        )
+        is None
+        or len(encoded) > 32
+    ):
+        raise ValueError("invalid_candidate_id")
+    candidate_id = int(value[2:])
+    if (
+        candidate_id > SQLITE_INTEGER_MAX
+        or display_id("C", candidate_id) != value
+    ):
+        raise ValueError("invalid_candidate_id")
+    return candidate_id
+
+
+def _live_candidate_text(
+    row: sqlite3.Row,
+    key: str,
+    maximum: int,
+) -> str:
+    value = row[key]
+    if type(value) is not str:
+        raise ValueError("candidate_state_corrupt")
+    try:
+        normalized = normalize_candidate_text(value, maximum)
+    except ValueError:
+        raise ValueError("candidate_state_corrupt") from None
+    if normalized != value:
+        raise ValueError("candidate_state_corrupt")
+    return value
+
+
+def _redacted_candidate_marker(
+    row: sqlite3.Row,
+    key: str,
+) -> str:
+    value = row[key]
+    if (
+        type(value) is not str
+        or re.fullmatch(r"redacted:[0-9a-f]{64}", value) is None
+    ):
+        raise ValueError("candidate_state_corrupt")
+    return value
+
+
+def _candidate_timestamp(row: sqlite3.Row, key: str) -> str:
+    value = row[key]
+    if type(value) is not str:
+        raise ValueError("candidate_state_corrupt")
+    try:
+        parse_iso_utc(value)
+    except ValueError:
+        raise ValueError("candidate_state_corrupt") from None
+    return value
+
+
+def inspect_candidate(
+    connection: sqlite3.Connection,
+    candidate_display_id: str,
+) -> dict[str, object]:
+    candidate_id = parse_candidate_display_id(candidate_display_id)
+    row = connection.execute(
+        "SELECT * FROM candidates WHERE id=?",
+        (candidate_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError("candidate_not_found")
+    status = row["status"]
+    category = row["problem_category"]
+    occurrence = row["occurrence_count"]
+    target_identity = row["target_identity"]
+    target_path = row["target_path"]
+    tombstone = row["tombstone_until"]
+    if type(target_identity) is not str or not target_identity:
+        raise ValueError("candidate_state_corrupt")
+    try:
+        target_identity_size = len(target_identity.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise ValueError("candidate_state_corrupt") from None
+    if (
+        type(status) is not str
+        or status
+        not in {
+            "proposed",
+            "prepared",
+            "deferred",
+            "rejected",
+            "stale",
+        }
+        or type(category) is not str
+        or category not in PROBLEM_CATEGORIES
+        or type(occurrence) is not int
+        or not 1 <= occurrence <= SQLITE_INTEGER_MAX
+        or target_identity_size > CATALOG_IDENTITY_MAX_BYTES
+    ):
+        raise ValueError("candidate_state_corrupt")
+    if status == "rejected":
+        if type(tombstone) is not str:
+            raise ValueError("candidate_state_corrupt")
+        try:
+            parse_iso_utc(tombstone)
+        except ValueError:
+            raise ValueError("candidate_state_corrupt") from None
+    elif tombstone is not None:
+        raise ValueError("candidate_state_corrupt")
+    first_seen = _candidate_timestamp(row, "first_seen_at")
+    last_seen = _candidate_timestamp(row, "last_seen_at")
+    updated = _candidate_timestamp(row, "updated_at")
+    if (
+        parse_iso_utc(first_seen) > parse_iso_utc(last_seen)
+        or parse_iso_utc(first_seen) > parse_iso_utc(updated)
+    ):
+        raise ValueError("candidate_state_corrupt")
+    if target_path is None:
+        if (
+            status not in {"stale", "rejected"}
+            or connection.execute(
+                """
+                SELECT 1 FROM candidate_evidence
+                WHERE candidate_id=? LIMIT 1
+                """,
+                (candidate_id,),
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("candidate_state_corrupt")
+        private = {
+            key: _redacted_candidate_marker(row, key)
+            for key in (
+                "target_locator",
+                "proposal_intent",
+                "problem_summary",
+                "proposal_summary",
+                "validation_plan",
+                "risk_level",
+            )
+        }
+    else:
+        if type(target_path) is not str:
+            raise ValueError("candidate_state_corrupt")
+        try:
+            target_path_size = len(target_path.encode("utf-8"))
+            parsed_target_path = Path(target_path)
+        except (UnicodeEncodeError, ValueError):
+            raise ValueError("candidate_state_corrupt") from None
+        if (
+            not 1
+            <= target_path_size
+            <= CANDIDATE_TARGET_PATH_MAX_BYTES
+            or "\x00" in target_path
+            or not parsed_target_path.is_absolute()
+            or ".." in parsed_target_path.parts
+            or str(parsed_target_path) != target_path
+            or type(row["risk_level"]) is not str
+            or row["risk_level"] not in RISK_LEVELS
+        ):
+            raise ValueError("candidate_state_corrupt")
+        private = {
+            "target_locator": _live_candidate_text(
+                row, "target_locator", 160
+            ),
+            "proposal_intent": _live_candidate_text(
+                row, "proposal_intent", 160
+            ),
+            "problem_summary": _live_candidate_text(
+                row, "problem_summary", 280
+            ),
+            "proposal_summary": _live_candidate_text(
+                row, "proposal_summary", 280
+            ),
+            "validation_plan": _live_candidate_text(
+                row, "validation_plan", 500
+            ),
+            "risk_level": row["risk_level"],
+        }
+    evidence_rows = connection.execute(
+        """
+        SELECT signal_type,source_kind,summary,created_at
+        FROM candidate_evidence
+        WHERE candidate_id=?
+        ORDER BY session_key,signal_type
+        LIMIT ?
+        """,
+        (candidate_id, CANDIDATE_INSPECT_EVIDENCE_MAX),
+    ).fetchall()
+    evidence = []
+    for item in evidence_rows:
+        signal_type = item["signal_type"]
+        source_kind = item["source_kind"]
+        summary = item["summary"]
+        created_at = item["created_at"]
+        if (
+            type(signal_type) is not str
+            or type(source_kind) is not str
+            or (signal_type, source_kind)
+            not in SIGNAL_SOURCE_PAIRS
+            or type(summary) is not str
+            or type(created_at) is not str
+        ):
+            raise ValueError("candidate_state_corrupt")
+        try:
+            normalized_summary = normalize_candidate_text(
+                summary, 280
+            )
+            parse_iso_utc(created_at)
+        except ValueError:
+            raise ValueError("candidate_state_corrupt") from None
+        if normalized_summary != summary:
+            raise ValueError("candidate_state_corrupt")
+        evidence.append(
+            {
+                "signal_type": signal_type,
+                "source_kind": source_kind,
+                "summary": summary,
+                "created_at": created_at,
+            }
+        )
+    evidence.sort(
+        key=lambda item: (
+            item["created_at"],
+            item["signal_type"],
+            item["source_kind"],
+        )
+    )
+    aggregate = load_candidate_evidence_aggregate(
+        connection, candidate_id
+    )
+    return {
+        "schema_version": 1,
+        "candidate_id": display_id("C", candidate_id),
+        "status": status,
+        "target_identity": target_identity,
+        "classification": {
+            "problem_category": category,
+            "target_locator": private["target_locator"],
+            "proposal_intent": private["proposal_intent"],
+        },
+        "problem_summary": private["problem_summary"],
+        "proposal_summary": private["proposal_summary"],
+        "validation_plan": private["validation_plan"],
+        "risk_level": private["risk_level"],
+        "occurrence_count": occurrence,
+        "first_seen_at": first_seen,
+        "last_seen_at": last_seen,
+        "updated_at": updated,
+        "tombstone_until": tombstone,
+        "evidence": evidence,
+        "evidence_aggregate": aggregate,
+    }
+
+
+def transition_candidate(
+    connection: sqlite3.Connection,
+    candidate_display_id: str,
+    action: str,
+    config: Config,
+    now: float,
+) -> dict[str, object]:
+    candidate_id = parse_candidate_display_id(candidate_display_id)
+    transitions = {
+        "defer": (("proposed",), "deferred"),
+        "resume": (("deferred",), "proposed"),
+        "reject": (
+            ("proposed", "deferred", "prepared"),
+            "rejected",
+        ),
+    }
+    if type(action) is not str or action not in transitions:
+        raise ValueError("invalid_candidate_transition")
+    sources, target = transitions[action]
+    marks = ",".join("?" for _ in sources)
+    tombstone = (
+        iso_utc(
+            now + config.rejected_tombstone_days * 86_400
+        )
+        if action == "reject"
+        else None
+    )
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        changed = connection.execute(
+            f"""
+            UPDATE candidates
+            SET status=?,updated_at=?,
+                tombstone_until=CASE
+                  WHEN ?='rejected' THEN ?
+                  ELSE tombstone_until
+                END
+            WHERE id=? AND status IN ({marks})
+              AND tombstone_until IS NULL
+            """,
+            (
+                target,
+                iso_utc(now),
+                target,
+                tombstone,
+                candidate_id,
+                *sources,
+            ),
+        ).rowcount
+        if changed != 1:
+            exists = connection.execute(
+                "SELECT 1 FROM candidates WHERE id=?",
+                (candidate_id,),
+            ).fetchone()
+            raise ValueError(
+                "candidate_transition_conflict"
+                if exists is not None
+                else "candidate_not_found"
+            )
+        result = inspect_candidate(
+            connection, display_id("C", candidate_id)
+        )
+        connection.commit()
+        return result
+    except BaseException:
+        connection.rollback()
+        raise
 
 
 def load_candidate_session_link(

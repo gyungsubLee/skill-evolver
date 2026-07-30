@@ -12162,3 +12162,683 @@ class CandidateMaintenanceTests(CandidateBatchFixture):
                 }
             ],
         )
+
+
+class CandidateInboxTests(CandidateBatchFixture):
+    def committed_candidate(self, now: float) -> int:
+        claim = self.claim(1, now)
+        path = self.write_result(claim, self.result_payload(claim))
+        self.runtime.commit_review_result(
+            self.connection,
+            self.installation,
+            self.config,
+            int(claim["batch_id"]),
+            str(claim["owner_token"]),
+            path,
+            now + 1,
+        )
+        return int(
+            self.connection.execute(
+                "SELECT id FROM candidates"
+            ).fetchone()["id"]
+        )
+
+    def test_inspect_exposes_exact_sanitized_fields(self) -> None:
+        now = 2_000_000_000.0
+        candidate_id = self.committed_candidate(now)
+        changes_before = self.connection.total_changes
+        inspected = self.runtime.inspect_candidate(
+            self.connection,
+            self.runtime.display_id("C", candidate_id),
+        )
+        self.assertEqual(self.connection.total_changes, changes_before)
+        self.assertEqual(
+            set(inspected),
+            {
+                "schema_version",
+                "candidate_id",
+                "status",
+                "target_identity",
+                "classification",
+                "problem_summary",
+                "proposal_summary",
+                "validation_plan",
+                "risk_level",
+                "occurrence_count",
+                "first_seen_at",
+                "last_seen_at",
+                "updated_at",
+                "tombstone_until",
+                "evidence",
+                "evidence_aggregate",
+            },
+        )
+        self.assertEqual(
+            set(inspected["classification"]),
+            {
+                "problem_category",
+                "target_locator",
+                "proposal_intent",
+            },
+        )
+        self.assertEqual(
+            set(inspected["evidence"][0]),
+            {"signal_type", "source_kind", "summary", "created_at"},
+        )
+        self.assertEqual(
+            inspected["evidence_aggregate"],
+            {
+                "schema_version": 1,
+                "counts": [],
+                "updated_at": None,
+            },
+        )
+        encoded = json.dumps(inspected)
+        for forbidden in (
+            "fingerprint",
+            "target_path",
+            "target_skill",
+            "conflict_group",
+            "review_item_id",
+            "session_key",
+            "generation",
+            "transcript",
+            "record_ref",
+            "result_path",
+            "owner_digest",
+        ):
+            self.assertNotIn(forbidden, encoded)
+
+        self.assertEqual(
+            self.runtime.CANDIDATE_INSPECT_EVIDENCE_MAX, 200
+        )
+        self.connection.executemany(
+            """
+            INSERT INTO candidate_evidence(
+              candidate_id,review_item_id,session_key,generation,
+              signal_type,source_kind,summary,created_at
+            ) VALUES(?,NULL,?,1,?,?,?,?)
+            """,
+            [
+                (
+                    candidate_id,
+                    f"{index + 1:064x}",
+                    "explicit_correction",
+                    "user_direct",
+                    "Bounded evidence summary.",
+                    self.runtime.iso_utc(now + index + 2),
+                )
+                for index in range(
+                    self.runtime.CANDIDATE_INSPECT_EVIDENCE_MAX
+                )
+            ],
+        )
+        bounded = self.runtime.inspect_candidate(
+            self.connection,
+            self.runtime.display_id("C", candidate_id),
+        )
+        self.assertEqual(
+            len(bounded["evidence"]),
+            self.runtime.CANDIDATE_INSPECT_EVIDENCE_MAX,
+        )
+        query_plan = self.connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT signal_type,source_kind,summary,created_at
+            FROM candidate_evidence
+            WHERE candidate_id=?
+            ORDER BY session_key,signal_type
+            LIMIT ?
+            """,
+            (
+                candidate_id,
+                self.runtime.CANDIDATE_INSPECT_EVIDENCE_MAX,
+            ),
+        ).fetchall()
+        self.assertNotIn(
+            "TEMP B-TREE",
+            " ".join(str(row["detail"]) for row in query_plan),
+        )
+        identity = self.runtime.display_id("C", candidate_id)
+        self.assertEqual(
+            self.runtime.transition_candidate(
+                self.connection,
+                identity,
+                "defer",
+                self.config,
+                now + 300,
+            )["status"],
+            "deferred",
+        )
+        self.assertEqual(
+            self.runtime.transition_candidate(
+                self.connection,
+                identity,
+                "resume",
+                self.config,
+                now + 301,
+            )["status"],
+            "proposed",
+        )
+        selected_session_key = f"{1:064x}"
+        selected_created_at = self.runtime.iso_utc(now + 2)
+        self.connection.execute(
+            """
+            UPDATE candidate_evidence SET created_at=?
+            WHERE candidate_id=? AND session_key=?
+            """,
+            (
+                sqlite3.Binary(selected_created_at.encode("ascii")),
+                candidate_id,
+                selected_session_key,
+            ),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "candidate_state_corrupt"
+        ):
+            self.runtime.inspect_candidate(
+                self.connection, identity
+            )
+        self.connection.execute(
+            """
+            UPDATE candidate_evidence SET created_at=?
+            WHERE candidate_id=? AND session_key=?
+            """,
+            (
+                selected_created_at,
+                candidate_id,
+                selected_session_key,
+            ),
+        )
+        self.connection.execute(
+            """
+            DELETE FROM candidate_evidence
+            WHERE candidate_id=? AND review_item_id IS NULL
+            """,
+            (candidate_id,),
+        )
+
+        aggregate_key = (
+            self.runtime.candidate_evidence_aggregate_key(candidate_id)
+        )
+        self.connection.execute(
+            "INSERT INTO metadata(key,value) VALUES(?,?)",
+            (
+                aggregate_key,
+                '{ "counts":[],"schema_version":1,"updated_at":null}',
+            ),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "invalid_candidate_evidence_aggregate"
+        ):
+            self.runtime.inspect_candidate(
+                self.connection,
+                self.runtime.display_id("C", candidate_id),
+            )
+        self.connection.execute(
+            "DELETE FROM metadata WHERE key=?", (aggregate_key,)
+        )
+        private_fields = (
+            "target_locator",
+            "proposal_intent",
+            "problem_summary",
+            "proposal_summary",
+            "validation_plan",
+            "risk_level",
+        )
+        live_row = self.connection.execute(
+            """
+            SELECT target_identity,target_path,target_locator,
+              proposal_intent,problem_summary,proposal_summary,
+              validation_plan,risk_level
+            FROM candidates WHERE id=?
+            """,
+            (candidate_id,),
+        ).fetchone()
+        self.connection.execute(
+            "UPDATE candidates SET target_identity=? WHERE id=?",
+            (sqlite3.Binary(b"not-text"), candidate_id),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "candidate_state_corrupt"
+        ):
+            self.runtime.inspect_candidate(
+                self.connection,
+                self.runtime.display_id("C", candidate_id),
+            )
+        self.connection.execute(
+            "UPDATE candidates SET target_identity=? WHERE id=?",
+            (live_row["target_identity"], candidate_id),
+        )
+        valid_273_byte_path = "/" + "a" * 272
+        self.assertEqual(
+            len(valid_273_byte_path.encode("utf-8")), 273
+        )
+        self.connection.execute(
+            "UPDATE candidates SET target_path=? WHERE id=?",
+            (valid_273_byte_path, candidate_id),
+        )
+        accepted = self.runtime.inspect_candidate(
+            self.connection,
+            self.runtime.display_id("C", candidate_id),
+        )
+        self.assertEqual(
+            accepted["candidate_id"], inspected["candidate_id"]
+        )
+        self.connection.execute(
+            "UPDATE candidates SET target_path=? WHERE id=?",
+            (live_row["target_path"], candidate_id),
+        )
+        oversized_path = "/" + "a" * 4_096
+        self.assertGreater(
+            len(oversized_path.encode("utf-8")), 4_096
+        )
+        self.connection.execute(
+            "UPDATE candidates SET target_path=? WHERE id=?",
+            (oversized_path, candidate_id),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "candidate_state_corrupt"
+        ):
+            self.runtime.inspect_candidate(
+                self.connection,
+                self.runtime.display_id("C", candidate_id),
+            )
+        self.connection.execute(
+            "UPDATE candidates SET target_path=? WHERE id=?",
+            (live_row["target_path"], candidate_id),
+        )
+        for column, invalid in (
+            (
+                "risk_level",
+                self.runtime.redacted_marker(live_row["risk_level"]),
+            ),
+            ("target_path", "relative/not-canonical"),
+            (
+                "problem_summary",
+                f" {live_row['problem_summary']} ",
+            ),
+        ):
+            with self.subTest(invalid_live_scalar=column):
+                self.connection.execute(
+                    f"UPDATE candidates SET {column}=? WHERE id=?",
+                    (invalid, candidate_id),
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "candidate_state_corrupt"
+                ):
+                    self.runtime.inspect_candidate(
+                        self.connection,
+                        self.runtime.display_id("C", candidate_id),
+                    )
+                self.connection.execute(
+                    f"UPDATE candidates SET {column}=? WHERE id=?",
+                    (live_row[column], candidate_id),
+                )
+
+        markers = {
+            key: self.runtime.redacted_marker(live_row[key])
+            for key in private_fields
+        }
+        evidence_row = self.connection.execute(
+            """
+            SELECT candidate_id,review_item_id,session_key,generation,
+              signal_type,source_kind,summary,created_at
+            FROM candidate_evidence WHERE candidate_id=?
+            """,
+            (candidate_id,),
+        ).fetchone()
+        self.assertIsNotNone(evidence_row)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            self.assertEqual(
+                self.runtime.aggregate_candidate_evidence_rows(
+                    self.connection,
+                    [candidate_id],
+                    now + 10,
+                ),
+                1,
+            )
+            self.connection.commit()
+        except BaseException:
+            self.connection.rollback()
+            raise
+        self.connection.execute(
+            "DELETE FROM candidate_evidence WHERE candidate_id=?",
+            (candidate_id,),
+        )
+        self.assertEqual(
+            self.runtime.load_candidate_evidence_aggregate(
+                self.connection, candidate_id
+            )["counts"],
+            [
+                {
+                    "signal_type": "explicit_correction",
+                    "source_kind": "user_direct",
+                    "count": 1,
+                }
+            ],
+        )
+        assignments = ",".join(
+            f"{key}=?" for key in private_fields
+        )
+        self.connection.execute(
+            f"""
+            UPDATE candidates
+            SET status='stale',target_path=NULL,tombstone_until=NULL,
+                {assignments}
+            WHERE id=?
+            """,
+            (*markers.values(), candidate_id),
+        )
+        redacted = self.runtime.inspect_candidate(
+            self.connection,
+            self.runtime.display_id("C", candidate_id),
+        )
+        self.assertEqual(redacted["status"], "stale")
+        self.assertEqual(
+            redacted["target_identity"], inspected["target_identity"]
+        )
+        self.assertEqual(
+            redacted["classification"]["problem_category"],
+            inspected["classification"]["problem_category"],
+        )
+        self.assertIsNone(redacted["tombstone_until"])
+        self.assertEqual(
+            {
+                "target_locator": redacted["classification"][
+                    "target_locator"
+                ],
+                "proposal_intent": redacted["classification"][
+                    "proposal_intent"
+                ],
+                "problem_summary": redacted["problem_summary"],
+                "proposal_summary": redacted["proposal_summary"],
+                "validation_plan": redacted["validation_plan"],
+                "risk_level": redacted["risk_level"],
+            },
+            markers,
+        )
+        for column in private_fields:
+            with self.subTest(invalid_redacted_marker=column):
+                self.connection.execute(
+                    f"UPDATE candidates SET {column}=? WHERE id=?",
+                    ("redacted:not-a-digest", candidate_id),
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "candidate_state_corrupt"
+                ):
+                    self.runtime.inspect_candidate(
+                        self.connection,
+                        self.runtime.display_id("C", candidate_id),
+                    )
+                self.connection.execute(
+                    f"UPDATE candidates SET {column}=? WHERE id=?",
+                    (markers[column], candidate_id),
+                )
+        self.connection.execute(
+            """
+            INSERT INTO candidate_evidence(
+              candidate_id,review_item_id,session_key,generation,
+              signal_type,source_kind,summary,created_at
+            ) VALUES(?,?,?,?,?,?,?,?)
+            """,
+            tuple(evidence_row),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "candidate_state_corrupt"
+        ):
+            self.runtime.inspect_candidate(
+                self.connection,
+                self.runtime.display_id("C", candidate_id),
+            )
+        self.connection.execute(
+            "DELETE FROM candidate_evidence WHERE candidate_id=?",
+            (candidate_id,),
+        )
+        self.connection.execute(
+            "UPDATE candidates SET status='proposed' WHERE id=?",
+            (candidate_id,),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "candidate_state_corrupt"
+        ):
+            self.runtime.inspect_candidate(
+                self.connection,
+                self.runtime.display_id("C", candidate_id),
+            )
+        rejected_until = self.runtime.iso_utc(now + 100)
+        self.connection.execute(
+            """
+            UPDATE candidates
+            SET status='rejected',tombstone_until=?
+            WHERE id=?
+            """,
+            (rejected_until, candidate_id),
+        )
+        self.assertEqual(
+            self.runtime.inspect_candidate(
+                self.connection,
+                self.runtime.display_id("C", candidate_id),
+            )["tombstone_until"],
+            rejected_until,
+        )
+
+    def test_defer_resume_reject_are_exact_compare_and_swap(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        candidate_id = self.committed_candidate(now)
+        identity = self.runtime.display_id("C", candidate_id)
+        deferred = self.runtime.transition_candidate(
+            self.connection,
+            identity,
+            "defer",
+            self.config,
+            now + 2,
+        )
+        self.assertEqual(deferred["status"], "deferred")
+        self.assertEqual(
+            deferred["updated_at"], self.runtime.iso_utc(now + 2)
+        )
+        self.assertIsNone(deferred["tombstone_until"])
+        resumed = self.runtime.transition_candidate(
+            self.connection,
+            identity,
+            "resume",
+            self.config,
+            now + 3,
+        )
+        self.assertEqual(resumed["status"], "proposed")
+        self.assertEqual(
+            resumed["updated_at"], self.runtime.iso_utc(now + 3)
+        )
+        self.assertIsNone(resumed["tombstone_until"])
+        original_summary = self.connection.execute(
+            "SELECT problem_summary FROM candidates WHERE id=?",
+            (candidate_id,),
+        ).fetchone()["problem_summary"]
+        self.connection.execute(
+            """
+            UPDATE candidates SET problem_summary=?
+            WHERE id=?
+            """,
+            (f" {original_summary} ", candidate_id),
+        )
+        before_rolled_back_transition = tuple(
+            self.connection.execute(
+                """
+                SELECT status,updated_at,tombstone_until
+                FROM candidates WHERE id=?
+                """,
+                (candidate_id,),
+            ).fetchone()
+        )
+        with self.assertRaisesRegex(
+            ValueError, "candidate_state_corrupt"
+        ):
+            self.runtime.transition_candidate(
+                self.connection,
+                identity,
+                "reject",
+                self.config,
+                now + 4,
+            )
+        self.assertEqual(
+            tuple(
+                self.connection.execute(
+                    """
+                    SELECT status,updated_at,tombstone_until
+                    FROM candidates WHERE id=?
+                    """,
+                    (candidate_id,),
+                ).fetchone()
+            ),
+            before_rolled_back_transition,
+        )
+        self.connection.execute(
+            "UPDATE candidates SET problem_summary=? WHERE id=?",
+            (original_summary, candidate_id),
+        )
+        rejected = self.runtime.transition_candidate(
+            self.connection,
+            identity,
+            "reject",
+            self.config,
+            now + 4,
+        )
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertEqual(
+            rejected["updated_at"], self.runtime.iso_utc(now + 4)
+        )
+        self.assertEqual(
+            rejected["tombstone_until"],
+            self.runtime.iso_utc(
+                now
+                + 4
+                + self.config.rejected_tombstone_days * 86_400
+            ),
+        )
+        rejected_state = tuple(
+            self.connection.execute(
+                """
+                SELECT status,updated_at,tombstone_until
+                FROM candidates WHERE id=?
+                """,
+                (candidate_id,),
+            ).fetchone()
+        )
+        with self.assertRaisesRegex(
+            ValueError, "candidate_transition_conflict"
+        ):
+            self.runtime.transition_candidate(
+                self.connection,
+                identity,
+                "resume",
+                self.config,
+                now + 5,
+            )
+        self.assertEqual(
+            tuple(
+                self.connection.execute(
+                    """
+                    SELECT status,updated_at,tombstone_until
+                    FROM candidates WHERE id=?
+                    """,
+                    (candidate_id,),
+                ).fetchone()
+            ),
+            rejected_state,
+        )
+        self.connection.execute(
+            "UPDATE candidates SET status='proposed' WHERE id=?",
+            (candidate_id,),
+        )
+        corrupt_state = tuple(
+            self.connection.execute(
+                """
+                SELECT status,updated_at,tombstone_until
+                FROM candidates WHERE id=?
+                """,
+                (candidate_id,),
+            ).fetchone()
+        )
+        with self.assertRaisesRegex(
+            ValueError, "candidate_transition_conflict"
+        ):
+            self.runtime.transition_candidate(
+                self.connection,
+                identity,
+                "defer",
+                self.config,
+                now + 6,
+            )
+        self.assertEqual(
+            tuple(
+                self.connection.execute(
+                    """
+                    SELECT status,updated_at,tombstone_until
+                    FROM candidates WHERE id=?
+                    """,
+                    (candidate_id,),
+                ).fetchone()
+            ),
+            corrupt_state,
+        )
+
+    def test_stale_cannot_be_resumed_and_unknown_id_is_rejected(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        candidate_id = self.committed_candidate(now)
+        identity = self.runtime.display_id("C", candidate_id)
+        self.connection.execute(
+            "UPDATE candidates SET status='stale' WHERE id=?",
+            (candidate_id,),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "candidate_transition_conflict"
+        ):
+            self.runtime.transition_candidate(
+                self.connection,
+                identity,
+                "resume",
+                self.config,
+                now + 2,
+            )
+        with self.assertRaisesRegex(ValueError, "candidate_not_found"):
+            self.runtime.inspect_candidate(
+                self.connection, "C-999999"
+            )
+        with self.assertRaisesRegex(
+            ValueError, "invalid_candidate_id"
+        ):
+            self.runtime.inspect_candidate(
+                self.connection, "candidate-one"
+            )
+        for malformed in (
+            "C-1",
+            "C-01",
+            "C-0001",
+            "C-000",
+            "C-+001",
+            f"C-{self.runtime.SQLITE_INTEGER_MAX + 1}",
+        ):
+            with self.subTest(
+                malformed=malformed
+            ), self.assertRaisesRegex(
+                ValueError, "invalid_candidate_id"
+            ):
+                self.runtime.inspect_candidate(
+                    self.connection, malformed
+                )
+
+        class CandidateIdSubclass(str):
+            pass
+
+        with self.assertRaisesRegex(
+            ValueError, "invalid_candidate_id"
+        ):
+            self.runtime.inspect_candidate(
+                self.connection, CandidateIdSubclass(identity)
+            )
