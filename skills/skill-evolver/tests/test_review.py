@@ -7766,3 +7766,276 @@ class ReviewBatchMaintenanceTests(BatchExportTestCase):
         self.assertEqual(audit["terminal_status"], "expired")
         self.assertEqual(audit["exclusion_counts"], {})
         self.assertEqual(audit["batch_capacity_released"], 1)
+
+
+class ReviewBatchIntegrationTests(BatchExportTestCase):
+    def test_partial_export_keeps_only_survivors_in_final_contract(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        first = self.insert_pending(connection, 1, now=now)
+        second = self.insert_pending(connection, 2, now=now)
+        error = self.runtime.TranscriptAdapterError(
+            "transcript_changed",
+            retryable=True,
+        )
+        with self.fixed_review_inputs(), mock.patch.object(
+            self.runtime,
+            "read_frozen_transcript",
+            side_effect=[self.make_export("first survives"), error],
+        ):
+            result = self.runtime.claim_review_batch(
+                connection,
+                self.installation,
+                self.config,
+                now,
+            )
+        contract = self.runtime.load_review_contract(
+            connection, int(result["batch_id"]), "final"
+        )
+        rows = connection.execute(
+            """
+            SELECT id,status,error_code,batch_id,reviewed_boundary
+            FROM review_items ORDER BY id
+            """
+        ).fetchall()
+        batch = connection.execute(
+            """
+            SELECT status,session_count,generation_count
+            FROM review_batches WHERE id=?
+            """,
+            (int(result["batch_id"]),),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(
+            [session["review_item_id"] for session in contract["sessions"]],
+            [int(first["id"])],
+        )
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [
+                (
+                    int(first["id"]),
+                    "reviewing",
+                    None,
+                    int(result["batch_id"]),
+                    0,
+                ),
+                (
+                    int(second["id"]),
+                    "pending",
+                    "transcript_changed",
+                    None,
+                    0,
+                ),
+            ],
+        )
+        self.assertEqual(tuple(batch), ("ready", 1, 1))
+
+    def test_seed_stage_crash_is_closed_by_expiry_recovery(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        item = self.insert_pending(connection, 1, now=now)
+        with self.fixed_review_inputs():
+            prepared = self.runtime._prepare_review_batch(
+                connection,
+                self.installation,
+                self.config,
+                self.review_runtime,
+                self.policy,
+                self.catalog,
+                now,
+            )
+        batch_id = int(prepared["batch_id"])
+        connection.execute(
+            """
+            UPDATE review_items SET lease_expires_at=?
+            WHERE batch_id=?
+            """,
+            (self.runtime.iso_utc(now - 1), batch_id),
+        )
+        recovered = self.runtime.recover_expired_review_leases(
+            connection, now
+        )
+        row = connection.execute(
+            """
+            SELECT status,batch_id,frozen_to,lease_owner,
+              reviewed_boundary,error_code
+            FROM review_items WHERE id=?
+            """,
+            (int(item["id"]),),
+        ).fetchone()
+        batch = connection.execute(
+            "SELECT status FROM review_batches WHERE id=?",
+            (batch_id,),
+        ).fetchone()
+        metadata = {
+            result["key"]
+            for result in connection.execute(
+                "SELECT key FROM metadata WHERE key LIKE ?",
+                (f"review.batch.{batch_id}.%",),
+            )
+        }
+        connection.close()
+        self.assertEqual(recovered, 1)
+        self.assertEqual(
+            tuple(row),
+            ("pending", None, None, None, 0, None),
+        )
+        self.assertEqual(batch["status"], "expired")
+        self.assertEqual(metadata, {
+            self.runtime.review_audit_key(batch_id)
+        })
+
+    def test_claim_abort_and_maintenance_each_run_bounded_cleanup(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        root = self.runtime.review_result_root()
+
+        def old_result(digit: str) -> Path:
+            path = root / f"result-{digit * 32}.json"
+            path.write_bytes(b"old unallocated")
+            path.chmod(0o600)
+            old_ns = int((now - 3_601) * 1_000_000_000)
+            os.utime(path, ns=(old_ns, old_ns))
+            return path
+
+        before_claim = old_result("1")
+        connection = self.runtime.open_database(self.installation)
+        self.insert_pending(connection, 1, now=now)
+        claimed = self.claim_ready_batch(
+            connection, [self.make_export("one")], now=now
+        )
+        self.assertFalse(before_claim.exists())
+
+        before_abort = old_result("2")
+        self.runtime.abort_review_batch(
+            connection,
+            self.installation,
+            int(claimed["batch_id"]),
+            str(claimed["owner_token"]),
+            now,
+        )
+        self.assertFalse(before_abort.exists())
+
+        before_maintenance = old_result("3")
+        result = self.runtime.run_maintenance(
+            connection,
+            self.installation,
+            self.config,
+            now,
+        )
+        connection.close()
+        self.assertFalse(before_maintenance.exists())
+        self.assertEqual(result["result_files_deleted"], 1)
+
+    def test_201_entry_saturation_precedes_any_claim_database_write(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        root = self.runtime.review_result_root()
+        for index in range(201):
+            path = root / f"result-{index:032x}.json"
+            path.write_bytes(f"private-{index}".encode())
+            path.chmod(0o600)
+        files_before = {}
+        for path in sorted(root.iterdir()):
+            info = path.lstat()
+            files_before[path.name] = (
+                path.read_bytes(),
+                info.st_dev,
+                info.st_ino,
+                stat.S_IMODE(info.st_mode),
+                info.st_uid,
+                info.st_nlink,
+                info.st_mtime_ns,
+            )
+        self.assertEqual(len(files_before), 201)
+
+        connection = self.runtime.open_database(self.installation)
+        item = self.insert_pending(connection, 1, now=now)
+        database_before = tuple(connection.iterdump())
+        metadata_before = [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT key,value FROM metadata ORDER BY key"
+            )
+        ]
+        changes_before = connection.total_changes
+        with mock.patch.object(
+            self.runtime,
+            "load_review_runtime",
+            side_effect=AssertionError("saturated runtime read"),
+        ) as runtime_read, mock.patch.object(
+            self.runtime,
+            "load_improvement_policy",
+            side_effect=AssertionError("saturated policy read"),
+        ) as policy_read, mock.patch.object(
+            self.runtime,
+            "build_catalog_snapshot",
+            side_effect=AssertionError("saturated catalog read"),
+        ) as catalog_read, mock.patch.object(
+            self.runtime,
+            "_prepare_review_batch",
+            side_effect=AssertionError("saturated prepare"),
+        ) as prepare, mock.patch.object(
+            self.runtime,
+            "read_frozen_transcript",
+            side_effect=AssertionError("saturated transcript read"),
+        ) as transcript_read, self.assertRaisesRegex(
+            ValueError, "review_result_namespace_saturated"
+        ):
+            self.runtime.claim_review_batch(
+                connection,
+                self.installation,
+                self.config,
+                now,
+            )
+        runtime_read.assert_not_called()
+        policy_read.assert_not_called()
+        catalog_read.assert_not_called()
+        prepare.assert_not_called()
+        transcript_read.assert_not_called()
+        database_after = tuple(connection.iterdump())
+        metadata_after = [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT key,value FROM metadata ORDER BY key"
+            )
+        ]
+        row = connection.execute(
+            """
+            SELECT status,batch_id,frozen_to,lease_owner
+            FROM review_items WHERE id=?
+            """,
+            (int(item["id"]),),
+        ).fetchone()
+        batches = connection.execute(
+            "SELECT COUNT(*) FROM review_batches"
+        ).fetchone()[0]
+        changes_after = connection.total_changes
+        connection.close()
+
+        files_after = {}
+        for path in sorted(root.iterdir()):
+            info = path.lstat()
+            files_after[path.name] = (
+                path.read_bytes(),
+                info.st_dev,
+                info.st_ino,
+                stat.S_IMODE(info.st_mode),
+                info.st_uid,
+                info.st_nlink,
+                info.st_mtime_ns,
+            )
+        self.assertEqual(files_after, files_before)
+        self.assertEqual(database_after, database_before)
+        self.assertEqual(metadata_after, metadata_before)
+        self.assertEqual(changes_after, changes_before)
+        self.assertEqual(tuple(row), ("pending", None, None, None))
+        self.assertEqual(batches, 0)
