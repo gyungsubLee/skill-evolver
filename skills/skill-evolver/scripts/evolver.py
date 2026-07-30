@@ -60,6 +60,7 @@ REVIEW_RESULT_SCAN_MAX = 201
 REVIEW_RESULT_TTL_SECONDS = 3_600
 REVIEW_BATCH_AUDIT_TTL_SECONDS = 90 * 86_400
 REVIEW_MAINTENANCE_BATCH_MAX = 200
+CANDIDATE_TERMINAL_MAX_DAYS = 90
 
 
 @dataclass(frozen=True)
@@ -1606,8 +1607,10 @@ DEFAULTS = {
     "lease_seconds": 600,
     "lease_heartbeat_seconds": 60,
     "deferred_to_stale_days": 30,
-    "rejected_tombstone_days": 90,
-    "terminal_candidate_retention_days": 90,
+    "rejected_tombstone_days": CANDIDATE_TERMINAL_MAX_DAYS,
+    "terminal_candidate_retention_days": (
+        CANDIDATE_TERMINAL_MAX_DAYS
+    ),
 }
 LEGACY_OPTIONAL_CONFIG_KEYS = frozenset(
     {
@@ -1625,6 +1628,10 @@ HARD_LIMITS = {
     "max_review_batch_bytes": REVIEW_BATCH_MAX_BYTES,
     "max_candidates_per_session": 1,
     "max_candidates_per_batch": 3,
+    "rejected_tombstone_days": CANDIDATE_TERMINAL_MAX_DAYS,
+    "terminal_candidate_retention_days": (
+        CANDIDATE_TERMINAL_MAX_DAYS
+    ),
 }
 
 
@@ -1639,6 +1646,13 @@ def _validate_lease_ttl_config(
     ):
         raise ValueError(
             "invalid_config_lease_heartbeat_seconds"
+        )
+    if (
+        int(values["terminal_candidate_retention_days"])
+        < int(values["rejected_tombstone_days"])
+    ):
+        raise ValueError(
+            "invalid_config_terminal_candidate_retention_days"
         )
 
 
@@ -1966,6 +1980,19 @@ def transcript_adapter_contract(
         "boundary": "half-open",
         "session_binding": "session-meta-hmac",
         "text_encoding": "strict-utf-8",
+        "record_text_redaction": {
+            "version": 1,
+            "owner_token_match": (
+                "direct-key-or-label-with-64-hex-value"
+            ),
+            "replacement": "[REDACTED:owner-token]",
+        },
+        "record_exclusion": {
+            "version": 1,
+            "ready_review_claim_tool_output": (
+                "direct-or-final-output-suffix-v1-strict-owner-hmac"
+            ),
+        },
         "read_past_frozen_to": False,
         "context": "bounded-reverse-complete-records",
         "content_identity_fields": [
@@ -2050,8 +2077,33 @@ RESPONSE_ITEM_IGNORED_TYPES = frozenset(
         "tool_search_output",
     }
 )
-
-
+OWNER_TOKEN_RECORD_TEXT = re.compile(
+    r"(?i)(\bowner(?:[_ -]?token)\b"
+    r"(?:[\"']?\s*[:=]\s*[\"']?|\s+))"
+    r"[0-9a-f]{64}(?![0-9a-f])"
+)
+READY_REVIEW_CLAIM_KEYS = frozenset(
+    {
+        "schema_version",
+        "status",
+        "batch_id",
+        "owner_token",
+        "contract_digest",
+        "lease_expires_at",
+        "result_path",
+        "envelope",
+    }
+)
+READY_REVIEW_ENVELOPE_KEYS = frozenset(
+    {
+        "schema_version",
+        "claim_contract",
+        "sessions",
+        "catalog",
+        "policy",
+        "result_schema_instructions",
+    }
+)
 class TranscriptRecordMapping(TypedDict):
     source_kind: str
     text: str
@@ -2074,6 +2126,130 @@ def _validated_transcript_text(
     if maximum_bytes is not None and len(encoded) > maximum_bytes:
         raise _transcript_error("unsupported_transcript")
     return value
+
+
+def _redact_transcript_record_text(value: str) -> str:
+    return OWNER_TOKEN_RECORD_TEXT.sub(
+        lambda match: (
+            f"{match.group(1)}[REDACTED:owner-token]"
+        ),
+        value,
+    )
+
+
+def _is_exact_ready_review_claim(
+    value: object,
+    installation: Installation,
+) -> bool:
+    if type(value) is not dict or set(value) != READY_REVIEW_CLAIM_KEYS:
+        return False
+    batch_id = value["batch_id"]
+    owner_token = value["owner_token"]
+    contract_digest = value["contract_digest"]
+    result_path = value["result_path"]
+    envelope = value["envelope"]
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or value["status"] != "ready"
+        or type(batch_id) is not int
+        or batch_id < 1
+        or not _is_lower_hex(owner_token, 64)
+        or not _is_lower_hex(contract_digest, 64)
+        or type(result_path) is not str
+        or type(envelope) is not dict
+        or set(envelope) != READY_REVIEW_ENVELOPE_KEYS
+        or type(envelope["schema_version"]) is not int
+        or envelope["schema_version"] != 1
+        or type(envelope["sessions"]) is not list
+        or type(envelope["catalog"]) is not list
+        or type(envelope["policy"]) is not str
+        or envelope["result_schema_instructions"]
+        != REVIEW_RESULT_SCHEMA_INSTRUCTIONS
+    ):
+        return False
+    path = Path(result_path)
+    if (
+        not path.is_absolute()
+        or REVIEW_RESULT_NAME.fullmatch(path.name) is None
+        or path.parent
+        != REVIEW_RESULT_PARENT
+        / f"{REVIEW_RESULT_PREFIX}{os.getuid()}"
+    ):
+        return False
+    try:
+        contract = _validate_review_contract(
+            envelope["claim_contract"], batch_id, "final"
+        )
+        encoded_envelope = canonical_json_bytes(envelope)
+    except (TypeError, UnicodeError, ValueError):
+        return False
+    try:
+        expected_owner_digest = review_owner_digest(
+            installation, owner_token
+        )
+    except OSError:
+        raise _transcript_error("unsupported_transcript") from None
+    except ValueError:
+        return False
+    return (
+        len(encoded_envelope) <= MODEL_ENVELOPE_MAX_BYTES
+        and hmac.compare_digest(
+            str(contract["owner_digest"]),
+            expected_owner_digest,
+        )
+        and hmac.compare_digest(
+            contract_digest, sha256_json(contract)
+        )
+        and value["lease_expires_at"]
+        == contract["lease_expires_at"]
+    )
+
+
+def _parse_ready_review_claim_json(value: str) -> Optional[object]:
+    candidate = value[:-1] if value.endswith("\n") else value
+    if not candidate or candidate.endswith("\n"):
+        return None
+    try:
+        encoded = candidate.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    if (
+        not encoded
+        or len(encoded) > REVIEW_RESULT_MAX_BYTES
+    ):
+        return None
+    try:
+        parsed = _load_declarative_result_json(encoded)
+        _require_plain_json_builtins(
+            parsed, "invalid_ready_review_claim_output"
+        )
+        if canonical_json_bytes(parsed).decode("utf-8") != candidate:
+            return None
+    except (UnicodeError, ValueError):
+        return None
+    return parsed
+
+
+def _contains_ready_review_claim_output(
+    value: str,
+    installation: Installation,
+) -> bool:
+    try:
+        if len(value.encode("utf-8")) > REVIEW_RESULT_MAX_BYTES:
+            return False
+    except UnicodeEncodeError:
+        return False
+    parsed = _parse_ready_review_claim_json(value)
+    if parsed is None:
+        _prefix, marker, candidate = value.rpartition("\nOutput:\n")
+        if not marker:
+            return False
+        parsed = _parse_ready_review_claim_json(candidate)
+    return (
+        parsed is not None
+        and _is_exact_ready_review_claim(parsed, installation)
+    )
 
 
 def _canonical_transcript_records(
@@ -2158,7 +2334,11 @@ def _message_texts(payload: Mapping[str, object]) -> list[str]:
         item_type = item.get("type")
         text = item.get("text")
         if item_type in {"input_text", "output_text"}:
-            texts.append(_validated_transcript_text(text))
+            texts.append(
+                _redact_transcript_record_text(
+                    _validated_transcript_text(text)
+                )
+            )
         elif item_type == "encrypted_content":
             continue
         else:
@@ -2230,6 +2410,11 @@ def _classify_transcript_object(
                 raise _transcript_error("unsupported_transcript")
             return []
         output = _validated_transcript_text(output_value)
+        if _contains_ready_review_claim_output(
+            output, installation
+        ):
+            return []
+        output = _redact_transcript_record_text(output)
         return [
             TranscriptRecord(
                 source_kind="tool_output",
@@ -3223,6 +3408,79 @@ def validate_declarative_result(
     return normalized
 
 
+def reject_persisted_candidate_text_leaks(
+    validated: dict[str, object],
+    contract: dict[str, object],
+    owner_token: str,
+    result_paths: frozenset[str],
+    target_paths: frozenset[str],
+) -> None:
+    if not _is_lower_hex(owner_token, 64):
+        raise ValueError("invalid_review_owner_token")
+    _require_plain_json_builtins(
+        contract, "review_contract_invalid"
+    )
+    if any(
+        type(value) is not str or not value
+        for values in (result_paths, target_paths)
+        for value in values
+    ):
+        raise ValueError("invalid_persisted_text_deny_values")
+    folded_values = {
+        owner_token,
+        sha256_json(contract),
+        *result_paths,
+        *target_paths,
+    }
+    stack: list[object] = [contract]
+    while stack:
+        current = stack.pop()
+        if type(current) is str:
+            if _is_lower_hex(current, 64):
+                folded_values.add(current)
+        elif type(current) is list:
+            stack.extend(current)
+        elif type(current) is dict:
+            stack.extend(current.values())
+    folded_markers = frozenset(
+        unicodedata.normalize("NFKC", value).casefold()
+        for value in folded_values
+    )
+    exact_markers = frozenset(
+        [
+            str(session["session_ref"])
+            for session in contract["sessions"]
+        ]
+        + [
+            str(record["record_ref"])
+            for session in contract["sessions"]
+            for record in session["records"]
+        ]
+    )
+    for session in validated["sessions"]:
+        if session["decision"] != "candidate":
+            continue
+        classification = session["classification"]
+        texts = [
+            classification["target_locator"],
+            classification["proposal_intent"],
+            session["problem_summary"],
+            session["proposal_summary"],
+            session["validation_plan"],
+            *(
+                evidence["summary"]
+                for evidence in session["evidence"]
+            ),
+        ]
+        for text in texts:
+            normalized = unicodedata.normalize("NFKC", text)
+            folded = normalized.casefold()
+            if any(marker in folded for marker in folded_markers):
+                raise ValueError("residual_secret")
+            if any(marker in normalized for marker in exact_markers):
+                raise ValueError("residual_secret")
+
+
 def normalized_fingerprint_field(value: object) -> str:
     if type(value) is not str or not value or len(value) > 160:
         if type(value) is str and len(value) > 160:
@@ -4136,7 +4394,14 @@ def upsert_validated_candidate(
         or type(occurrence) is not int
         or not 1 <= occurrence < SQLITE_INTEGER_MAX
         or type(existing["status"]) is not str
-        or not existing["status"]
+        or existing["status"]
+        not in {
+            "proposed",
+            "prepared",
+            "deferred",
+            "rejected",
+            "stale",
+        }
         or type(existing["fingerprint"]) is not str
         or not _is_lower_hex(existing["fingerprint"], 64)
         or existing["fingerprint"] != fingerprint
@@ -4314,8 +4579,17 @@ def commit_review_result(
         entry.identity for entry in snapshot.entries
     )
     try:
-        validate_declarative_result(
+        validated = validate_declarative_result(
             payload, contract, allowed_targets
+        )
+        reject_persisted_candidate_text_leaks(
+            validated,
+            contract,
+            owner_token,
+            frozenset({str(opened.path), str(result_path)}),
+            frozenset(
+                str(entry.skill_dir) for entry in snapshot.entries
+            ),
         )
     except ValueError:
         return rotate_invalid_review_result(
@@ -4366,6 +4640,18 @@ def commit_review_result(
             try:
                 validated = validate_declarative_result(
                     payload, live_contract, live_targets
+                )
+                reject_persisted_candidate_text_leaks(
+                    validated,
+                    live_contract,
+                    owner_token,
+                    frozenset(
+                        {str(opened.path), str(result_path)}
+                    ),
+                    frozenset(
+                        str(entry.skill_dir)
+                        for entry in live_snapshot.entries
+                    ),
                 )
             except ValueError:
                 raise _CandidateResultRetry from None
@@ -8472,15 +8758,49 @@ def run_maintenance(
             now
             - config.terminal_candidate_retention_days * 86_400
         )
-        terminal_rows = list(
+        terminal_modifier = (
+            f"+{CANDIDATE_TERMINAL_MAX_DAYS} days"
+        )
+        selected_terminal_rows = list(
             connection.execute(
                 """
-                SELECT id,status,tombstone_until,target_path,
+                SELECT id,status,updated_at,tombstone_until,target_path,
                   target_locator,proposal_intent,problem_summary,
                   proposal_summary,validation_plan,risk_level
                 FROM candidates
                 WHERE status IN ('rejected','stale')
-                  AND updated_at<=?
+                  AND (
+                    strftime(
+                      '%Y-%m-%dT%H:%M:%SZ',updated_at,
+                      '+0 seconds'
+                    ) IS NULL
+                    OR strftime(
+                      '%Y-%m-%dT%H:%M:%SZ',updated_at,
+                      '+0 seconds'
+                    )!=updated_at
+                    OR (
+                      updated_at<=?
+                      AND (
+                        status='stale'
+                        OR tombstone_until IS NULL
+                        OR tombstone_until<=?
+                        OR strftime(
+                          '%Y-%m-%dT%H:%M:%SZ',tombstone_until,
+                          '+0 seconds'
+                        ) IS NULL
+                        OR strftime(
+                          '%Y-%m-%dT%H:%M:%SZ',tombstone_until,
+                          '+0 seconds'
+                        )!=tombstone_until
+                        OR strftime(
+                          '%Y-%m-%dT%H:%M:%SZ',updated_at,?
+                        ) IS NULL
+                        OR tombstone_until>strftime(
+                          '%Y-%m-%dT%H:%M:%SZ',updated_at,?
+                        )
+                      )
+                    )
+                  )
                   AND (
                     target_path IS NOT NULL
                     OR EXISTS(
@@ -8493,25 +8813,41 @@ def run_maintenance(
                 """,
                 (
                     terminal_cutoff,
+                    iso_utc(now),
+                    terminal_modifier,
+                    terminal_modifier,
                     REVIEW_MAINTENANCE_BATCH_MAX,
                 ),
             )
         )
-        terminal_candidate_ids = [
-            int(row["id"]) for row in terminal_rows
-        ]
-        for candidate in terminal_rows:
+        terminal_rows: list[sqlite3.Row] = []
+        for candidate in selected_terminal_rows:
             status = candidate["status"]
             tombstone = candidate["tombstone_until"]
+            tombstone_epoch: Optional[float] = None
+            try:
+                updated_epoch = parse_iso_utc(
+                    candidate["updated_at"]
+                )
+            except ValueError:
+                raise ValueError(
+                    "candidate_maintenance_state_corrupt"
+                ) from None
             if status == "stale":
                 valid_tombstone = tombstone is None
             else:
                 valid_tombstone = type(tombstone) is str
                 if valid_tombstone:
                     try:
-                        parse_iso_utc(tombstone)
+                        tombstone_epoch = parse_iso_utc(tombstone)
                     except ValueError:
                         valid_tombstone = False
+                    else:
+                        valid_tombstone = (
+                            updated_epoch < tombstone_epoch
+                            <= updated_epoch
+                            + CANDIDATE_TERMINAL_MAX_DAYS * 86_400
+                        )
             if not valid_tombstone:
                 raise ValueError(
                     "candidate_maintenance_state_corrupt"
@@ -8534,6 +8870,17 @@ def run_maintenance(
                 raise ValueError(
                     "candidate_maintenance_state_corrupt"
                 )
+            if (
+                status == "stale"
+                or (
+                    tombstone_epoch is not None
+                    and tombstone_epoch <= now
+                )
+            ):
+                terminal_rows.append(candidate)
+        terminal_candidate_ids = [
+            int(row["id"]) for row in terminal_rows
+        ]
         require_candidate_evidence_bindings(
             connection,
             installation,

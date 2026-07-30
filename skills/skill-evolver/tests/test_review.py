@@ -220,6 +220,8 @@ class ReviewConfigLimitTests(unittest.TestCase):
             "max_review_batch_bytes": 8_388_609,
             "max_candidates_per_session": 2,
             "max_candidates_per_batch": 4,
+            "rejected_tombstone_days": 91,
+            "terminal_candidate_retention_days": 91,
         }
         for key, value in hostile_values.items():
             with self.subTest(key=key):
@@ -232,6 +234,29 @@ class ReviewConfigLimitTests(unittest.TestCase):
                     ValueError, f"invalid_config_{key}"
                 ):
                     self.runtime.load_config(self.installation)
+
+        for key in (
+            "rejected_tombstone_days",
+            "terminal_candidate_retention_days",
+        ):
+            with self.subTest(
+                key=key,
+                surface="initialize",
+                bound="maximum",
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    f"invalid_config_{key}",
+                ):
+                    self.runtime.initialize_runtime(
+                        self.base / f"invalid-{key}-maximum",
+                        (self.sessions,),
+                        {
+                            "capture_paused": False,
+                            "exclude_roots": [],
+                            key: 91,
+                        },
+                    )
 
         self.installation.config_path.write_text(
             json.dumps({**current, "review_batch_sessions": True}),
@@ -263,6 +288,11 @@ class ReviewConfigLimitTests(unittest.TestCase):
                 "lease_heartbeat_seconds",
                 int(current["lease_seconds"]),
                 "invalid_config_lease_heartbeat_seconds",
+            ),
+            (
+                "terminal_candidate_retention_days",
+                int(current["rejected_tombstone_days"]) - 1,
+                "invalid_config_terminal_candidate_retention_days",
             ),
         )
         for key, value, error_code in lease_cases:
@@ -1984,10 +2014,24 @@ class FrozenTranscriptBoundedReadTests(FrozenTranscriptTestCase):
         )
 
     def test_transcript_adapter_digest_is_static(self) -> None:
-        contract = self.runtime.transcript_adapter_contract(self.review)
-        self.assertEqual(contract["text_encoding"], "strict-utf-8")
+        adapter_contract = self.runtime.transcript_adapter_contract(
+            self.review
+        )
         self.assertEqual(
-            contract["relocation"],
+            adapter_contract["text_encoding"], "strict-utf-8"
+        )
+        self.assertEqual(
+            adapter_contract["record_text_redaction"],
+            {
+                "version": 1,
+                "owner_token_match": (
+                    "direct-key-or-label-with-64-hex-value"
+                ),
+                "replacement": "[REDACTED:owner-token]",
+            },
+        )
+        self.assertEqual(
+            adapter_contract["relocation"],
             {
                 "roots": "installation-transcript-roots",
                 "descriptor_relative": True,
@@ -1999,8 +2043,8 @@ class FrozenTranscriptBoundedReadTests(FrozenTranscriptTestCase):
         )
         self.assertEqual(
             (
-                contract["limits"]["evidence_shape_nodes"],
-                contract["limits"]["evidence_shape_depth"],
+                adapter_contract["limits"]["evidence_shape_nodes"],
+                adapter_contract["limits"]["evidence_shape_depth"],
             ),
             (4_096, 64),
         )
@@ -2011,26 +2055,257 @@ class FrozenTranscriptBoundedReadTests(FrozenTranscriptTestCase):
             + session_id.encode()
             + b'"}}\n'
         )
-        first = (
-            b'{"type":"response_item","payload":{"type":"message",'
-            b'"role":"user","content":[{"type":"input_text",'
-            b'"text":"first content"}]}}\n'
+        owner_token = "a" * 64
+        unrelated_hash = "b" * 64
+        ready_owner_token = "c" * 64
+        ready_session_ref = f"S-{'1' * 64}"
+        ready_record_ref = f"{ready_session_ref}-R-001"
+        ready_contract = {
+            "schema_version": 1,
+            "stage": "final",
+            "batch_id": 7,
+            "owner_digest": self.runtime.review_owner_digest(
+                self.installation, ready_owner_token
+            ),
+            "sessions": [
+                {
+                    "session_ref": ready_session_ref,
+                    "review_item_id": 1,
+                    "expected_generation": 1,
+                    "frozen_epoch": 0,
+                    "frozen_from": 0,
+                    "frozen_to": 1,
+                    "frozen_locator_digest": "2" * 64,
+                    "records": [
+                        {
+                            "record_ref": ready_record_ref,
+                            "source_kind": "tool_output",
+                            "evidence_eligible": True,
+                            "content_hmac": "3" * 64,
+                        }
+                    ],
+                }
+            ],
+            "policy_digest": "4" * 64,
+            "transcript_adapter_digest": "5" * 64,
+            "catalog_adapter_digest": "6" * 64,
+            "catalog_snapshot_digest": "7" * 64,
+            "created_at": self.runtime.iso_utc(2_000_000_000.0),
+            "lease_expires_at": self.runtime.iso_utc(
+                2_000_000_600.0
+            ),
+        }
+        ready_envelope = {
+            "schema_version": 1,
+            "claim_contract": ready_contract,
+            "sessions": [
+                {
+                    "session_ref": ready_session_ref,
+                    "records": [
+                        {
+                            "record_ref": ready_record_ref,
+                            "source_kind": "tool_output",
+                            "evidence_eligible": True,
+                            "scope": "delta",
+                            "content": "private prior review output",
+                        }
+                    ],
+                }
+            ],
+            "catalog": [],
+            "policy": "Review policy.",
+            "result_schema_instructions": (
+                self.runtime.REVIEW_RESULT_SCHEMA_INSTRUCTIONS
+            ),
+        }
+        ready_claim = {
+            "schema_version": 1,
+            "status": "ready",
+            "batch_id": 7,
+            "owner_token": ready_owner_token,
+            "contract_digest": self.runtime.sha256_json(
+                ready_contract
+            ),
+            "lease_expires_at": ready_contract[
+                "lease_expires_at"
+            ],
+            "result_path": str(
+                self.runtime.REVIEW_RESULT_PARENT
+                / (
+                    f"{self.runtime.REVIEW_RESULT_PREFIX}"
+                    f"{os.getuid()}"
+                )
+                / f"result-{'8' * 32}.json"
+            ),
+            "envelope": ready_envelope,
+        }
+        ready_claim_output = self.runtime.canonical_json_bytes(
+            ready_claim
+        ).decode()
+        framed_ready_claim_output = (
+            "Chunk ID: deadbeef\n"
+            "Wall time: 0.125 seconds\n"
+            "Process exited with code 0\n"
+            "Approximate token count: 2048\n"
+            "Additional runtime metadata: allowed to drift\n"
+            "Output:\n"
+            f"{ready_claim_output}\n"
         )
+        general_ready_output = json.dumps(
+            {"status": "ready", "commit": unrelated_hash}
+        )
+
+        def response_line(payload: dict[str, object]) -> bytes:
+            return (
+                json.dumps(
+                    {"type": "response_item", "payload": payload}
+                )
+                + "\n"
+            ).encode()
+
+        records = [
+            response_line(
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                f'"owner_token":"{owner_token}" '
+                                f"commit {unrelated_hash}"
+                            ),
+                        }
+                    ],
+                }
+            ),
+            response_line(
+                {
+                    "type": "function_call_output",
+                    "output": ready_claim_output,
+                }
+            ),
+            response_line(
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": (
+                                f"owner token = {owner_token}; "
+                                f"commit {unrelated_hash}"
+                            ),
+                        }
+                    ],
+                }
+            ),
+            response_line(
+                {
+                    "type": "function_call_output",
+                    "output": (
+                        f"owner-token:{owner_token} "
+                        f"commit {unrelated_hash}"
+                    ),
+                }
+            ),
+            response_line(
+                {
+                    "type": "custom_tool_call_output",
+                    "output": (
+                        f"OWNER_TOKEN={owner_token.upper()} "
+                        f"commit {unrelated_hash}"
+                    ),
+                }
+            ),
+            response_line(
+                {
+                    "type": "custom_tool_call_output",
+                    "output": framed_ready_claim_output,
+                }
+            ),
+            response_line(
+                {
+                    "type": "function_call_output",
+                    "output": general_ready_output,
+                }
+            ),
+        ]
         connection, transcript, frozen = self.capture_and_claim(
-            [header, first],
-            reviewed_boundary=len(header),
+            [header, *records],
+            reviewed_boundary=(
+                len(header) + len(records[0]) + len(records[1])
+            ),
             session_id=session_id,
         )
         try:
-            self.runtime.read_frozen_transcript(
+            exported = self.runtime.read_frozen_transcript(
                 self.installation,
                 frozen,
                 self.config,
                 self.review,
             )
+            self.assertEqual(
+                [record.source_kind for record in exported.records],
+                [
+                    "user_direct",
+                    "assistant",
+                    "tool_output",
+                    "tool_output",
+                    "tool_output",
+                ],
+            )
+            self.assertEqual(
+                [record.evidence_eligible for record in exported.records],
+                [False, True, True, True, True],
+            )
+            self.assertEqual(
+                [record.scope for record in exported.records],
+                [
+                    "context_only",
+                    "delta",
+                    "delta",
+                    "delta",
+                    "delta",
+                ],
+            )
+            for record in exported.records[:-1]:
+                self.assertNotIn(owner_token, record.text.casefold())
+                self.assertIn(
+                    "[REDACTED:owner-token]", record.text
+                )
+                self.assertIn(unrelated_hash, record.text)
+            self.assertEqual(
+                exported.records[-1].text, general_ready_output
+            )
+            exported_text = "\n".join(
+                record.text for record in exported.records
+            )
+            for private in (
+                ready_owner_token,
+                str(ready_contract["owner_digest"]),
+                str(ready_claim["contract_digest"]),
+                str(ready_claim["result_path"]),
+                ready_session_ref,
+                ready_record_ref,
+                "private prior review output",
+            ):
+                self.assertNotIn(private, exported_text)
+            self.assertIn(unrelated_hash, exported_text)
+            self.assertEqual(
+                adapter_contract["record_exclusion"],
+                {
+                    "version": 1,
+                    "ready_review_claim_tool_output": (
+                        "direct-or-final-output-suffix-v1-strict-owner-hmac"
+                    ),
+                },
+            )
             transcript.write_bytes(
                 header
-                + first.replace(b"first content", b"other content")
+                + b"".join(records).replace(
+                    b"owner_token", b"owner_tokex"
+                )
             )
             self.assertEqual(
                 self.runtime.transcript_adapter_digest(self.review),
@@ -9385,7 +9660,172 @@ class CandidateCommitTests(CandidateBatchFixture):
                 )
                 self.abort(claim, attempt_now + 2)
 
-        attempt_now = now + len(invalid_documents) * 10
+        leaked_owner_tokens: list[str] = []
+        leak_kinds = (
+            "owner-token",
+            "owner-token-uppercase",
+            "owner-token-fullwidth",
+            "owner_digest",
+            "policy_digest",
+            "transcript_adapter_digest",
+            "catalog_adapter_digest",
+            "catalog_snapshot_digest",
+            "frozen_locator_digest",
+            "content_hmac",
+            "contract_digest",
+            "result_path",
+            "target_path",
+        )
+        for variant_offset, label in enumerate(leak_kinds):
+            attempt_now = (
+                now + (len(invalid_documents) + variant_offset) * 10
+            )
+            claim = self.claim(1, attempt_now)
+            owner_token = str(claim["owner_token"])
+            leaked_owner_tokens.append(owner_token)
+            contract = self.runtime.load_review_contract(
+                self.connection, int(claim["batch_id"]), "final"
+            )
+            contract_session = contract["sessions"][0]
+            if label == "owner-token":
+                sensitive_value = owner_token
+            elif label == "owner-token-uppercase":
+                sensitive_value = owner_token.upper()
+            elif label == "owner-token-fullwidth":
+                sensitive_value = "".join(
+                    chr(ord(character) + 0xFEE0)
+                    for character in owner_token
+                )
+            elif label in self.runtime.HEX_DIGEST_FIELDS:
+                sensitive_value = str(contract[label])
+            elif label == "frozen_locator_digest":
+                sensitive_value = str(
+                    contract_session["frozen_locator_digest"]
+                )
+            elif label == "content_hmac":
+                sensitive_value = str(
+                    contract_session["records"][0]["content_hmac"]
+                )
+            elif label == "contract_digest":
+                sensitive_value = str(claim["contract_digest"])
+            elif label == "result_path":
+                sensitive_value = str(claim["result_path"])
+            else:
+                sensitive_value = str(self.catalog_entry.skill_dir)
+            payload = self.result_payload(claim)
+            payload["sessions"][0]["problem_summary"] = (
+                f"Observed leaked review value {sensitive_value}."
+            )
+            payload["sessions"][0]["evidence"][0]["summary"] = (
+                f"The review exposed private value {sensitive_value}."
+            )
+            old_path = self.write_result(claim, payload)
+            with self.subTest(persisted_private_value=label):
+                retried = self.commit(
+                    claim, old_path, attempt_now + 1
+                )
+                new_path = Path(str(retried["result_path"]))
+                self.assertEqual(retried["status"], "retry")
+                self.assertEqual(
+                    retried["error_code"], "invalid_review_result"
+                )
+                self.assertNotIn(
+                    self.runtime.unicodedata.normalize(
+                        "NFKC", sensitive_value
+                    ).casefold(),
+                    self.runtime.unicodedata.normalize(
+                        "NFKC", json.dumps(retried, sort_keys=True)
+                    ).casefold(),
+                )
+                self.assertFalse(old_path.exists())
+                self.assertTrue(new_path.exists())
+                self.assertNotEqual(old_path, new_path)
+                self.assertEqual(
+                    self.connection.execute(
+                        "SELECT COUNT(*) FROM candidates"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    self.connection.execute(
+                        "SELECT COUNT(*) FROM candidate_evidence"
+                    ).fetchone()[0],
+                    0,
+                )
+                database_dump = self.runtime.unicodedata.normalize(
+                    "NFKC", "\n".join(self.connection.iterdump())
+                ).casefold()
+                self.assertNotIn(owner_token, database_dump)
+            self.abort(claim, attempt_now + 2)
+
+        copied_contract_refs = ("session_ref", "record_ref")
+        for ref_offset, ref_kind in enumerate(copied_contract_refs):
+            attempt_now = (
+                now
+                + (
+                    len(invalid_documents)
+                    + len(leak_kinds)
+                    + ref_offset
+                )
+                * 10
+            )
+            claim = self.claim(1, attempt_now)
+            contract = self.runtime.load_review_contract(
+                self.connection, int(claim["batch_id"]), "final"
+            )
+            contract_session = contract["sessions"][0]
+            copied_ref = (
+                str(contract_session["session_ref"])
+                if ref_kind == "session_ref"
+                else str(contract_session["records"][0]["record_ref"])
+            )
+            payload = self.result_payload(claim)
+            payload["sessions"][0]["problem_summary"] = (
+                f"Copied contract reference {copied_ref}."
+            )
+            payload["sessions"][0]["evidence"][0]["summary"] = (
+                f"The review exposed contract reference {copied_ref}."
+            )
+            old_path = self.write_result(claim, payload)
+            with self.subTest(copied_contract_ref=ref_kind):
+                retried = self.commit(
+                    claim, old_path, attempt_now + 1
+                )
+                new_path = Path(str(retried["result_path"]))
+                self.assertEqual(retried["status"], "retry")
+                self.assertEqual(
+                    retried["error_code"], "invalid_review_result"
+                )
+                self.assertNotIn(
+                    copied_ref,
+                    json.dumps(retried, sort_keys=True),
+                )
+                self.assertFalse(old_path.exists())
+                self.assertTrue(new_path.exists())
+                self.assertNotEqual(old_path, new_path)
+                self.assertEqual(
+                    self.connection.execute(
+                        "SELECT COUNT(*) FROM candidates"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    self.connection.execute(
+                        "SELECT COUNT(*) FROM candidate_evidence"
+                    ).fetchone()[0],
+                    0,
+                )
+            self.abort(claim, attempt_now + 2)
+
+        attempt_now = (
+            now
+            + (
+                len(invalid_documents)
+                + len(leak_kinds)
+                + len(copied_contract_refs)
+            )
+            * 10
+        )
         claim = self.claim(1, attempt_now)
         payload = self.result_payload(claim)
         payload["sessions"][0]["validation_plan"] = (
@@ -9405,6 +9845,50 @@ class CandidateCommitTests(CandidateBatchFixture):
         self.assertFalse(old_path.exists())
         self.assertTrue(new_path.exists())
         self.assertNotEqual(old_path, new_path)
+        self.abort(claim, attempt_now + 2)
+
+        clean_now = attempt_now + 10
+        clean_claim = self.claim(1, clean_now)
+        clean_contract = self.runtime.load_review_contract(
+            self.connection, int(clean_claim["batch_id"]), "final"
+        )
+        clean_session = clean_contract["sessions"][0]
+        sensitive_hashes = {
+            str(clean_claim["owner_token"]),
+            str(clean_claim["contract_digest"]),
+            *(
+                str(clean_contract[field])
+                for field in self.runtime.HEX_DIGEST_FIELDS
+            ),
+            str(clean_session["frozen_locator_digest"]),
+            str(clean_session["records"][0]["content_hmac"]),
+        }
+        unrelated_hash = next(
+            character * 64
+            for character in "fedcba9876543210"
+            if character * 64 not in sensitive_hashes
+        )
+        clean_payload = self.result_payload(clean_claim)
+        clean_payload["sessions"][0]["problem_summary"] = (
+            f"Correlated diagnostic hash {unrelated_hash}."
+        )
+        clean_path = self.write_result(clean_claim, clean_payload)
+        completed = self.commit(
+            clean_claim, clean_path, clean_now + 1
+        )
+        stored_summary = self.connection.execute(
+            "SELECT problem_summary FROM candidates"
+        ).fetchone()["problem_summary"]
+        database_dump = self.runtime.unicodedata.normalize(
+            "NFKC", "\n".join(self.connection.iterdump())
+        ).casefold()
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(
+            stored_summary,
+            f"Correlated diagnostic hash {unrelated_hash}.",
+        )
+        for owner_token in leaked_owner_tokens:
+            self.assertNotIn(owner_token, database_dump)
 
     def test_foreign_result_is_preserved_and_never_rotated(self) -> None:
         now = 2_000_000_000.0
@@ -9875,6 +10359,7 @@ class CandidateCommitTests(CandidateBatchFixture):
                     "tombstone_until",
                     self.runtime.iso_utc(now + 500),
                 ),
+                ("unknown-status", "status", "mystery"),
             )
         ):
             corrupt_now = now + 40 + offset * 3
@@ -11439,7 +11924,113 @@ class CandidateMaintenanceTests(CandidateBatchFixture):
             ),
         )
 
+        lowered_retention = replace(
+            self.config,
+            rejected_tombstone_days=30,
+            terminal_candidate_retention_days=30,
+        )
+        drift_due = rejected_at + 30 * 86_400
+        before_drift = tuple(
+            self.connection.execute(
+                """
+                SELECT target_path,target_locator,proposal_intent,
+                  problem_summary,proposal_summary,validation_plan,
+                  risk_level
+                FROM candidates WHERE id=?
+                """,
+                (candidate_id,),
+            ).fetchone()
+        )
+        evidence_before_drift = int(
+            self.connection.execute(
+                """
+                SELECT COUNT(*) FROM candidate_evidence
+                WHERE candidate_id=?
+                """,
+                (candidate_id,),
+            ).fetchone()[0]
+        )
+        drift_maintenance = self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            lowered_retention,
+            drift_due,
+        )
+        self.assertEqual(
+            drift_maintenance["candidate_text_redacted"], 0
+        )
+        self.assertEqual(
+            tuple(
+                self.connection.execute(
+                    """
+                    SELECT target_path,target_locator,proposal_intent,
+                      problem_summary,proposal_summary,validation_plan,
+                      risk_level
+                    FROM candidates WHERE id=?
+                    """,
+                    (candidate_id,),
+                ).fetchone()
+            ),
+            before_drift,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                """
+                SELECT COUNT(*) FROM candidate_evidence
+                WHERE candidate_id=?
+                """,
+                (candidate_id,),
+            ).fetchone()[0],
+            evidence_before_drift,
+        )
+
+        drift_recurrence_at = rejected_at + 40 * 86_400
+        drift_claim = self.claim(1, drift_recurrence_at)
+        drift_path = self.write_result(
+            drift_claim, self.result_payload(drift_claim)
+        )
+        self.commit(
+            drift_claim, drift_path, drift_recurrence_at + 1
+        )
+        drift_inspected = self.runtime.inspect_candidate(
+            self.connection,
+            self.runtime.display_id("C", candidate_id),
+        )
+        self.assertEqual(drift_inspected["status"], "rejected")
+        self.assertEqual(drift_inspected["occurrence_count"], 5)
+        self.assertEqual(
+            drift_inspected["tombstone_until"],
+            self.runtime.iso_utc(tombstone_until),
+        )
+        self.assertGreater(
+            len(drift_inspected["evidence"]),
+            evidence_before_drift,
+        )
+
         expired_at = tombstone_until + 1
+        expiry_cleanup = self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            lowered_retention,
+            expired_at,
+        )
+        self.assertEqual(
+            expiry_cleanup["candidate_text_redacted"], 1
+        )
+        self.assertEqual(
+            self.connection.execute(
+                """
+                SELECT COUNT(*) FROM candidate_evidence
+                WHERE candidate_id=?
+                """,
+                (candidate_id,),
+            ).fetchone()[0],
+            0,
+        )
+        self.runtime.inspect_candidate(
+            self.connection,
+            self.runtime.display_id("C", candidate_id),
+        )
         expired_claim = self.claim(1, expired_at)
         expired_payload = self.result_payload(expired_claim)
         expired_path = self.write_result(
@@ -11458,7 +12049,7 @@ class CandidateMaintenanceTests(CandidateBatchFixture):
             tuple(expired),
             (
                 "proposed",
-                5,
+                6,
                 self.runtime.iso_utc(expired_at + 1),
                 None,
                 str(self.catalog_entry.skill_dir),
@@ -11496,16 +12087,122 @@ class CandidateMaintenanceTests(CandidateBatchFixture):
             """,
             (maintenance_marker,),
         )
+        for invalid_tombstone in (
+            "not-utc",
+            "9998-01-01T24:00:00Z",
+            "9998-01-01T00:00:00Z",
+        ):
+            self.connection.execute(
+                """
+                UPDATE candidates
+                SET status='rejected',tombstone_until=?
+                WHERE id=?
+                """,
+                (invalid_tombstone, strict_id),
+            )
+            with self.subTest(
+                maintenance_state="rejected-invalid-tombstone",
+                tombstone=invalid_tombstone,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^candidate_maintenance_state_corrupt$",
+                ):
+                    self.runtime.run_maintenance(
+                        self.connection,
+                        self.installation,
+                        self.config,
+                        strict_due,
+                    )
+                self.assertEqual(
+                    tuple(
+                        self.connection.execute(
+                            """
+                            SELECT status,tombstone_until,target_path
+                            FROM candidates WHERE id=?
+                            """,
+                            (strict_id,),
+                        ).fetchone()
+                    ),
+                    (
+                        "rejected",
+                        invalid_tombstone,
+                        str(self.catalog_entry.skill_dir),
+                    ),
+                )
+                self.assertEqual(
+                    self.connection.execute(
+                        "SELECT COUNT(*) FROM candidate_evidence "
+                        "WHERE candidate_id=?",
+                        (strict_id,),
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    self.connection.execute(
+                        "SELECT value FROM metadata "
+                        "WHERE key='last_maintenance_at'"
+                    ).fetchone()["value"],
+                    maintenance_marker,
+                )
+        malformed_day = strict_now - strict_now % 86_400
+        malformed_updated_at = (
+            self.runtime.iso_utc(malformed_day)[:10]
+            + "T24:00:00Z"
+        )
+        active_tombstone = self.runtime.iso_utc(
+            malformed_day + 61 * 86_400
+        )
         self.connection.execute(
             """
             UPDATE candidates
-            SET status='rejected',tombstone_until='not-utc'
+            SET status='rejected',updated_at=?,tombstone_until=?
             WHERE id=?
             """,
-            (strict_id,),
+            (
+                malformed_updated_at,
+                active_tombstone,
+                strict_id,
+            ),
         )
         with self.subTest(
-            maintenance_state="rejected-invalid-tombstone"
+            maintenance_state="rejected-invalid-updated-at"
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "^candidate_maintenance_state_corrupt$",
+            ):
+                self.runtime.run_maintenance(
+                    self.connection,
+                    self.installation,
+                    lowered_retention,
+                    malformed_day + 32 * 86_400,
+                )
+            self.assertEqual(
+                tuple(
+                    self.connection.execute(
+                        """
+                        SELECT status,updated_at,tombstone_until
+                        FROM candidates WHERE id=?
+                        """,
+                        (strict_id,),
+                    ).fetchone()
+                ),
+                (
+                    "rejected",
+                    malformed_updated_at,
+                    active_tombstone,
+                ),
+            )
+        self.connection.execute(
+            """
+            UPDATE candidates SET status='stale',updated_at=?,
+                tombstone_until=NULL WHERE id=?
+            """,
+            ("not-utc", strict_id),
+        )
+        with self.subTest(
+            maintenance_state="stale-invalid-updated-at"
         ):
             with self.assertRaisesRegex(
                 ValueError,
@@ -11521,39 +12218,17 @@ class CandidateMaintenanceTests(CandidateBatchFixture):
                 tuple(
                     self.connection.execute(
                         """
-                        SELECT status,tombstone_until,target_path
+                        SELECT status,updated_at,tombstone_until
                         FROM candidates WHERE id=?
                         """,
                         (strict_id,),
                     ).fetchone()
                 ),
-                (
-                    "rejected",
-                    "not-utc",
-                    str(self.catalog_entry.skill_dir),
-                ),
-            )
-            self.assertEqual(
-                self.connection.execute(
-                    "SELECT COUNT(*) FROM candidate_evidence "
-                    "WHERE candidate_id=?",
-                    (strict_id,),
-                ).fetchone()[0],
-                1,
-            )
-            self.assertEqual(
-                self.connection.execute(
-                    "SELECT value FROM metadata "
-                    "WHERE key='last_maintenance_at'"
-                ).fetchone()["value"],
-                maintenance_marker,
+                ("stale", "not-utc", None),
             )
         self.connection.execute(
-            """
-            UPDATE candidates
-            SET status='stale',tombstone_until=NULL WHERE id=?
-            """,
-            (strict_id,),
+            "UPDATE candidates SET updated_at=? WHERE id=?",
+            (strict_updated_at, strict_id),
         )
         live_shape = self.connection.execute(
             """
