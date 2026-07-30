@@ -76,8 +76,12 @@ REVIEW_MAINTENANCE_BATCH_MAX = 200
 CANDIDATE_TERMINAL_MAX_DAYS = 90
 QUALITY_EPOCH_MAX = 8
 QUALITY_OBSERVATION_MAX = 100
-QUALITY_EPOCH_MAX_BYTES = 16_384
+QUALITY_BATCH_MAX = 200
+QUALITY_EPOCH_MAX_BYTES = 65_536
 QUALITY_OBSERVATION_MAX_BYTES = 8_192
+QUALITY_AUDIT_MAX_BYTES = 8_192
+QUALITY_LABEL_MAX_BYTES = 2_048
+QUALITY_CANDIDATE_SUBJECT_MAX_BYTES = 131_072
 QUALITY_SOURCE_MAX_BYTES = 1_048_576
 QUALITY_PHASE4_REPORT_MAX_BYTES = 16_384
 QUALITY_COLLECTION_TTL_SECONDS = 30 * 86_400
@@ -88,6 +92,7 @@ QUALITY_NEXT_EPOCH_KEY = "quality.next_epoch_id"
 REVIEW_NEXT_BATCH_ID_KEY = "review.next_batch_id"
 QUALITY_INVALID_REASONS = frozenset(
     {
+        "quality_collection_expired",
         "quality_observation_capacity",
         "quality_provenance_drift",
     }
@@ -4455,6 +4460,25 @@ QUALITY_OBSERVATION_KEYS = frozenset(
         "finished_at",
     }
 )
+QUALITY_LABEL_KEYS = frozenset(
+    {
+        "schema_version",
+        "epoch_id",
+        "candidate_id",
+        "subject_digest",
+        "evaluation_worthy",
+        "target_correct",
+        "external_content_adoption",
+        "attested_at",
+    }
+)
+QUALITY_LABEL_ANSWER_KEYS = frozenset(
+    {
+        "evaluation_worthy",
+        "target_correct",
+        "external_content_adoption",
+    }
+)
 
 
 def parse_quality_epoch_display_id(value: object) -> int:
@@ -4499,6 +4523,21 @@ def quality_observation_key(
     return (
         f"quality.epoch.{display_id('Q', number)}"
         f".batch.{batch_id}"
+    )
+
+
+def quality_label_key(
+    epoch_id: object, candidate_id: object
+) -> str:
+    number = parse_quality_epoch_display_id(epoch_id)
+    if (
+        type(candidate_id) is not int
+        or not 1 <= candidate_id <= SQLITE_INTEGER_MAX
+    ):
+        raise ValueError("invalid_candidate_id")
+    return (
+        f"quality.epoch.{display_id('Q', number)}"
+        f".label.{display_id('C', candidate_id)}"
     )
 
 
@@ -4754,7 +4793,14 @@ def quality_contract_payload() -> dict[str, object]:
         "limits": {
             "epochs": QUALITY_EPOCH_MAX,
             "observations": QUALITY_OBSERVATION_MAX,
+            "batches": QUALITY_BATCH_MAX,
             "sessions_minimum": 10,
+            "epoch_bytes": QUALITY_EPOCH_MAX_BYTES,
+            "observation_bytes": QUALITY_OBSERVATION_MAX_BYTES,
+            "label_bytes": QUALITY_LABEL_MAX_BYTES,
+            "candidate_subject_bytes": (
+                QUALITY_CANDIDATE_SUBJECT_MAX_BYTES
+            ),
         },
         "thresholds": {
             "evaluation_worthy_numerator": 1,
@@ -4909,6 +4955,135 @@ def _valid_quality_terminal(
     )
 
 
+def _valid_quality_seal(
+    value: object,
+    first_batch_id: int,
+) -> bool:
+    if (
+        type(value) is not dict
+        or set(value)
+        != {
+            "schema_version",
+            "high_water_batch_id",
+            "batches",
+            "batch_set_digest",
+            "observations",
+            "observation_set_digest",
+            "distinct_session_count",
+            "candidate_count",
+            "candidates",
+            "sealed_at",
+            "label_expires_at",
+            "seal_digest",
+        }
+        or type(value.get("schema_version")) is not int
+        or value.get("schema_version") != 1
+        or type(value.get("high_water_batch_id")) is not int
+        or not first_batch_id
+        <= value["high_water_batch_id"]
+        <= SQLITE_INTEGER_MAX
+        or value["high_water_batch_id"] - first_batch_id + 1
+        > QUALITY_BATCH_MAX
+        or type(value.get("batches")) is not list
+        or len(value["batches"])
+        != value["high_water_batch_id"] - first_batch_id + 1
+        or not _is_lower_hex(value.get("batch_set_digest"), 64)
+        or type(value.get("observations")) is not list
+        or not 1
+        <= len(value["observations"])
+        <= QUALITY_OBSERVATION_MAX
+        or type(value.get("candidates")) is not list
+        or not 1
+        <= len(value["candidates"])
+        <= QUALITY_OBSERVATION_MAX
+        or type(value.get("distinct_session_count")) is not int
+        or not 10
+        <= value["distinct_session_count"]
+        <= QUALITY_OBSERVATION_MAX
+        or type(value.get("candidate_count")) is not int
+        or value.get("candidate_count") != len(value["candidates"])
+        or not _is_lower_hex(
+            value.get("observation_set_digest"), 64
+        )
+        or not _is_iso_utc_string(value.get("sealed_at"))
+        or not _is_iso_utc_string(value.get("label_expires_at"))
+        or parse_iso_utc(value["label_expires_at"])
+        != parse_iso_utc(value["sealed_at"])
+        + QUALITY_SEALED_TTL_SECONDS
+        or not _is_lower_hex(value.get("seal_digest"), 64)
+    ):
+        return False
+    batches = value["batches"]
+    if any(
+        type(item) is not dict
+        or set(item)
+        != {"batch_id", "terminal_status", "audit_digest"}
+        or type(item.get("batch_id")) is not int
+        or item.get("terminal_status")
+        not in {"completed", "aborted", "expired", "failed"}
+        or not _is_lower_hex(item.get("audit_digest"), 64)
+        for item in batches
+    ):
+        return False
+    if [item["batch_id"] for item in batches] != list(
+        range(first_batch_id, value["high_water_batch_id"] + 1)
+    ):
+        return False
+    observations = value["observations"]
+    if any(
+        type(item) is not dict
+        or set(item) != {"batch_id", "digest"}
+        or type(item.get("batch_id")) is not int
+        or not first_batch_id
+        <= item["batch_id"]
+        <= value["high_water_batch_id"]
+        or not _is_lower_hex(item.get("digest"), 64)
+        for item in observations
+    ):
+        return False
+    observation_ids = [
+        item["batch_id"] for item in observations
+    ]
+    if observation_ids != sorted(observation_ids) or len(
+        observation_ids
+    ) != len(set(observation_ids)):
+        return False
+    if set(observation_ids) != {
+        item["batch_id"]
+        for item in batches
+        if item["terminal_status"] == "completed"
+    }:
+        return False
+    candidates = value["candidates"]
+    if any(
+        type(item) is not dict
+        or set(item) != {"candidate_id", "subject_digest"}
+        or type(item.get("candidate_id")) is not int
+        or not 1 <= item["candidate_id"] <= SQLITE_INTEGER_MAX
+        or not _is_lower_hex(item.get("subject_digest"), 64)
+        for item in candidates
+    ):
+        return False
+    candidate_ids = [
+        item["candidate_id"] for item in candidates
+    ]
+    if candidate_ids != sorted(candidate_ids) or len(
+        candidate_ids
+    ) != len(set(candidate_ids)):
+        return False
+    payload = {
+        name: item
+        for name, item in value.items()
+        if name != "seal_digest"
+    }
+    return (
+        sha256_json(batches) == value["batch_set_digest"]
+        and sha256_json(observations)
+        == value["observation_set_digest"]
+        and sha256_json(payload) == value["seal_digest"]
+    )
+
+
 def _valid_quality_lifecycle(
     value: dict[str, object],
     state: str,
@@ -4922,13 +5097,25 @@ def _valid_quality_lifecycle(
         return sealed is None and terminal is None and ended_at is None
     if state == "sealed":
         return (
-            type(sealed) is dict
+            _valid_quality_seal(
+                sealed, int(value["first_batch_id"])
+            )
+            and parse_iso_utc(sealed["sealed_at"])
+            >= parse_iso_utc(value["started_at"])
+            and parse_iso_utc(sealed["sealed_at"])
+            < parse_iso_utc(value["collection_expires_at"])
             and terminal is None
             and ended_at is None
         )
     if state in {"passed", "failed"}:
         return (
-            type(sealed) is dict
+            _valid_quality_seal(
+                sealed, int(value["first_batch_id"])
+            )
+            and parse_iso_utc(sealed["sealed_at"])
+            >= parse_iso_utc(value["started_at"])
+            and parse_iso_utc(sealed["sealed_at"])
+            < parse_iso_utc(value["collection_expires_at"])
             and _valid_quality_terminal(
                 terminal, str(value["epoch_id"]), state
             )
@@ -4936,7 +5123,18 @@ def _valid_quality_lifecycle(
         )
     if state == "invalid":
         return (
-            terminal is None and ended_at is None
+            terminal is None
+            and ended_at is None
+            and (
+                sealed is None
+                or _valid_quality_seal(
+                    sealed, int(value["first_batch_id"])
+                )
+                and parse_iso_utc(sealed["sealed_at"])
+                >= parse_iso_utc(value["started_at"])
+                and parse_iso_utc(sealed["sealed_at"])
+                < parse_iso_utc(value["collection_expires_at"])
+            )
         ) or (
             _valid_quality_terminal(
                 terminal, str(value["epoch_id"]), state
@@ -4987,6 +5185,9 @@ def load_quality_epoch(
         )
         or not _is_iso_utc_string(value.get("started_at"))
         or not _is_iso_utc_string(value.get("collection_expires_at"))
+        or parse_iso_utc(value["collection_expires_at"])
+        != parse_iso_utc(value["started_at"])
+        + QUALITY_COLLECTION_TTL_SECONDS
         or (
             state == "invalid"
             and (
@@ -5159,6 +5360,698 @@ def load_quality_observation(
     return value
 
 
+def quality_observation_inventory(
+    connection: sqlite3.Connection,
+    epoch_id: str,
+) -> list[dict[str, object]]:
+    parse_quality_epoch_display_id(epoch_id)
+    rows = list(
+        connection.execute(
+            """
+            SELECT key FROM metadata
+            WHERE key GLOB ?
+            ORDER BY key
+            LIMIT ?
+            """,
+            (
+                f"quality.epoch.{epoch_id}.batch.*",
+                QUALITY_OBSERVATION_MAX + 1,
+            ),
+        )
+    )
+    if len(rows) > QUALITY_OBSERVATION_MAX:
+        raise ValueError("invalid_quality_observation")
+    observations: list[dict[str, object]] = []
+    for row in rows:
+        match = re.fullmatch(
+            rf"quality\.epoch\.{re.escape(epoch_id)}"
+            r"\.batch\.([1-9][0-9]*)",
+            str(row["key"]),
+        )
+        if match is None:
+            raise ValueError("invalid_quality_observation")
+        batch_id = int(match.group(1))
+        if (
+            batch_id > SQLITE_INTEGER_MAX
+            or quality_observation_key(epoch_id, batch_id)
+            != row["key"]
+        ):
+            raise ValueError("invalid_quality_observation")
+        observations.append(
+            load_quality_observation(
+                connection, epoch_id, batch_id
+            )
+        )
+    observations.sort(key=lambda item: int(item["batch_id"]))
+    return observations
+
+
+def load_quality_review_audit(
+    connection: sqlite3.Connection,
+    batch_id: int,
+    *,
+    expected_status: Optional[str] = None,
+) -> dict[str, object]:
+    if (
+        type(batch_id) is not int
+        or not 1 <= batch_id <= SQLITE_INTEGER_MAX
+        or (
+            expected_status is not None
+            and expected_status
+            not in {"completed", "aborted", "expired", "failed"}
+        )
+    ):
+        raise ValueError("invalid_review_batch_id")
+    audit = _load_quality_metadata_json(
+        connection,
+        review_audit_key(batch_id),
+        QUALITY_AUDIT_MAX_BYTES,
+        "invalid_quality_review_audit",
+        required=True,
+    )
+    exclusions = audit.get("exclusion_counts")
+    terminal_status = audit.get("terminal_status")
+    if (
+        set(audit)
+        != {
+            "schema_version",
+            "batch_id",
+            "terminal_status",
+            "owner_digest",
+            "policy_digest",
+            "transcript_adapter_digest",
+            "catalog_adapter_digest",
+            "catalog_snapshot_digest",
+            "session_count",
+            "generation_count",
+            "candidate_count",
+            "exclusion_counts",
+            "batch_capacity_released",
+            "finished_at",
+        }
+        or type(audit.get("schema_version")) is not int
+        or audit["schema_version"] != 1
+        or audit.get("batch_id") != batch_id
+        or terminal_status
+        not in {"completed", "aborted", "expired", "failed"}
+        or (
+            expected_status is not None
+            and terminal_status != expected_status
+        )
+        or any(
+            not _is_lower_hex(audit.get(name), 64)
+            for name in (
+                "owner_digest",
+                "policy_digest",
+                "transcript_adapter_digest",
+                "catalog_adapter_digest",
+                "catalog_snapshot_digest",
+            )
+        )
+        or any(
+            type(audit.get(name)) is not int
+            or not 0 <= audit[name] <= REVIEW_BATCH_SESSIONS_MAX
+            for name in (
+                "session_count",
+                "generation_count",
+                "candidate_count",
+                "batch_capacity_released",
+            )
+        )
+        or (
+            terminal_status == "completed"
+            and not 1 <= audit["generation_count"]
+        )
+        or audit["session_count"] != audit["generation_count"]
+        or audit["candidate_count"] > audit["generation_count"]
+        or (
+            terminal_status != "completed"
+            and audit["candidate_count"] != 0
+        )
+        or type(exclusions) is not dict
+        or len(exclusions) > REVIEW_BATCH_SESSIONS_MAX
+        or any(
+            type(name) is not str
+            or name not in REVIEW_EXTERNAL_EXCLUSION_REASONS
+            or type(count) is not int
+            or not 1 <= count <= REVIEW_BATCH_SESSIONS_MAX
+            for name, count in exclusions.items()
+        )
+        or audit["candidate_count"]
+        + sum(exclusions.values())
+        + audit["batch_capacity_released"]
+        > REVIEW_BATCH_SESSIONS_MAX
+        or not _is_iso_utc_string(audit.get("finished_at"))
+    ):
+        raise ValueError("invalid_quality_review_audit")
+    return audit
+
+
+def quality_candidate_subject(
+    connection: sqlite3.Connection,
+    candidate_id: int,
+) -> dict[str, object]:
+    if (
+        type(candidate_id) is not int
+        or not 1 <= candidate_id <= SQLITE_INTEGER_MAX
+    ):
+        raise ValueError("invalid_candidate_id")
+    if (
+        connection.execute(
+            """
+            SELECT 1 FROM candidate_evidence
+            WHERE candidate_id=?
+            ORDER BY session_key,signal_type
+            LIMIT 1 OFFSET ?
+            """,
+            (candidate_id, CANDIDATE_INSPECT_EVIDENCE_MAX),
+        ).fetchone()
+        is not None
+    ):
+        raise ValueError("quality_candidate_evidence_saturated")
+    inspected = inspect_candidate(
+        connection, display_id("C", candidate_id)
+    )
+    evidence = [
+        {
+            "signal_type": signal_type,
+            "source_kind": source_kind,
+            "summary": summary,
+        }
+        for signal_type, source_kind, summary in sorted(
+            {
+                (
+                    str(item["signal_type"]),
+                    str(item["source_kind"]),
+                    str(item["summary"]),
+                )
+                for item in inspected["evidence"]
+            }
+        )
+    ]
+    subject = {
+        "schema_version": 1,
+        "target_identity": inspected["target_identity"],
+        "classification": inspected["classification"],
+        "problem_summary": inspected["problem_summary"],
+        "proposal_summary": inspected["proposal_summary"],
+        "validation_plan": inspected["validation_plan"],
+        "risk_level": inspected["risk_level"],
+        "evidence": evidence,
+    }
+    encoded = canonical_json_bytes(subject)
+    if (
+        len(encoded) > QUALITY_CANDIDATE_SUBJECT_MAX_BYTES
+        or b"redacted:" in encoded
+    ):
+        raise ValueError("invalid_quality_candidate_subject")
+    return subject
+
+
+def quality_candidate_subject_digest(
+    connection: sqlite3.Connection,
+    candidate_id: int,
+) -> str:
+    return sha256_json(
+        quality_candidate_subject(connection, candidate_id)
+    )
+
+
+def _quality_sealed_candidate(
+    epoch: dict[str, object],
+    candidate_id: int,
+) -> dict[str, object]:
+    sealed = epoch.get("sealed")
+    if (
+        type(sealed) is not dict
+        or not _valid_quality_seal(
+            sealed, int(epoch["first_batch_id"])
+        )
+    ):
+        raise ValueError("quality_epoch_not_sealed")
+    matches = [
+        item
+        for item in sealed["candidates"]
+        if item["candidate_id"] == candidate_id
+    ]
+    if len(matches) != 1:
+        raise ValueError("quality_candidate_not_in_sample")
+    return matches[0]
+
+
+def load_quality_label(
+    connection: sqlite3.Connection,
+    epoch_id: str,
+    candidate_id: int,
+    *,
+    required: bool = True,
+) -> Optional[dict[str, object]]:
+    epoch = load_quality_epoch(connection, epoch_id)
+    sealed_candidate = _quality_sealed_candidate(
+        epoch, candidate_id
+    )
+    value = _load_quality_metadata_json(
+        connection,
+        quality_label_key(epoch_id, candidate_id),
+        QUALITY_LABEL_MAX_BYTES,
+        "invalid_quality_label",
+        required=required,
+    )
+    if value is None:
+        return None
+    attested_at = value.get("attested_at")
+    sealed = epoch["sealed"]
+    if (
+        set(value) != QUALITY_LABEL_KEYS
+        or type(value.get("schema_version")) is not int
+        or value["schema_version"] != 1
+        or value.get("epoch_id") != epoch_id
+        or type(value.get("candidate_id")) is not int
+        or value["candidate_id"] != candidate_id
+        or value.get("subject_digest")
+        != sealed_candidate["subject_digest"]
+        or any(
+            type(value.get(name)) is not bool
+            for name in QUALITY_LABEL_ANSWER_KEYS
+        )
+        or not _is_iso_utc_string(attested_at)
+        or parse_iso_utc(attested_at)
+        < parse_iso_utc(sealed["sealed_at"])
+        or parse_iso_utc(attested_at)
+        >= parse_iso_utc(sealed["label_expires_at"])
+    ):
+        raise ValueError("invalid_quality_label")
+    return value
+
+
+def quality_label_inventory(
+    connection: sqlite3.Connection,
+    epoch_id: str,
+) -> list[dict[str, object]]:
+    parse_quality_epoch_display_id(epoch_id)
+    rows = list(
+        connection.execute(
+            """
+            SELECT key FROM metadata
+            WHERE key GLOB ?
+            ORDER BY key
+            LIMIT ?
+            """,
+            (
+                f"quality.epoch.{epoch_id}.label.*",
+                QUALITY_OBSERVATION_MAX + 1,
+            ),
+        )
+    )
+    if len(rows) > QUALITY_OBSERVATION_MAX:
+        raise ValueError("invalid_quality_label")
+    labels: list[dict[str, object]] = []
+    for row in rows:
+        match = re.fullmatch(
+            rf"quality\.epoch\.{re.escape(epoch_id)}"
+            r"\.label\.(C-(?:00[1-9]|0[1-9][0-9]|"
+            r"[1-9][0-9]{2,}))",
+            str(row["key"]),
+        )
+        if match is None:
+            raise ValueError("invalid_quality_label")
+        candidate_id = parse_candidate_display_id(match.group(1))
+        if (
+            quality_label_key(epoch_id, candidate_id)
+            != row["key"]
+        ):
+            raise ValueError("invalid_quality_label")
+        labels.append(
+            load_quality_label(
+                connection, epoch_id, candidate_id
+            )
+        )
+    labels.sort(key=lambda item: int(item["candidate_id"]))
+    return labels
+
+
+def prepare_quality_label(
+    connection: sqlite3.Connection,
+    installation: Installation,
+    candidate_display_id: str,
+    now: float,
+) -> dict[str, object]:
+    candidate_id = parse_candidate_display_id(
+        candidate_display_id
+    )
+    epoch = active_quality_epoch(connection)
+    if epoch is None:
+        raise ValueError("quality_epoch_missing")
+    if epoch["state"] != "sealed":
+        raise ValueError("quality_epoch_not_sealed")
+    sealed = epoch["sealed"]
+    if now >= parse_iso_utc(sealed["label_expires_at"]):
+        raise ValueError("quality_label_expired")
+    identity = load_quality_identity_key(installation)
+    current = current_quality_provenance(
+        installation, identity_key=identity
+    )
+    if any(
+        current[name] != epoch[name]
+        for name in QUALITY_PROVENANCE_FIELDS
+    ):
+        raise ValueError("quality_provenance_drift")
+    sealed_candidate = _quality_sealed_candidate(
+        epoch, candidate_id
+    )
+    if not quality_sealed_witness_current(connection, epoch):
+        raise ValueError("quality_sealed_witness_changed")
+    if (
+        load_quality_label(
+            connection,
+            str(epoch["epoch_id"]),
+            candidate_id,
+            required=False,
+        )
+        is not None
+    ):
+        raise ValueError("quality_label_exists")
+    subject = quality_candidate_subject(connection, candidate_id)
+    subject_digest = sha256_json(subject)
+    if subject_digest != sealed_candidate["subject_digest"]:
+        raise ValueError("quality_candidate_subject_changed")
+    return {
+        "schema_version": 1,
+        "epoch_id": epoch["epoch_id"],
+        "candidate_id": candidate_display_id,
+        "seal_digest": sealed["seal_digest"],
+        "subject_digest": subject_digest,
+        "subject": subject,
+    }
+
+
+def commit_quality_label(
+    connection: sqlite3.Connection,
+    installation: Installation,
+    candidate_display_id: str,
+    expected_epoch_id: str,
+    expected_seal_digest: str,
+    expected_subject_digest: str,
+    answers: dict[str, bool],
+    now: float,
+) -> dict[str, object]:
+    candidate_id = parse_candidate_display_id(
+        candidate_display_id
+    )
+    parse_quality_epoch_display_id(expected_epoch_id)
+    if (
+        connection.in_transaction
+        or not _is_lower_hex(expected_seal_digest, 64)
+        or not _is_lower_hex(expected_subject_digest, 64)
+        or type(answers) is not dict
+        or set(answers) != QUALITY_LABEL_ANSWER_KEYS
+        or any(type(value) is not bool for value in answers.values())
+    ):
+        raise ValueError("invalid_quality_label_input")
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        epoch = active_quality_epoch(connection)
+        if (
+            epoch is None
+            or epoch["epoch_id"] != expected_epoch_id
+            or epoch["state"] != "sealed"
+        ):
+            raise ValueError("quality_label_epoch_changed")
+        sealed = epoch["sealed"]
+        if sealed["seal_digest"] != expected_seal_digest:
+            raise ValueError("quality_label_epoch_changed")
+        if now < parse_iso_utc(sealed["sealed_at"]):
+            raise ValueError("invalid_quality_label_time")
+        if now >= parse_iso_utc(sealed["label_expires_at"]):
+            raise ValueError("quality_label_expired")
+        identity = load_quality_identity_key(installation)
+        current = current_quality_provenance(
+            installation, identity_key=identity
+        )
+        if any(
+            current[name] != epoch[name]
+            for name in QUALITY_PROVENANCE_FIELDS
+        ):
+            _invalidate_quality_epoch(
+                connection,
+                epoch,
+                "quality_provenance_drift",
+                now,
+            )
+            connection.commit()
+            raise ValueError("quality_provenance_drift")
+        sealed_candidate = _quality_sealed_candidate(
+            epoch, candidate_id
+        )
+        if not quality_sealed_witness_current(
+            connection, epoch
+        ):
+            raise ValueError("quality_sealed_witness_changed")
+        current_subject_digest = quality_candidate_subject_digest(
+            connection, candidate_id
+        )
+        if not (
+            current_subject_digest
+            == sealed_candidate["subject_digest"]
+            == expected_subject_digest
+        ):
+            raise ValueError("quality_candidate_subject_changed")
+        if (
+            load_quality_label(
+                connection,
+                expected_epoch_id,
+                candidate_id,
+                required=False,
+            )
+            is not None
+        ):
+            raise ValueError("quality_label_exists")
+        label = {
+            "schema_version": 1,
+            "epoch_id": expected_epoch_id,
+            "candidate_id": candidate_id,
+            "subject_digest": expected_subject_digest,
+            **answers,
+            "attested_at": iso_utc(now),
+        }
+        encoded = canonical_json_bytes(label)
+        if len(encoded) > QUALITY_LABEL_MAX_BYTES:
+            raise ValueError("invalid_quality_label")
+        connection.execute(
+            "INSERT INTO metadata(key,value) VALUES(?,?)",
+            (
+                quality_label_key(
+                    expected_epoch_id, candidate_id
+                ),
+                encoded.decode("utf-8"),
+            ),
+        )
+        connection.commit()
+        return label
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def parse_quality_yes_no(value: object) -> bool:
+    if type(value) is not str or value not in {"yes", "no"}:
+        raise ValueError("invalid_quality_label_answer")
+    return value == "yes"
+
+
+def validate_quality_confirmation(
+    candidate_display_id: str,
+    subject_digest: str,
+    value: object,
+) -> None:
+    parse_candidate_display_id(candidate_display_id)
+    if (
+        not _is_lower_hex(subject_digest, 64)
+        or type(value) is not str
+        or value != f"{candidate_display_id}@{subject_digest}"
+    ):
+        raise ValueError("invalid_quality_label_confirmation")
+
+
+def _quality_epoch_provenance_current(
+    installation: Installation,
+    epoch: dict[str, object],
+) -> bool:
+    identity = load_quality_identity_key(installation)
+    current = current_quality_provenance(
+        installation, identity_key=identity
+    )
+    return all(
+        current[name] == epoch[name]
+        for name in QUALITY_PROVENANCE_FIELDS
+    )
+
+
+def _quality_sealed_source_current(
+    connection: sqlite3.Connection,
+    installation: Installation,
+    epoch: dict[str, object],
+) -> bool:
+    sealed = epoch.get("sealed")
+    return (
+        epoch.get("state") == "sealed"
+        and type(sealed) is dict
+        and _quality_epoch_provenance_current(
+            installation, epoch
+        )
+        and quality_sealed_witness_current(connection, epoch)
+        and all(
+            quality_candidate_subject_digest(
+                connection, int(item["candidate_id"])
+            )
+            == item["subject_digest"]
+            for item in sealed["candidates"]
+        )
+    )
+
+
+def quality_status(
+    connection: sqlite3.Connection,
+    installation: Installation,
+    now: float,
+) -> dict[str, object]:
+    if type(installation) is not Installation:
+        raise ValueError("invalid_quality_installation")
+    epoch = active_quality_epoch(connection)
+    if epoch is None:
+        epochs = quality_epoch_inventory(connection)
+        epoch = epochs[-1] if epochs else None
+    if epoch is None:
+        return {
+            "schema_version": 1,
+            "epoch_id": None,
+            "status": "IDLE",
+            "distinct_session_count": None,
+            "candidate_count": None,
+            "attested_label_count": 0,
+            "missing_labels": [],
+        }
+    state = str(epoch["state"])
+    if state == "collecting":
+        try:
+            source_current = _quality_epoch_provenance_current(
+                installation, epoch
+            )
+        except ValueError:
+            source_current = False
+        if (
+            now >= parse_iso_utc(epoch["collection_expires_at"])
+            or not source_current
+        ):
+            session_refs = set()
+            candidate_ids = set()
+            status = "INVALID"
+        else:
+            observations = quality_observation_inventory(
+                connection, str(epoch["epoch_id"])
+            )
+            session_refs = {
+                str(decision["session_ref"])
+                for observation in observations
+                for decision in observation["decisions"]
+            }
+            candidate_ids = {
+                int(decision["candidate_id"])
+                for observation in observations
+                for decision in observation["decisions"]
+                if decision["outcome"] == "candidate"
+            }
+            status = "COLLECTING"
+        label_count = 0
+        missing: list[str] = []
+    elif state == "sealed":
+        sealed = epoch["sealed"]
+        candidate_ids = {
+            int(item["candidate_id"])
+            for item in sealed["candidates"]
+        }
+        session_refs = set()
+        try:
+            source_current = _quality_sealed_source_current(
+                connection, installation, epoch
+            )
+        except ValueError:
+            source_current = False
+        if (
+            now >= parse_iso_utc(sealed["label_expires_at"])
+            or not source_current
+        ):
+            label_count = 0
+            missing = []
+            status = "INVALID"
+        else:
+            labels = quality_label_inventory(
+                connection, str(epoch["epoch_id"])
+            )
+            labeled_ids = {
+                int(item["candidate_id"]) for item in labels
+            }
+            missing = [
+                display_id("C", candidate_id)
+                for candidate_id in sorted(
+                    candidate_ids - labeled_ids
+                )
+            ]
+            label_count = len(labels)
+            status = (
+                "AWAITING_LABELS"
+                if missing
+                else "READY_TO_GATE"
+            )
+    else:
+        sealed = epoch.get("sealed")
+        candidate_ids = (
+            {
+                int(item["candidate_id"])
+                for item in sealed["candidates"]
+            }
+            if type(sealed) is dict
+            else set()
+        )
+        labels = (
+            quality_label_inventory(
+                connection, str(epoch["epoch_id"])
+            )
+            if type(sealed) is dict
+            and state in {"passed", "failed"}
+            else []
+        )
+        session_refs = set()
+        label_count = len(labels)
+        missing = []
+        status = {
+            "passed": "PASS",
+            "failed": "FAIL",
+            "invalid": "INVALID",
+            "superseded": "SUPERSEDED",
+        }.get(state)
+        if status is None:
+            raise ValueError("invalid_quality_epoch")
+    sealed = epoch.get("sealed")
+    return {
+        "schema_version": 1,
+        "epoch_id": epoch["epoch_id"],
+        "status": status,
+        "distinct_session_count": (
+            sealed["distinct_session_count"]
+            if type(sealed) is dict
+            else len(session_refs)
+        ),
+        "candidate_count": (
+            sealed["candidate_count"]
+            if type(sealed) is dict
+            else len(candidate_ids)
+        ),
+        "attested_label_count": label_count,
+        "missing_labels": missing,
+    }
+
+
 def _parse_quality_predecessor(
     connection: sqlite3.Connection,
     predecessor: Optional[str],
@@ -5325,7 +6218,7 @@ def _invalidate_quality_epoch(
 ) -> dict[str, object]:
     if (
         not connection.in_transaction
-        or epoch.get("state") != "collecting"
+        or epoch.get("state") not in {"collecting", "sealed"}
         or type(reason) is not str
         or reason not in QUALITY_INVALID_REASONS
     ):
@@ -5395,6 +6288,13 @@ def record_quality_observation(
         or batch_id < int(epoch["first_batch_id"])
     ):
         return None
+    if now >= parse_iso_utc(epoch["collection_expires_at"]):
+        return _invalidate_quality_epoch(
+            connection,
+            epoch,
+            "quality_collection_expired",
+            now,
+        )
     identity = load_quality_identity_key(installation)
     current = current_quality_provenance(
         installation, identity_key=identity
@@ -5467,34 +6367,12 @@ def record_quality_observation(
         or not _is_iso_utc_string(audit.get("finished_at"))
     ):
         raise ValueError("invalid_quality_observation_input")
-    rows = list(
-        connection.execute(
-            """
-            SELECT key FROM metadata
-            WHERE key GLOB ?
-            ORDER BY key
-            LIMIT ?
-            """,
-            (
-                f"quality.epoch.{epoch_id}.batch.*",
-                QUALITY_OBSERVATION_MAX + 1,
-            ),
+    observed_count = sum(
+        len(existing["decisions"])
+        for existing in quality_observation_inventory(
+            connection, epoch_id
         )
     )
-    if len(rows) > QUALITY_OBSERVATION_MAX:
-        raise ValueError("invalid_quality_observation")
-    observed_count = 0
-    for row in rows:
-        match = re.fullmatch(
-            rf"quality\.epoch\.{re.escape(epoch_id)}\.batch\.([0-9]+)",
-            str(row["key"]),
-        )
-        if match is None:
-            raise ValueError("invalid_quality_observation")
-        existing = load_quality_observation(
-            connection, epoch_id, int(match.group(1))
-        )
-        observed_count += len(existing["decisions"])
     if observed_count > QUALITY_OBSERVATION_MAX:
         raise ValueError("invalid_quality_observation")
     if observed_count + len(normalized) > QUALITY_OBSERVATION_MAX:
@@ -5517,6 +6395,388 @@ def record_quality_observation(
     }
     _insert_quality_observation(connection, observation)
     return observation
+
+
+def _load_quality_batch_source(
+    connection: sqlite3.Connection,
+    batch: sqlite3.Row,
+    epoch: dict[str, object],
+) -> dict[str, object]:
+    batch_id = int(batch["id"])
+    status = str(batch["status"])
+    audit = load_quality_review_audit(
+        connection, batch_id, expected_status=status
+    )
+    try:
+        batch_exclusions = _load_bounded_json(
+            batch["exclusion_counts_json"],
+            REVIEW_EXCLUSION_COUNTS_MAX_BYTES,
+            "quality_observation_audit_mismatch",
+        )
+        if (
+            canonical_json_bytes(batch_exclusions).decode("utf-8")
+            != batch["exclusion_counts_json"]
+        ):
+            raise ValueError("quality_observation_audit_mismatch")
+    except (RecursionError, TypeError, UnicodeError, ValueError):
+        raise ValueError(
+            "quality_observation_audit_mismatch"
+        ) from None
+    if (
+        audit["policy_digest"] != epoch["policy_digest"]
+        or audit["transcript_adapter_digest"]
+        != epoch["transcript_adapter_digest"]
+        or audit["catalog_adapter_digest"]
+        != epoch["catalog_adapter_digest"]
+        or audit["finished_at"] != batch["finished_at"]
+        or audit["session_count"] != batch["session_count"]
+        or audit["generation_count"] != batch["generation_count"]
+        or audit["candidate_count"] != batch["candidate_count"]
+        or batch_exclusions
+        != {
+            **audit["exclusion_counts"],
+            "batch_capacity_released": audit[
+                "batch_capacity_released"
+            ],
+        }
+    ):
+        raise ValueError("quality_observation_audit_mismatch")
+    return audit
+
+
+def seal_quality_epoch(
+    connection: sqlite3.Connection,
+    installation: Installation,
+    now: float,
+) -> dict[str, object]:
+    if connection.in_transaction:
+        raise ValueError("active_transaction")
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        epoch = active_quality_epoch(connection)
+        if epoch is None:
+            raise ValueError("quality_epoch_missing")
+        if epoch["state"] != "collecting":
+            raise ValueError("quality_epoch_not_collecting")
+        if now < parse_iso_utc(epoch["started_at"]):
+            raise ValueError("invalid_quality_seal_time")
+        if now >= parse_iso_utc(epoch["collection_expires_at"]):
+            updated = _invalidate_quality_epoch(
+                connection,
+                epoch,
+                "quality_collection_expired",
+                now,
+            )
+            connection.commit()
+            return updated
+        identity = load_quality_identity_key(installation)
+        current = current_quality_provenance(
+            installation, identity_key=identity
+        )
+        if any(
+            current[name] != epoch[name]
+            for name in QUALITY_PROVENANCE_FIELDS
+        ):
+            updated = _invalidate_quality_epoch(
+                connection,
+                epoch,
+                "quality_provenance_drift",
+                now,
+            )
+            connection.commit()
+            return updated
+        next_batch_id = next_review_batch_id(
+            connection, initialize=False
+        )
+        first_batch_id = int(epoch["first_batch_id"])
+        high_water = next_batch_id - 1
+        if high_water < first_batch_id:
+            raise ValueError("quality_sample_too_small")
+        batch_count = high_water - first_batch_id + 1
+        if batch_count > QUALITY_BATCH_MAX:
+            raise ValueError("quality_batch_inventory_saturated")
+        batches = list(
+            connection.execute(
+                """
+                SELECT id,status,finished_at,session_count,
+                  generation_count,candidate_count,
+                  exclusion_counts_json
+                FROM review_batches
+                WHERE id BETWEEN ? AND ?
+                ORDER BY id
+                LIMIT ?
+                """,
+                (
+                    first_batch_id,
+                    high_water,
+                    QUALITY_BATCH_MAX + 1,
+                ),
+            )
+        )
+        batch_ids = [int(row["id"]) for row in batches]
+        if batch_ids != list(
+            range(first_batch_id, high_water + 1)
+        ):
+            raise ValueError("quality_review_batch_coverage")
+        terminal_statuses = {
+            "completed",
+            "aborted",
+            "expired",
+            "failed",
+        }
+        if any(
+            row["status"] not in terminal_statuses
+            for row in batches
+        ):
+            raise ValueError("quality_review_batch_live")
+        batch_audits: dict[int, dict[str, object]] = {}
+        batch_witnesses: list[dict[str, object]] = []
+        latest_finished_at = parse_iso_utc(epoch["started_at"])
+        for batch in batches:
+            batch_id = int(batch["id"])
+            audit = _load_quality_batch_source(
+                connection, batch, epoch
+            )
+            batch_audits[batch_id] = audit
+            batch_witnesses.append(
+                {
+                    "batch_id": batch_id,
+                    "terminal_status": batch["status"],
+                    "audit_digest": sha256_json(audit),
+                }
+            )
+            latest_finished_at = max(
+                latest_finished_at,
+                parse_iso_utc(str(audit["finished_at"])),
+            )
+        completed = {
+            int(row["id"]): row
+            for row in batches
+            if row["status"] == "completed"
+        }
+        observations = quality_observation_inventory(
+            connection, str(epoch["epoch_id"])
+        )
+        if {
+            int(observation["batch_id"])
+            for observation in observations
+        } != set(completed):
+            raise ValueError("quality_observation_coverage")
+        observation_witnesses: list[dict[str, object]] = []
+        session_refs: set[str] = set()
+        candidate_ids: set[int] = set()
+        decision_count = 0
+        for observation in observations:
+            batch_id = int(observation["batch_id"])
+            audit = batch_audits[batch_id]
+            observed_exclusions: dict[str, int] = {}
+            for decision in observation["decisions"]:
+                if decision["outcome"] == "excluded":
+                    reason = str(decision["excluded_reason"])
+                    observed_exclusions[reason] = (
+                        observed_exclusions.get(reason, 0) + 1
+                    )
+            if (
+                sha256_json(audit) != observation["audit_digest"]
+                or audit["policy_digest"]
+                != observation["policy_digest"]
+                or audit["transcript_adapter_digest"]
+                != observation["transcript_adapter_digest"]
+                or audit["catalog_adapter_digest"]
+                != observation["catalog_adapter_digest"]
+                or audit["catalog_snapshot_digest"]
+                != observation["catalog_snapshot_digest"]
+                or audit["finished_at"] != observation["finished_at"]
+                or len(observation["decisions"])
+                != audit["generation_count"]
+                or sum(
+                    item["outcome"] == "candidate"
+                    for item in observation["decisions"]
+                )
+                != audit["candidate_count"]
+                or any(
+                    audit["exclusion_counts"].get(reason, 0)
+                    < count
+                    for reason, count in observed_exclusions.items()
+                )
+            ):
+                raise ValueError(
+                    "quality_observation_audit_mismatch"
+                )
+            decision_count += len(observation["decisions"])
+            if decision_count > QUALITY_OBSERVATION_MAX:
+                raise ValueError("invalid_quality_observation")
+            for decision in observation["decisions"]:
+                session_refs.add(str(decision["session_ref"]))
+                if decision["outcome"] == "candidate":
+                    candidate_ids.add(int(decision["candidate_id"]))
+            observation_witnesses.append(
+                {
+                    "batch_id": batch_id,
+                    "digest": sha256_json(observation),
+                }
+            )
+        if now < latest_finished_at:
+            raise ValueError("invalid_quality_seal_time")
+        if len(session_refs) < 10:
+            raise ValueError("quality_sample_too_small")
+        if not candidate_ids:
+            raise ValueError("quality_sample_candidate_required")
+        candidates = [
+            {
+                "candidate_id": candidate_id,
+                "subject_digest": (
+                    quality_candidate_subject_digest(
+                        connection, candidate_id
+                    )
+                ),
+            }
+            for candidate_id in sorted(candidate_ids)
+        ]
+        sealed_at = iso_utc(now)
+        seal_payload = {
+            "schema_version": 1,
+            "high_water_batch_id": high_water,
+            "batches": batch_witnesses,
+            "batch_set_digest": sha256_json(batch_witnesses),
+            "observations": observation_witnesses,
+            "observation_set_digest": sha256_json(
+                observation_witnesses
+            ),
+            "distinct_session_count": len(session_refs),
+            "candidate_count": len(candidates),
+            "candidates": candidates,
+            "sealed_at": sealed_at,
+            "label_expires_at": iso_utc(
+                now + QUALITY_SEALED_TTL_SECONDS
+            ),
+        }
+        sealed = {
+            **seal_payload,
+            "seal_digest": sha256_json(seal_payload),
+        }
+        updated = {
+            **epoch,
+            "state": "sealed",
+            "sealed": sealed,
+        }
+        encoded = canonical_json_bytes(updated)
+        if (
+            len(encoded) > QUALITY_EPOCH_MAX_BYTES
+            or not _valid_quality_seal(sealed, first_batch_id)
+        ):
+            raise ValueError("invalid_quality_seal")
+        changed = connection.execute(
+            "UPDATE metadata SET value=? WHERE key=? AND value=?",
+            (
+                encoded.decode("utf-8"),
+                quality_epoch_key(str(epoch["epoch_id"])),
+                canonical_json_bytes(epoch).decode("utf-8"),
+            ),
+        ).rowcount
+        if changed != 1:
+            raise sqlite3.IntegrityError("quality_epoch_changed")
+        connection.commit()
+        return updated
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def quality_sealed_witness_current(
+    connection: sqlite3.Connection,
+    epoch: dict[str, object],
+) -> bool:
+    sealed = epoch.get("sealed")
+    if (
+        epoch.get("state") != "sealed"
+        or type(sealed) is not dict
+        or not _valid_quality_seal(
+            sealed, int(epoch["first_batch_id"])
+        )
+    ):
+        return False
+    first_batch_id = int(epoch["first_batch_id"])
+    high_water = int(sealed["high_water_batch_id"])
+    batches = list(
+        connection.execute(
+            """
+            SELECT id,status,finished_at,session_count,
+              generation_count,candidate_count,
+              exclusion_counts_json
+            FROM review_batches
+            WHERE id BETWEEN ? AND ?
+            ORDER BY id
+            LIMIT ?
+            """,
+            (
+                first_batch_id,
+                high_water,
+                QUALITY_BATCH_MAX + 1,
+            ),
+        )
+    )
+    if [int(row["id"]) for row in batches] != list(
+        range(first_batch_id, high_water + 1)
+    ):
+        return False
+    batch_witnesses: list[dict[str, object]] = []
+    completed_ids: set[int] = set()
+    for batch in batches:
+        batch_id = int(batch["id"])
+        audit = _load_quality_batch_source(
+            connection, batch, epoch
+        )
+        batch_witnesses.append(
+            {
+                "batch_id": batch_id,
+                "terminal_status": batch["status"],
+                "audit_digest": sha256_json(audit),
+            }
+        )
+        if batch["status"] == "completed":
+            completed_ids.add(batch_id)
+    observations = quality_observation_inventory(
+        connection, str(epoch["epoch_id"])
+    )
+    observation_witnesses = [
+        {
+            "batch_id": int(observation["batch_id"]),
+            "digest": sha256_json(observation),
+        }
+        for observation in observations
+    ]
+    session_refs = {
+        str(decision["session_ref"])
+        for observation in observations
+        for decision in observation["decisions"]
+    }
+    candidate_ids = {
+        int(decision["candidate_id"])
+        for observation in observations
+        for decision in observation["decisions"]
+        if decision["outcome"] == "candidate"
+    }
+    decision_count = sum(
+        len(observation["decisions"])
+        for observation in observations
+    )
+    return (
+        batch_witnesses == sealed["batches"]
+        and observation_witnesses == sealed["observations"]
+        and {
+            int(observation["batch_id"])
+            for observation in observations
+        }
+        == completed_ids
+        and decision_count <= QUALITY_OBSERVATION_MAX
+        and len(session_refs) == sealed["distinct_session_count"]
+        and candidate_ids
+        == {
+            int(item["candidate_id"])
+            for item in sealed["candidates"]
+        }
+    )
 
 
 def rotate_invalid_review_result(
@@ -10816,6 +12076,123 @@ def cmd_quality_open(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_quality_seal(args: argparse.Namespace) -> int:
+    installation = load_installation(Path(args.installation))
+    connection = open_database(installation)
+    try:
+        result = seal_quality_epoch(
+            connection, installation, time.time()
+        )
+    finally:
+        connection.close()
+    write_json_stdout(result)
+    return 0
+
+
+def cmd_quality_status(args: argparse.Namespace) -> int:
+    installation = load_installation(Path(args.installation))
+    connection = open_database(installation, read_only=True)
+    try:
+        result = quality_status(
+            connection, installation, time.time()
+        )
+    finally:
+        connection.close()
+    write_json_stdout(result)
+    return 0
+
+
+def _read_quality_tty_line(prompt: str, maximum: int) -> str:
+    if (
+        type(prompt) is not str
+        or type(maximum) is not int
+        or maximum < 1
+    ):
+        raise ValueError("invalid_quality_label_input")
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    value = sys.stdin.readline(maximum + 2)
+    if not value.endswith("\n") or len(value[:-1]) > maximum:
+        return ""
+    return value[:-1]
+
+
+def cmd_quality_label(args: argparse.Namespace) -> int:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise ValueError("quality_label_external_tty_required")
+    installation = load_installation(Path(args.installation))
+    candidate_display_id = str(args.candidate_id)
+    read_connection = open_database(
+        installation, read_only=True
+    )
+    try:
+        prepared = prepare_quality_label(
+            read_connection,
+            installation,
+            candidate_display_id,
+            time.time(),
+        )
+    finally:
+        read_connection.close()
+    write_json_stdout(
+        {
+            name: prepared[name]
+            for name in (
+                "schema_version",
+                "epoch_id",
+                "candidate_id",
+                "subject_digest",
+                "subject",
+            )
+        }
+    )
+    answers = {
+        "evaluation_worthy": parse_quality_yes_no(
+            _read_quality_tty_line(
+                "evaluation_worthy [yes/no]: ", 3
+            )
+        ),
+        "target_correct": parse_quality_yes_no(
+            _read_quality_tty_line(
+                "target_correct [yes/no]: ", 3
+            )
+        ),
+        "external_content_adoption": parse_quality_yes_no(
+            _read_quality_tty_line(
+                "external_content_adoption [yes/no]: ", 3
+            )
+        ),
+    }
+    confirmation = _read_quality_tty_line(
+        (
+            f"confirm {candidate_display_id}@"
+            f"{prepared['subject_digest']}: "
+        ),
+        128,
+    )
+    validate_quality_confirmation(
+        candidate_display_id,
+        str(prepared["subject_digest"]),
+        confirmation,
+    )
+    connection = open_database(installation)
+    try:
+        result = commit_quality_label(
+            connection,
+            installation,
+            candidate_display_id,
+            str(prepared["epoch_id"]),
+            str(prepared["seal_digest"]),
+            str(prepared["subject_digest"]),
+            answers,
+            time.time(),
+        )
+    finally:
+        connection.close()
+    write_json_stdout(result)
+    return 0
+
+
 def cmd_catalog_inspect(args: argparse.Namespace) -> int:
     load_installation(Path(args.installation))
     runtime = load_review_runtime()
@@ -10962,6 +12339,19 @@ def build_parser() -> argparse.ArgumentParser:
     add_installation_argument(quality_open)
     quality_open.add_argument("--predecessor")
     quality_open.set_defaults(handler=cmd_quality_open)
+
+    quality_seal = commands.add_parser("quality-seal")
+    add_installation_argument(quality_seal)
+    quality_seal.set_defaults(handler=cmd_quality_seal)
+
+    quality_label = commands.add_parser("quality-label")
+    add_installation_argument(quality_label)
+    quality_label.add_argument("candidate_id")
+    quality_label.set_defaults(handler=cmd_quality_label)
+
+    quality_status = commands.add_parser("quality-status")
+    add_installation_argument(quality_status)
+    quality_status.set_defaults(handler=cmd_quality_status)
 
     catalog_inspect = commands.add_parser("catalog-inspect")
     add_installation_argument(catalog_inspect)
