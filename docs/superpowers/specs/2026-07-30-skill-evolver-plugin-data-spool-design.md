@@ -73,7 +73,7 @@ than it needs.
 ```mermaid
 flowchart LR
     S["Codex Stop"] --> H["Trusted plugin Hook"]
-    H --> P["$PLUGIN_DATA/spool<br/>bounded signed metadata"]
+    H --> P["$PLUGIN_DATA/stop-spool<br/>bounded signed metadata"]
     P --> M["Explicit maintain or review"]
     M --> D["Canonical SQLite queue<br/>~/.codex/skill-evolver"]
     D --> R["Explicit review"]
@@ -106,9 +106,10 @@ legacy invocations. When supplied:
 
 1. it must be a non-empty absolute canonical path;
 2. it must equal the trusted plugin-data path pinned in the plugin runtime
-   reference;
+  reference and the canonical installation's expected plugin-data relation;
 3. its existing components must not be symlinks;
-4. the directory and `spool/` must be owned by the current user with mode
+4. the directory and dedicated `stop-spool/` child must be owned by the
+   current user with mode
    `0700`;
 5. the Hook uses spool-only capture and never opens the canonical database for
    writing.
@@ -132,12 +133,17 @@ The Hook:
 3. validates the `Stop` envelope and transcript locator without reading
    transcript content;
 4. derives the HMAC session key;
-5. writes one canonical signed JSON payload to `$PLUGIN_DATA/spool`;
+5. converges the latest event for that `session_key` into one canonical signed
+   JSON payload under `$PLUGIN_DATA/stop-spool`;
 6. exits `0` without stdout, stderr, model calls or network access.
 
-The existing limits remain 200 payload files and 10 MiB. Lock contention,
-capacity overflow and invalid filesystem state remain bounded and never block
-the completed task.
+The existing limits remain 200 files and 10 MiB, but the primary ingress file
+count represents distinct session keys rather than Stop deliveries. Under the
+existing spool lock, an older delivery cannot replace a newer signed payload;
+a newer delivery atomically replaces only the same session-key file. This
+prevents a long-running session from exhausting the whole ingress capacity.
+Lock contention, capacity overflow and invalid filesystem state remain bounded
+and never block the completed task.
 
 ### 6.2 Explicit import
 
@@ -167,7 +173,7 @@ Hook health.
 
 If plugin data is absent, status reports an empty spool plus a bounded
 availability indicator; it does not create directories. The Hook may create
-its exact private `spool/` child under an already host-provided plugin-data
+its exact private `stop-spool/` child under an already host-provided plugin-data
 directory. It must not create or chmod arbitrary ancestors.
 
 The Hook remains best effort. A capture failure cannot fail the user's task,
@@ -183,7 +189,10 @@ transcript records, prompts, responses or proposed skill changes.
 
 Required boundaries:
 
-- exact pinned plugin-data equality before any Hook write or import deletion;
+- exact pinned plugin-data equality and canonical-installation relation before
+  any Hook write or import deletion;
+- a dedicated `stop-spool/` child so unrelated plugin JSON is never scanned or
+  deleted;
 - current-user ownership and private modes;
 - no symlink traversal and inode-bound deletion;
 - existing HMAC verification with the canonical identity key;
@@ -203,8 +212,10 @@ The minimum automated proof is:
 4. ingress payloads contain no transcript text;
 5. explicit maintenance imports a valid event exactly once and removes only
    its verified inode;
-6. status observes ingress spool metadata without mutating either store;
-7. the existing capture, review, quality and full suites remain green.
+6. repeated Stops for one session converge on one ingress file and preserve
+   the newest observation;
+7. status observes ingress spool metadata without mutating either store;
+8. the existing capture, review, quality and full suites remain green.
 
 The production proof is one new Desktop task after installing the patch and
 trusting the changed Hook. Before import, status must show one or more ingress
