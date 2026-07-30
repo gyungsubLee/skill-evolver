@@ -946,6 +946,12 @@ Expected: one commit containing only `evolver.py` and `test_review.py`.
 - Produces: `commit_review_result(connection, installation, config, batch_id, owner_token, result_path, now) -> dict[str, object]`.
 - Retry result: `{"schema_version": 1, "status": "retry", "batch_id": int, "error_code": "invalid_review_result", "result_path": str}`.
 - Completed result: `{"schema_version": 1, "status": "completed", "batch_id": int, "new_candidates": list[str], "merged_candidates": list[str], "exclusion_counts": dict[str, int], "result_deleted": bool}`.
+- The persisted candidate-session link is the session-level storage
+  idempotence authority. An existing link to the same candidate suppresses
+  the entire evidence insertion loop, including after 90-day aggregation has
+  deleted the individual rows. Only a first distinct session (`link is None`)
+  may record evidence, must insert at least one evidence row, and then inserts
+  its link in the same transaction.
 
 - [ ] **Step 1 (2–5 min): Add a reusable ready-batch candidate fixture**
 
@@ -984,6 +990,46 @@ class CandidateBatchFixture(BatchExportTestCase):
             self.connection,
             exports,
             now=now,
+        )
+
+    def reopen_review_item(
+        self,
+        review_item_id: int,
+        now: float,
+    ) -> dict[str, object]:
+        row = self.connection.execute(
+            "SELECT transcript_path FROM review_items WHERE id=?",
+            (review_item_id,),
+        ).fetchone()
+        transcript = Path(str(row["transcript_path"]))
+        with transcript.open("ab") as stream:
+            stream.write(b"x")
+        info = transcript.stat()
+        changed = self.connection.execute(
+            """
+            UPDATE review_items
+            SET status='pending',generation=generation+1,
+                observed_boundary=?,transcript_size=?,
+                transcript_mtime_ns=?,transcript_device=?,
+                transcript_inode=?,last_stop_ns=last_stop_ns+1,
+                pending_since=?,excluded_reason=NULL
+            WHERE id=? AND batch_id IS NULL
+            """,
+            (
+                info.st_size,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_dev,
+                info.st_ino,
+                self.runtime.iso_utc(now),
+                review_item_id,
+            ),
+        ).rowcount
+        self.assertEqual(changed, 1)
+        return self.claim_ready_batch(
+            self.connection,
+            [self.make_export("new distinct review generation")],
+            now=now + 1,
         )
 
     def result_payload(
@@ -1064,6 +1110,10 @@ The exact Plan 4B helper contracts reused here are:
 - `make_export(self, *texts, context=0) -> TranscriptExport`;
 - `write_result_bytes(self, path: Path, value: bytes, now: float) -> None`;
 - `claim_ready_batch(self, connection, exports, *, now=2_000_000_000.0) -> dict[str, object]`.
+- `reopen_review_item(self, review_item_id: int, now: float) ->
+  dict[str, object]` appends one byte to the fixture transcript, refreshes its
+  size, mtime, device, inode, boundary, generation, and pending fields
+  together, then uses `claim_ready_batch` with one controlled export.
 
 - [ ] **Step 2 (2–5 min): Add success, merged-exclusion, rollback, cap, recurrence, and retry-allocation tests**
 
@@ -1348,7 +1398,9 @@ class CandidateCommitTests(CandidateBatchFixture):
         self.assertEqual(tuple(counts), (0, 0, 0))
         self.assertEqual(reviewing, 4)
 
-    def test_existing_session_link_prevents_a_second_candidate(self) -> None:
+    def test_existing_session_link_is_idempotent_and_prevents_a_second_candidate(
+        self,
+    ) -> None:
         now = 2_000_000_000.0
         first = self.claim(1, now)
         first_path = self.write_result(
@@ -1366,24 +1418,12 @@ class CandidateCommitTests(CandidateBatchFixture):
         row = self.connection.execute(
             "SELECT * FROM review_items"
         ).fetchone()
-        self.connection.execute(
-            """
-            UPDATE review_items
-            SET status='pending',generation=generation+1,
-                observed_boundary=observed_boundary+1,pending_since=?
-            WHERE id=?
-            """,
-            (self.runtime.iso_utc(now + 2), int(row["id"])),
+        second = self.reopen_review_item(
+            int(row["id"]), now + 2
         )
-        second = self.runtime.claim_review_batch(
-            self.connection,
-            self.installation,
-            self.config,
-            now + 3,
-        )
-        payload = self.result_payload(second, "-different")
+        payload = self.result_payload(second)
         second_path = self.write_result(second, payload)
-        committed = self.runtime.commit_review_result(
+        merged = self.runtime.commit_review_result(
             self.connection,
             self.installation,
             self.config,
@@ -1392,18 +1432,52 @@ class CandidateCommitTests(CandidateBatchFixture):
             second_path,
             now + 4,
         )
+        candidate = self.connection.execute(
+            "SELECT id,occurrence_count FROM candidates"
+        ).fetchone()
         candidates = int(
             self.connection.execute(
                 "SELECT COUNT(*) FROM candidates"
             ).fetchone()[0]
         )
-        occurrence = int(
+        evidence = int(
             self.connection.execute(
-                "SELECT occurrence_count FROM candidates"
+                "SELECT COUNT(*) FROM candidate_evidence"
             ).fetchone()[0]
         )
         self.assertEqual(candidates, 1)
-        self.assertEqual(occurrence, 1)
+        self.assertEqual(int(candidate["occurrence_count"]), 1)
+        self.assertEqual(evidence, 1)
+        self.assertEqual(merged["exclusion_counts"], {})
+        self.assertEqual(
+            merged["merged_candidates"],
+            [self.runtime.display_id("C", int(candidate["id"]))],
+        )
+
+        third = self.reopen_review_item(
+            int(row["id"]), now + 5
+        )
+        third_path = self.write_result(
+            third, self.result_payload(third, "-different")
+        )
+        committed = self.runtime.commit_review_result(
+            self.connection,
+            self.installation,
+            self.config,
+            int(third["batch_id"]),
+            str(third["owner_token"]),
+            third_path,
+            now + 7,
+        )
+        final_counts = self.connection.execute(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM candidates),
+              (SELECT COUNT(*) FROM candidate_evidence),
+              (SELECT occurrence_count FROM candidates)
+            """
+        ).fetchone()
+        self.assertEqual(tuple(final_counts), (1, 1, 1))
         self.assertEqual(
             committed["exclusion_counts"], {"candidate_limit": 1}
         )
@@ -1986,22 +2060,22 @@ def commit_review_result(
                     item,
                     now,
                 )
-                inserted_evidence = 0
-                for evidence in result["evidence"]:
-                    inserted_evidence += int(
-                        record_candidate_evidence(
-                            connection,
-                            candidate_id,
-                            int(session["review_item_id"]),
-                            owner_digest,
-                            int(session["expected_generation"]),
-                            str(evidence["signal_type"]),
-                            str(evidence["source_kind"]),
-                            str(evidence["summary"]),
-                            now,
-                        )
-                    )
                 if item["link"] is None:
+                    inserted_evidence = 0
+                    for evidence in result["evidence"]:
+                        inserted_evidence += int(
+                            record_candidate_evidence(
+                                connection,
+                                candidate_id,
+                                int(session["review_item_id"]),
+                                owner_digest,
+                                int(session["expected_generation"]),
+                                str(evidence["signal_type"]),
+                                str(evidence["source_kind"]),
+                                str(evidence["summary"]),
+                                now,
+                            )
+                        )
                     if inserted_evidence < 1:
                         raise ValueError("candidate_evidence_required")
                     connection.execute(
@@ -2167,7 +2241,12 @@ def upsert_validated_candidate(
 ```
 
 This helper deliberately increments occurrence only when the recurrence link is
-absent. An active rejected tombstone accepts new distinct-session evidence and
+absent. The commit loop applies the same boundary to storage: when the loaded
+link already names this candidate, it skips every
+`record_candidate_evidence` call and leaves the link untouched. That remains
+idempotent after maintenance aggregates and deletes individual evidence, so a
+replayed linked session cannot recreate raw evidence or increment aggregate
+counts. An active rejected tombstone accepts new distinct-session evidence and
 last-seen recurrence but remains rejected. Expired rejected and stale rows
 revive only on a new distinct-session link and restore the catalog target path,
 classification locator and intent, validated summaries, validation plan, and
@@ -2184,7 +2263,7 @@ cd /Users/igyeongseob/Documents/오픈소스
   -v
 ```
 
-Expected: all ten tests pass; foreign output is preserved, a post-read binding rotation rolls back every candidate-side database mutation while preserving the new bound file, batch-bound invalid output rotates to one new result file, persisted adapter and capacity exclusions survive completion, every static digest, a freshly loaded in-transaction runtime/catalog snapshot, and every frozen tuple are revalidated, candidate targets resolve only from that live snapshot, four new fingerprints roll back completely, and one session cannot create a second candidate.
+Expected: all ten tests pass; foreign output is preserved, a post-read binding rotation rolls back every candidate-side database mutation while preserving the new bound file, batch-bound invalid output rotates to one new result file, persisted adapter and capacity exclusions survive completion, every static digest, a freshly loaded in-transaction runtime/catalog snapshot, and every frozen tuple are revalidated, candidate targets resolve only from that live snapshot, four new fingerprints roll back completely, an existing same-candidate link stores no second evidence row, and one session cannot create a second candidate.
 
 - [ ] **Step 9 (2–5 min): Run all Review tests and Phase 3 generation regressions**
 
@@ -2227,7 +2306,7 @@ Expected: one commit containing only `evolver.py` and `test_review.py`.
 
 **Interfaces:**
 - Consumes: existing `run_maintenance`, Plan 4B `cleanup_review_results(now) -> dict[str, int]`, Task 2 recurrence keys, and Task 3 candidate state.
-- Produces: config values `deferred_to_stale_days=30`, `rejected_tombstone_days=90`, `terminal_candidate_retention_days=90`; aggregate metadata at `f"candidate.{candidate_id}.evidence_aggregate"`; strict `load_candidate_evidence_aggregate(connection, candidate_id) -> dict[str, object]` with a 4,096-byte bound; recurrence-link deletion at the existing 180-day session boundary.
+- Produces: config values `deferred_to_stale_days=30`, `rejected_tombstone_days=90`, `terminal_candidate_retention_days=90`; aggregate metadata at `f"candidate.{candidate_id}.evidence_aggregate"`; strict `load_candidate_evidence_aggregate(connection, candidate_id) -> dict[str, object]` with a 4,096-byte bound; recurrence-link deletion at the existing 180-day session boundary. The retained link continues to suppress same-session evidence after the 90-day aggregate/delete step, and the aggregate count remains unchanged until and through that 180-day boundary.
 
 - [ ] **Step 1 (2–5 min): Add the three candidate-retention defaults to config tests**
 
@@ -2679,6 +2758,74 @@ class CandidateMaintenanceTests(CandidateBatchFixture):
             canonical_aggregate,
         )
 
+        review_item = self.connection.execute(
+            "SELECT id FROM review_items"
+        ).fetchone()
+        replay_at = at_90_terminal + 2
+        replay = self.reopen_review_item(
+            int(review_item["id"]), replay_at
+        )
+        replay_path = self.write_result(
+            replay, self.result_payload(replay)
+        )
+        replayed = self.runtime.commit_review_result(
+            self.connection,
+            self.installation,
+            self.config,
+            int(replay["batch_id"]),
+            str(replay["owner_token"]),
+            replay_path,
+            replay_at + 2,
+        )
+        self.assertEqual(replayed["exclusion_counts"], {})
+        self.assertEqual(
+            replayed["merged_candidates"],
+            [self.runtime.display_id("C", candidate_id)],
+        )
+        replayed_candidate = self.connection.execute(
+            "SELECT status,target_path FROM candidates WHERE id=?",
+            (candidate_id,),
+        ).fetchone()
+        self.assertEqual(
+            (replayed_candidate["status"], replayed_candidate["target_path"]),
+            ("stale", None),
+        )
+        self.assertEqual(
+            int(
+                self.connection.execute(
+                    "SELECT COUNT(*) FROM candidate_evidence"
+                ).fetchone()[0]
+            ),
+            0,
+        )
+        self.assertEqual(
+            self.runtime.load_candidate_evidence_aggregate(
+                self.connection, candidate_id
+            ),
+            aggregate,
+        )
+
+        self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            replay_at + 3,
+        )
+        self.assertEqual(
+            int(
+                self.connection.execute(
+                    "SELECT COUNT(*) FROM candidate_evidence"
+                ).fetchone()[0]
+            ),
+            0,
+        )
+        self.assertEqual(
+            self.runtime.load_candidate_evidence_aggregate(
+                self.connection, candidate_id
+            ),
+            aggregate,
+        )
+
         at_180 = now + self.config.session_dedupe_days * 86_400
         third = self.runtime.run_maintenance(
             self.connection,
@@ -2705,6 +2852,12 @@ class CandidateMaintenanceTests(CandidateBatchFixture):
         self.assertEqual(third["candidate_session_links_deleted"], 1)
         self.assertEqual(tuple(remaining), (0, 0, 0))
         self.assertEqual(occurrence, 1)
+        self.assertEqual(
+            self.runtime.load_candidate_evidence_aggregate(
+                self.connection, candidate_id
+            ),
+            aggregate,
+        )
 
     def test_stale_and_expired_tombstone_require_new_session_evidence(
         self,
