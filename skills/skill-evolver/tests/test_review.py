@@ -8939,3 +8939,1820 @@ class CandidateIdentityTests(unittest.TestCase):
                     self.runtime.candidate_session_link_value(
                         17, invalid_expiry
                     )
+
+
+class CandidateBatchFixture(BatchExportTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.fixed_inputs = self.fixed_review_inputs()
+        self.fixed_inputs.__enter__()
+        self.addCleanup(
+            self.fixed_inputs.__exit__, None, None, None
+        )
+        self.connection = self.runtime.open_database(self.installation)
+        self.addCleanup(self.connection.close)
+        self.next_session_number = 1
+
+    def claim(self, count: int, now: float) -> dict[str, object]:
+        start = self.next_session_number
+        for number in range(start, start + count):
+            self.insert_pending(
+                self.connection,
+                number,
+                text=f"candidate-session-{number}\n",
+                now=now,
+            )
+        self.next_session_number += count
+        exports = [
+            self.make_export(
+                "The user corrected a failed completion claim.",
+                "The verification command failed.",
+            )
+            for _ in range(count)
+        ]
+        return self.claim_ready_batch(
+            self.connection,
+            exports,
+            now=now,
+        )
+
+    def result_payload(
+        self,
+        claim: dict[str, object],
+        *,
+        distinct: bool = False,
+        locator_suffix: str = "",
+    ) -> dict[str, object]:
+        contract = self.runtime.load_review_contract(
+            self.connection, int(claim["batch_id"]), "final"
+        )
+        sessions = []
+        for index, session in enumerate(contract["sessions"]):
+            record = session["records"][0]
+            locator = f"completion claim{locator_suffix}"
+            if distinct:
+                locator = f"{locator} {index}"
+            sessions.append(
+                {
+                    "session_ref": session["session_ref"],
+                    "decision": "candidate",
+                    "target_identity": self.catalog_entry.identity,
+                    "classification": {
+                        "problem_category": "verification",
+                        "target_locator": locator,
+                        "proposal_intent": (
+                            "require successful verification"
+                        ),
+                    },
+                    "problem_summary": (
+                        "A completion claim survived a failed check."
+                    ),
+                    "proposal_summary": (
+                        "Require fresh successful evidence."
+                    ),
+                    "validation_plan": (
+                        "Reproduce the failure and add a focused regression."
+                    ),
+                    "risk_level": "low",
+                    "evidence": [
+                        {
+                            "record_ref": record["record_ref"],
+                            "signal_type": "explicit_correction",
+                            "summary": (
+                                "The user corrected a completion claim."
+                            ),
+                        }
+                    ],
+                }
+            )
+        return {
+            "schema_version": 1,
+            "contract_digest": claim["contract_digest"],
+            "sessions": sessions,
+        }
+
+    def write_result(
+        self,
+        claim: dict[str, object],
+        payload: dict[str, object],
+    ) -> Path:
+        return self.write_encoded_result(
+            claim,
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+            ).encode("utf-8"),
+        )
+
+    def write_encoded_result(
+        self,
+        claim: dict[str, object],
+        encoded: bytes,
+    ) -> Path:
+        path = Path(str(claim["result_path"]))
+        self.write_result_bytes(
+            path,
+            encoded,
+            self.runtime.parse_iso_utc(
+                str(claim["lease_expires_at"])
+            ),
+        )
+        return path
+
+    def commit(
+        self,
+        claim: dict[str, object],
+        result_path: Path,
+        now: float,
+    ) -> dict[str, object]:
+        return self.runtime.commit_review_result(
+            self.connection,
+            self.installation,
+            self.config,
+            int(claim["batch_id"]),
+            str(claim["owner_token"]),
+            result_path,
+            now,
+        )
+
+    def abort(
+        self,
+        claim: dict[str, object],
+        now: float,
+    ) -> None:
+        contract = self.runtime.load_review_contract(
+            self.connection, int(claim["batch_id"]), "final"
+        )
+        item_ids = [
+            int(session["review_item_id"])
+            for session in contract["sessions"]
+        ]
+        self.runtime.abort_review_batch(
+            self.connection,
+            self.installation,
+            int(claim["batch_id"]),
+            str(claim["owner_token"]),
+            now,
+        )
+        for item_id in item_ids:
+            self.connection.execute(
+                """
+                UPDATE review_items
+                SET status='excluded',
+                    reviewed_boundary=observed_boundary,
+                    pending_since=NULL,excluded_reason='one_off'
+                WHERE id=?
+                """,
+                (item_id,),
+            )
+
+    def reopen_review_item(
+        self,
+        review_item_id: int,
+        now: float,
+    ) -> dict[str, object]:
+        row = self.connection.execute(
+            """
+            SELECT transcript_path FROM review_items WHERE id=?
+            """,
+            (review_item_id,),
+        ).fetchone()
+        transcript = Path(str(row["transcript_path"]))
+        with transcript.open("ab") as stream:
+            stream.write(b"x")
+        info = transcript.stat()
+        changed = self.connection.execute(
+            """
+            UPDATE review_items
+            SET status='pending',generation=generation+1,
+                observed_boundary=?,transcript_size=?,
+                transcript_mtime_ns=?,transcript_device=?,
+                transcript_inode=?,last_stop_ns=last_stop_ns+1,
+                pending_since=?,excluded_reason=NULL
+            WHERE id=? AND batch_id IS NULL
+            """,
+            (
+                info.st_size,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_dev,
+                info.st_ino,
+                self.runtime.iso_utc(now),
+                review_item_id,
+            ),
+        ).rowcount
+        self.assertEqual(changed, 1)
+        return self.claim_ready_batch(
+            self.connection,
+            [self.make_export("new distinct review generation")],
+            now=now + 1,
+        )
+
+    def insert_existing_candidate(self, now: float) -> int:
+        now_text = self.runtime.iso_utc(now)
+        return int(
+            self.connection.execute(
+                """
+                INSERT INTO candidates(
+                  fingerprint,target_identity,target_skill,target_path,
+                  problem_category,target_locator,proposal_intent,
+                  conflict_group,problem_summary,proposal_summary,
+                  validation_plan,risk_level,status,occurrence_count,
+                  first_seen_at,last_seen_at,updated_at,tombstone_until
+                ) VALUES(
+                  ?,?,?,?, ?,?,?,NULL, ?,?,?,?, 'proposed',1,?,?,?,NULL
+                )
+                """,
+                (
+                    "f" * 64,
+                    self.catalog_entry.identity,
+                    self.catalog_entry.skill_dir.name,
+                    str(self.catalog_entry.skill_dir),
+                    "verification",
+                    "unrelated locator",
+                    "unrelated proposal",
+                    "Existing problem.",
+                    "Existing proposal.",
+                    "Existing validation.",
+                    "low",
+                    now_text,
+                    now_text,
+                    now_text,
+                ),
+            ).lastrowid
+        )
+
+
+class CandidateCommitTests(CandidateBatchFixture):
+    def test_commit_writes_candidate_evidence_link_generation_and_audit(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        claim = self.claim(5, now)
+        result_path = self.write_result(
+            claim, self.result_payload(claim)
+        )
+        committed = self.commit(claim, result_path, now + 1)
+        candidate = self.connection.execute(
+            "SELECT * FROM candidates"
+        ).fetchone()
+        evidence_count = int(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM candidate_evidence"
+            ).fetchone()[0]
+        )
+        links = list(
+            self.connection.execute(
+                "SELECT key,value FROM metadata "
+                "WHERE key LIKE 'candidate-session.%' ORDER BY key"
+            )
+        )
+        reviewed = int(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM review_items WHERE status='reviewed'"
+            ).fetchone()[0]
+        )
+        batch_id = int(claim["batch_id"])
+        audit = json.loads(
+            self.connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (self.runtime.review_audit_key(batch_id),),
+            ).fetchone()["value"]
+        )
+        batch = self.connection.execute(
+            "SELECT * FROM review_batches WHERE id=?",
+            (batch_id,),
+        ).fetchone()
+        self.assertEqual(committed["status"], "completed")
+        self.assertEqual(committed["new_candidates"], ["C-001"])
+        self.assertEqual(committed["merged_candidates"], [])
+        self.assertEqual(
+            committed["new_candidates"],
+            sorted(set(committed["new_candidates"])),
+        )
+        self.assertEqual(
+            committed["merged_candidates"],
+            sorted(set(committed["merged_candidates"])),
+        )
+        self.assertTrue(
+            set(committed["new_candidates"]).isdisjoint(
+                committed["merged_candidates"]
+            )
+        )
+        self.assertEqual(candidate["occurrence_count"], 5)
+        self.assertEqual(evidence_count, 5)
+        self.assertEqual(len(links), 5)
+        self.assertTrue(
+            all("candidate-session-" not in row["key"] for row in links)
+        )
+        self.assertEqual(reviewed, 5)
+        self.assertEqual(audit["terminal_status"], "completed")
+        self.assertEqual(audit["candidate_count"], 5)
+        self.assertEqual(batch["candidate_count"], 5)
+        self.assertFalse(result_path.exists())
+
+    def test_partial_export_commit_preserves_adapter_and_capacity_exclusions(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        for number in range(1, 4):
+            self.insert_pending(
+                self.connection,
+                number,
+                text=f"partial-{number}\n",
+                now=now,
+            )
+        self.next_session_number = 4
+        accepted = replace(
+            self.make_export("accepted candidate evidence"),
+            canonical_records_bytes=5_000_000,
+        )
+        terminal = self.runtime.TranscriptAdapterError(
+            "unsupported_transcript",
+            retryable=False,
+        )
+        capacity = replace(
+            self.make_export("released by aggregate capacity"),
+            canonical_records_bytes=5_000_000,
+        )
+        claim = self.claim_ready_batch(
+            self.connection,
+            [accepted, terminal, capacity],
+            now=now,
+        )
+        batch_id = int(claim["batch_id"])
+        before = json.loads(
+            self.connection.execute(
+                """
+                SELECT exclusion_counts_json FROM review_batches
+                WHERE id=?
+                """,
+                (batch_id,),
+            ).fetchone()["exclusion_counts_json"]
+        )
+        result_path = self.write_result(
+            claim, self.result_payload(claim)
+        )
+        committed = self.commit(claim, result_path, now + 1)
+        batch = self.connection.execute(
+            """
+            SELECT exclusion_counts_json FROM review_batches
+            WHERE id=?
+            """,
+            (batch_id,),
+        ).fetchone()
+        audit = json.loads(
+            self.connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (self.runtime.review_audit_key(batch_id),),
+            ).fetchone()["value"]
+        )
+        live_members = int(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM review_items WHERE batch_id=?",
+                (batch_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual(
+            before,
+            {
+                "batch_capacity_released": 1,
+                "unsupported_transcript": 1,
+            },
+        )
+        self.assertEqual(committed["status"], "completed")
+        self.assertEqual(committed["new_candidates"], ["C-001"])
+        self.assertEqual(
+            committed["exclusion_counts"],
+            {"unsupported_transcript": 1},
+        )
+        self.assertEqual(
+            audit["exclusion_counts"],
+            {"unsupported_transcript": 1},
+        )
+        self.assertEqual(audit["batch_capacity_released"], 1)
+        self.assertEqual(
+            json.loads(batch["exclusion_counts_json"]),
+            {
+                "batch_capacity_released": 1,
+                "unsupported_transcript": 1,
+            },
+        )
+        self.assertEqual(live_members, 0)
+
+    def test_residual_secret_rolls_back_and_allocates_fresh_retry(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        invalid_documents: list[tuple[str, bytes]] = [
+            (
+                "duplicate-key",
+                b'{"schema_version":1,"schema_version":1}',
+            ),
+            ("nan", b'{"value":NaN}'),
+            ("infinity", b'{"value":Infinity}'),
+            ("negative-infinity", b'{"value":-Infinity}'),
+            ("exponent-overflow", b'{"value":1e9999}'),
+            ("negative-exponent-overflow", b'{"value":-1e9999}'),
+        ]
+        for offset, (label, encoded) in enumerate(invalid_documents):
+            attempt_now = now + offset * 10
+            with self.subTest(strict_result=label):
+                claim = self.claim(1, attempt_now)
+                old_path = self.write_encoded_result(claim, encoded)
+                retried = self.commit(
+                    claim, old_path, attempt_now + 1
+                )
+                new_path = Path(str(retried["result_path"]))
+                self.assertEqual(retried["status"], "retry")
+                self.assertEqual(
+                    retried["error_code"], "invalid_review_result"
+                )
+                self.assertFalse(old_path.exists())
+                self.assertTrue(new_path.exists())
+                self.assertNotEqual(old_path, new_path)
+                self.assertEqual(
+                    list(self.runtime.review_result_root().iterdir()),
+                    [new_path],
+                )
+                self.assertEqual(
+                    self.connection.execute(
+                        "SELECT COUNT(*) FROM candidates"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.abort(claim, attempt_now + 2)
+
+        attempt_now = now + len(invalid_documents) * 10
+        claim = self.claim(1, attempt_now)
+        payload = self.result_payload(claim)
+        payload["sessions"][0]["validation_plan"] = (
+            "-----BEGIN PRIVATE KEY-----"
+        )
+        old_path = self.write_result(claim, payload)
+        retried = self.commit(claim, old_path, attempt_now + 1)
+        new_path = Path(str(retried["result_path"]))
+        self.assertEqual(retried["status"], "retry")
+        self.assertEqual(retried["error_code"], "invalid_review_result")
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM candidates"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertFalse(old_path.exists())
+        self.assertTrue(new_path.exists())
+        self.assertNotEqual(old_path, new_path)
+
+    def test_foreign_result_is_preserved_and_never_rotated(self) -> None:
+        now = 2_000_000_000.0
+        claim = self.claim(1, now)
+        bound = Path(str(claim["result_path"]))
+        foreign = Path(self.temp.name) / "foreign-result.json"
+        foreign.write_text("{}", encoding="utf-8")
+        root = self.runtime.review_result_root()
+        stale = root / f"result-{'e' * 32}.json"
+        stale.write_bytes(b"stale")
+        stale.chmod(0o600)
+        stale_ns = int(
+            (now - self.runtime.REVIEW_RESULT_TTL_SECONDS - 1)
+            * 1_000_000_000
+        )
+        os.utime(stale, ns=(stale_ns, stale_ns))
+        with mock.patch.object(
+            self.runtime,
+            "cleanup_review_results",
+            side_effect=AssertionError("pre-auth cleanup"),
+        ) as cleanup:
+            with self.assertRaisesRegex(
+                ValueError, "^review_batch_owner_mismatch$"
+            ):
+                self.runtime.commit_review_result(
+                    self.connection,
+                    self.installation,
+                    self.config,
+                    int(claim["batch_id"]),
+                    "0" * 64,
+                    bound,
+                    now + 1,
+                )
+            with self.assertRaises(self.runtime.ReviewResultError) as caught:
+                self.runtime.commit_review_result(
+                    self.connection,
+                    self.installation,
+                    self.config,
+                    int(claim["batch_id"]),
+                    str(claim["owner_token"]),
+                    foreign,
+                    now + 1,
+                )
+            cleanup.assert_not_called()
+        self.assertIsNone(caught.exception.opened)
+        self.assertTrue(foreign.exists())
+        self.assertTrue(bound.exists())
+        self.assertTrue(stale.exists())
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM candidates"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_bound_reader_failure_allocates_one_fresh_retry(self) -> None:
+        now = 2_000_000_000.0
+        claim = self.claim(1, now)
+        old_path = self.write_encoded_result(
+            claim,
+            b"x" * (self.runtime.REVIEW_RESULT_MAX_BYTES + 1)
+        )
+        retried = self.commit(claim, old_path, now + 1)
+        new_path = Path(str(retried["result_path"]))
+        self.assertEqual(retried["status"], "retry")
+        self.assertEqual(retried["error_code"], "invalid_review_result")
+        self.assertFalse(old_path.exists())
+        self.assertTrue(new_path.exists())
+        self.assertNotEqual(old_path, new_path)
+        self.assertEqual(
+            list(self.runtime.review_result_root().iterdir()),
+            [new_path],
+        )
+        self.abort(claim, now + 2)
+
+        existing_id = self.insert_existing_candidate(now + 3)
+        corrupt_values = (
+            ("not-object", "[]"),
+            (
+                "oversized",
+                "x"
+                * (
+                    self.runtime.CANDIDATE_SESSION_LINK_MAX_BYTES
+                    + 1
+                ),
+            ),
+            (
+                "duplicate-key",
+                (
+                    '{"candidate_id":%d,"candidate_id":%d,'
+                    '"dedupe_expires_at":"2033-11-14T22:13:20Z",'
+                    '"schema_version":1}'
+                )
+                % (existing_id, existing_id),
+            ),
+            (
+                "noncanonical",
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "candidate_id": existing_id,
+                        "dedupe_expires_at": (
+                            "2033-11-14T22:13:20Z"
+                        ),
+                    }
+                ),
+            ),
+            (
+                "bool-id",
+                self.runtime.canonical_json_bytes(
+                    {
+                        "schema_version": 1,
+                        "candidate_id": True,
+                        "dedupe_expires_at": (
+                            "2033-11-14T22:13:20Z"
+                        ),
+                    }
+                ).decode(),
+            ),
+            (
+                "bad-expiry",
+                self.runtime.canonical_json_bytes(
+                    {
+                        "schema_version": 1,
+                        "candidate_id": existing_id,
+                        "dedupe_expires_at": "not-utc",
+                    }
+                ).decode(),
+            ),
+            (
+                "extra-key",
+                self.runtime.canonical_json_bytes(
+                    {
+                        "schema_version": 1,
+                        "candidate_id": existing_id,
+                        "dedupe_expires_at": (
+                            "2033-11-14T22:13:20Z"
+                        ),
+                        "extra": 1,
+                    }
+                ).decode(),
+            ),
+            (
+                "orphan",
+                self.runtime.canonical_json_bytes(
+                    {
+                        "schema_version": 1,
+                        "candidate_id": existing_id + 999,
+                        "dedupe_expires_at": (
+                            "2033-11-14T22:13:20Z"
+                        ),
+                    }
+                ).decode(),
+            ),
+        )
+        for offset, (label, raw_link) in enumerate(corrupt_values):
+            attempt_now = now + 10 + offset * 10
+            with self.subTest(corrupt_link=label):
+                claim = self.claim(1, attempt_now)
+                contract = self.runtime.load_review_contract(
+                    self.connection,
+                    int(claim["batch_id"]),
+                    "final",
+                )
+                item_id = int(
+                    contract["sessions"][0]["review_item_id"]
+                )
+                row = self.connection.execute(
+                    "SELECT session_key FROM review_items WHERE id=?",
+                    (item_id,),
+                ).fetchone()
+                link_key = self.runtime.candidate_session_link_key(
+                    self.installation, str(row["session_key"])
+                )
+                self.connection.execute(
+                    "INSERT INTO metadata(key,value) VALUES(?,?)",
+                    (link_key, raw_link),
+                )
+                path = self.write_result(
+                    claim, self.result_payload(claim)
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^invalid_candidate_session_link$",
+                ):
+                    self.commit(claim, path, attempt_now + 1)
+                binding = self.runtime.load_review_result_binding(
+                    self.connection, int(claim["batch_id"])
+                )
+                self.assertEqual(binding["basename"], path.name)
+                self.assertTrue(path.exists())
+                self.assertEqual(
+                    list(self.runtime.review_result_root().iterdir()),
+                    [path],
+                )
+                self.assertEqual(
+                    self.connection.execute(
+                        "SELECT COUNT(*) FROM candidate_evidence"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.connection.execute(
+                    "DELETE FROM metadata WHERE key=?", (link_key,)
+                )
+                self.abort(claim, attempt_now + 2)
+
+        for offset, (label, expiry_delta, accepted) in enumerate(
+            (
+                ("later-expiry", 1, True),
+                ("earlier-expiry", -1, False),
+            )
+        ):
+            attempt_now = now + 100 + offset * 10
+            with self.subTest(link_expiry_order=label):
+                claim = self.claim(1, attempt_now)
+                contract = self.runtime.load_review_contract(
+                    self.connection,
+                    int(claim["batch_id"]),
+                    "final",
+                )
+                item_id = int(
+                    contract["sessions"][0]["review_item_id"]
+                )
+                row = self.connection.execute(
+                    """
+                    SELECT session_key,dedupe_expires_at
+                    FROM review_items WHERE id=?
+                    """,
+                    (item_id,),
+                ).fetchone()
+                link_key = self.runtime.candidate_session_link_key(
+                    self.installation, str(row["session_key"])
+                )
+                link_expiry = self.runtime.iso_utc(
+                    self.runtime.parse_iso_utc(
+                        str(row["dedupe_expires_at"])
+                    )
+                    + expiry_delta
+                )
+                self.connection.execute(
+                    "INSERT INTO metadata(key,value) VALUES(?,?)",
+                    (
+                        link_key,
+                        self.runtime.canonical_json_bytes(
+                            self.runtime.candidate_session_link_value(
+                                existing_id, link_expiry
+                            )
+                        ).decode(),
+                    ),
+                )
+                path = self.write_result(
+                    claim, self.result_payload(claim)
+                )
+                if accepted:
+                    committed = self.commit(
+                        claim, path, attempt_now + 1
+                    )
+                    self.assertEqual(
+                        committed["exclusion_counts"],
+                        {"candidate_limit": 1},
+                    )
+                    self.assertFalse(path.exists())
+                else:
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "^invalid_candidate_session_link$",
+                    ):
+                        self.commit(claim, path, attempt_now + 1)
+                    binding = (
+                        self.runtime.load_review_result_binding(
+                            self.connection,
+                            int(claim["batch_id"]),
+                        )
+                    )
+                    self.assertEqual(binding["basename"], path.name)
+                    self.assertTrue(path.exists())
+                self.connection.execute(
+                    "DELETE FROM metadata WHERE key=?", (link_key,)
+                )
+                if not accepted:
+                    self.abort(claim, attempt_now + 2)
+        with self.assertRaisesRegex(
+            ValueError, "^invalid_candidate_session_link$"
+        ):
+            self.runtime.load_candidate_session_link(
+                self.connection, "candidate-session.INVALID"
+            )
+
+    def test_four_new_fingerprints_roll_back_the_whole_batch(self) -> None:
+        now = 2_000_000_000.0
+        claim = self.claim(4, now)
+        generation_before = [
+            tuple(row)
+            for row in self.connection.execute(
+                """
+                SELECT id,generation,status,reviewed_boundary,batch_id
+                FROM review_items ORDER BY id
+                """
+            )
+        ]
+        old_path = self.write_result(
+            claim,
+            self.result_payload(
+                claim, distinct=True, locator_suffix="-distinct"
+            ),
+        )
+        retried = self.commit(claim, old_path, now + 1)
+        new_path = Path(str(retried["result_path"]))
+        counts = self.connection.execute(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM candidates),
+              (SELECT COUNT(*) FROM candidate_evidence),
+              (SELECT COUNT(*) FROM metadata
+               WHERE key LIKE 'candidate-session.%')
+            """
+        ).fetchone()
+        generation_after = [
+            tuple(row)
+            for row in self.connection.execute(
+                """
+                SELECT id,generation,status,reviewed_boundary,batch_id
+                FROM review_items ORDER BY id
+                """
+            )
+        ]
+        batch_status = self.connection.execute(
+            "SELECT status FROM review_batches WHERE id=?",
+            (int(claim["batch_id"]),),
+        ).fetchone()["status"]
+        self.assertEqual(retried["status"], "retry")
+        self.assertEqual(
+            retried["error_code"], "invalid_review_result"
+        )
+        self.assertEqual(tuple(counts), (0, 0, 0))
+        self.assertEqual(generation_after, generation_before)
+        self.assertEqual(batch_status, "ready")
+        self.assertFalse(old_path.exists())
+        self.assertTrue(new_path.exists())
+        self.assertNotEqual(new_path, old_path)
+
+    def test_existing_session_link_prevents_a_second_candidate(self) -> None:
+        now = 2_000_000_000.0
+        first = self.claim(1, now)
+        first_path = self.write_result(
+            first, self.result_payload(first)
+        )
+        first_result = self.commit(first, first_path, now + 1)
+        self.assertEqual(first_result["new_candidates"], ["C-001"])
+        candidate_id = int(
+            self.connection.execute(
+                "SELECT id FROM candidates"
+            ).fetchone()[0]
+        )
+        first_item_id = int(
+            self.connection.execute(
+                "SELECT id FROM review_items ORDER BY id LIMIT 1"
+            ).fetchone()[0]
+        )
+
+        second = self.reopen_review_item(first_item_id, now + 2)
+        second_path = self.write_result(
+            second,
+            self.result_payload(second, distinct=True),
+        )
+        second_result = self.commit(second, second_path, now + 4)
+        candidate = self.connection.execute(
+            "SELECT * FROM candidates WHERE id=?", (candidate_id,)
+        ).fetchone()
+        self.assertEqual(
+            second_result["exclusion_counts"],
+            {"candidate_limit": 1},
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM candidates"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(candidate["occurrence_count"], 1)
+
+        for offset, status in enumerate(
+            ("rejected", "deferred", "prepared")
+        ):
+            state_now = now + 20 + offset * 10
+            marker = self.runtime.iso_utc(state_now - 100)
+            tombstone = (
+                self.runtime.iso_utc(state_now + 100)
+                if status == "rejected"
+                else None
+            )
+            before = int(
+                self.connection.execute(
+                    "SELECT occurrence_count FROM candidates WHERE id=?",
+                    (candidate_id,),
+                ).fetchone()[0]
+            )
+            self.connection.execute(
+                """
+                UPDATE candidates
+                SET status=?,updated_at=?,last_seen_at=?,
+                    tombstone_until=?
+                WHERE id=?
+                """,
+                (status, marker, marker, tombstone, candidate_id),
+            )
+            claim = self.claim(1, state_now)
+            path = self.write_result(
+                claim, self.result_payload(claim)
+            )
+            committed = self.commit(claim, path, state_now + 1)
+            candidate = self.connection.execute(
+                "SELECT * FROM candidates WHERE id=?", (candidate_id,)
+            ).fetchone()
+            self.assertEqual(committed["merged_candidates"], ["C-001"])
+            self.assertEqual(candidate["status"], status)
+            self.assertEqual(candidate["occurrence_count"], before + 1)
+            self.assertEqual(
+                candidate["last_seen_at"],
+                self.runtime.iso_utc(state_now + 1),
+            )
+            self.assertEqual(candidate["updated_at"], marker)
+            self.assertEqual(candidate["tombstone_until"], tombstone)
+
+        def reset_live_candidate() -> None:
+            self.connection.execute(
+                """
+                UPDATE candidates
+                SET target_skill=?,target_path=?,
+                    problem_category='verification',
+                    target_locator='completion claim',
+                    proposal_intent='require successful verification',
+                    problem_summary=?,
+                    proposal_summary=?,
+                    validation_plan=?,risk_level='low',
+                    status='proposed',tombstone_until=NULL
+                WHERE id=?
+                """,
+                (
+                    self.catalog_entry.skill_dir.name,
+                    str(self.catalog_entry.skill_dir),
+                    "A completion claim survived a failed check.",
+                    "Require fresh successful evidence.",
+                    (
+                        "Reproduce the failure and add a focused "
+                        "regression."
+                    ),
+                    candidate_id,
+                ),
+            )
+
+        for offset, (label, column, value) in enumerate(
+            (
+                ("wrong-target-skill", "target_skill", "other-skill"),
+                ("wrong-target-path", "target_path", "/wrong/path"),
+                (
+                    "changed-fingerprint-constituent",
+                    "target_locator",
+                    "different locator",
+                ),
+                (
+                    "noncanonical-problem-category",
+                    "problem_category",
+                    "Verification",
+                ),
+                (
+                    "non-rejected-with-tombstone",
+                    "tombstone_until",
+                    self.runtime.iso_utc(now + 500),
+                ),
+            )
+        ):
+            corrupt_now = now + 40 + offset * 3
+            reset_live_candidate()
+            self.connection.execute(
+                f"UPDATE candidates SET {column}=? WHERE id=?",
+                (value, candidate_id),
+            )
+            before = tuple(
+                self.connection.execute(
+                    """
+                    SELECT occurrence_count,status,target_skill,
+                      target_path,problem_category,target_locator,
+                      tombstone_until
+                    FROM candidates WHERE id=?
+                    """,
+                    (candidate_id,),
+                ).fetchone()
+            )
+            evidence_before = int(
+                self.connection.execute(
+                    "SELECT COUNT(*) FROM candidate_evidence"
+                ).fetchone()[0]
+            )
+            claim = self.claim(1, corrupt_now)
+            path = self.write_result(
+                claim, self.result_payload(claim)
+            )
+            with self.subTest(existing_live_shape=label):
+                with self.assertRaisesRegex(
+                    ValueError, "^candidate_state_corrupt$"
+                ):
+                    self.commit(claim, path, corrupt_now + 1)
+                binding = self.runtime.load_review_result_binding(
+                    self.connection, int(claim["batch_id"])
+                )
+                after = tuple(
+                    self.connection.execute(
+                        """
+                        SELECT occurrence_count,status,target_skill,
+                          target_path,problem_category,target_locator,
+                          tombstone_until
+                        FROM candidates WHERE id=?
+                        """,
+                        (candidate_id,),
+                    ).fetchone()
+                )
+                self.assertEqual(binding["basename"], path.name)
+                self.assertTrue(path.exists())
+                self.assertEqual(after, before)
+                self.assertEqual(
+                    self.connection.execute(
+                        "SELECT COUNT(*) FROM candidate_evidence"
+                    ).fetchone()[0],
+                    evidence_before,
+                )
+            self.abort(claim, corrupt_now + 2)
+
+        redacted_shape = f"redacted:{'b' * 64}"
+        for offset, (
+            label,
+            status,
+            problem_category,
+            target_locator,
+            tombstone,
+        ) in enumerate(
+            (
+                (
+                    "unsupported-redacted-status",
+                    "proposed",
+                    "verification",
+                    redacted_shape,
+                    None,
+                ),
+                (
+                    "malformed-redacted-field",
+                    "stale",
+                    "verification",
+                    "not-redacted",
+                    None,
+                ),
+                (
+                    "stale-with-tombstone",
+                    "stale",
+                    "verification",
+                    redacted_shape,
+                    self.runtime.iso_utc(now + 500),
+                ),
+                (
+                    "wrong-redacted-problem-category",
+                    "stale",
+                    "safety",
+                    redacted_shape,
+                    None,
+                ),
+            )
+        ):
+            corrupt_now = now + 60 + offset * 3
+            reset_live_candidate()
+            self.connection.execute(
+                """
+                UPDATE candidates SET target_path=NULL,status=?,
+                    problem_category=?,tombstone_until=?,
+                    target_locator=?,proposal_intent=?,
+                    problem_summary=?,proposal_summary=?,
+                    validation_plan=?,risk_level=?
+                WHERE id=?
+                """,
+                (
+                    status,
+                    problem_category,
+                    tombstone,
+                    target_locator,
+                    redacted_shape,
+                    redacted_shape,
+                    redacted_shape,
+                    redacted_shape,
+                    redacted_shape,
+                    candidate_id,
+                ),
+            )
+            before = tuple(
+                self.connection.execute(
+                    """
+                    SELECT occurrence_count,status,target_path,
+                      problem_category,target_locator,tombstone_until
+                    FROM candidates WHERE id=?
+                    """,
+                    (candidate_id,),
+                ).fetchone()
+            )
+            claim = self.claim(1, corrupt_now)
+            path = self.write_result(
+                claim, self.result_payload(claim)
+            )
+            with self.subTest(existing_redacted_shape=label):
+                with self.assertRaisesRegex(
+                    ValueError, "^candidate_state_corrupt$"
+                ):
+                    self.commit(claim, path, corrupt_now + 1)
+                binding = self.runtime.load_review_result_binding(
+                    self.connection, int(claim["batch_id"])
+                )
+                after = tuple(
+                    self.connection.execute(
+                        """
+                        SELECT occurrence_count,status,target_path,
+                          problem_category,target_locator,tombstone_until
+                        FROM candidates WHERE id=?
+                        """,
+                        (candidate_id,),
+                    ).fetchone()
+                )
+                self.assertEqual(binding["basename"], path.name)
+                self.assertTrue(path.exists())
+                self.assertEqual(after, before)
+            self.abort(claim, corrupt_now + 2)
+
+        reset_live_candidate()
+        linked_item_id = first_item_id
+        for offset, (label, tombstone) in enumerate(
+            (("missing", None), ("malformed", "not-utc"))
+        ):
+            corrupt_now = now + 80 + offset * 4
+            marker = self.runtime.iso_utc(corrupt_now - 100)
+            occurrence = int(
+                self.connection.execute(
+                    "SELECT occurrence_count FROM candidates WHERE id=?",
+                    (candidate_id,),
+                ).fetchone()[0]
+            )
+            self.connection.execute(
+                """
+                UPDATE candidates
+                SET status='rejected',updated_at=?,
+                    tombstone_until=?
+                WHERE id=?
+                """,
+                (marker, tombstone, candidate_id),
+            )
+            claim = self.claim(1, corrupt_now)
+            path = self.write_result(
+                claim, self.result_payload(claim)
+            )
+            with self.subTest(rejected_tombstone=label):
+                with self.assertRaisesRegex(
+                    ValueError, "^candidate_state_corrupt$"
+                ):
+                    self.commit(claim, path, corrupt_now + 1)
+                binding = self.runtime.load_review_result_binding(
+                    self.connection, int(claim["batch_id"])
+                )
+                candidate = self.connection.execute(
+                    "SELECT * FROM candidates WHERE id=?",
+                    (candidate_id,),
+                ).fetchone()
+                self.assertEqual(binding["basename"], path.name)
+                self.assertTrue(path.exists())
+                self.assertEqual(candidate["status"], "rejected")
+                self.assertEqual(
+                    candidate["occurrence_count"], occurrence
+                )
+                self.assertEqual(candidate["updated_at"], marker)
+                self.assertEqual(
+                    candidate["tombstone_until"], tombstone
+                )
+            self.abort(claim, corrupt_now + 2)
+
+        stale_now = now + 90
+        stale_marker = self.runtime.iso_utc(stale_now - 100)
+        redacted = f"redacted:{'a' * 64}"
+        stale_occurrence = int(
+            self.connection.execute(
+                "SELECT occurrence_count FROM candidates WHERE id=?",
+                (candidate_id,),
+            ).fetchone()[0]
+        )
+        self.connection.execute(
+            """
+            UPDATE candidates
+            SET status='stale',updated_at=?,tombstone_until=NULL,
+                target_path=NULL,target_locator=?,proposal_intent=?,
+                problem_summary=?,proposal_summary=?,
+                validation_plan=?,risk_level=?
+            WHERE id=?
+            """,
+            (
+                stale_marker,
+                redacted,
+                redacted,
+                redacted,
+                redacted,
+                redacted,
+                redacted,
+                candidate_id,
+            ),
+        )
+        same_stale = self.reopen_review_item(
+            linked_item_id, stale_now
+        )
+        same_stale_path = self.write_result(
+            same_stale, self.result_payload(same_stale)
+        )
+        self.commit(same_stale, same_stale_path, stale_now + 2)
+        candidate = self.connection.execute(
+            "SELECT * FROM candidates WHERE id=?", (candidate_id,)
+        ).fetchone()
+        self.assertEqual(candidate["status"], "stale")
+        self.assertEqual(
+            candidate["occurrence_count"], stale_occurrence
+        )
+        self.assertEqual(candidate["updated_at"], stale_marker)
+        self.assertIsNone(candidate["target_path"])
+        for field in (
+            "target_locator",
+            "proposal_intent",
+            "problem_summary",
+            "proposal_summary",
+            "validation_plan",
+            "risk_level",
+        ):
+            self.assertEqual(candidate[field], redacted)
+
+        new_stale = self.claim(1, stale_now + 10)
+        new_stale_payload = self.result_payload(new_stale)
+        new_stale_path = self.write_result(
+            new_stale, new_stale_payload
+        )
+        self.commit(new_stale, new_stale_path, stale_now + 11)
+        candidate = self.connection.execute(
+            "SELECT * FROM candidates WHERE id=?", (candidate_id,)
+        ).fetchone()
+        self.assertEqual(candidate["status"], "proposed")
+        self.assertEqual(
+            candidate["occurrence_count"], stale_occurrence + 1
+        )
+        self.assertEqual(
+            candidate["updated_at"],
+            self.runtime.iso_utc(stale_now + 11),
+        )
+        stale_result = new_stale_payload["sessions"][0]
+        stale_classification = stale_result["classification"]
+        self.assertEqual(
+            (
+                candidate["target_path"],
+                candidate["target_locator"],
+                candidate["proposal_intent"],
+                candidate["problem_summary"],
+                candidate["proposal_summary"],
+                candidate["validation_plan"],
+                candidate["risk_level"],
+            ),
+            (
+                str(self.catalog_entry.skill_dir),
+                stale_classification["target_locator"],
+                stale_classification["proposal_intent"],
+                stale_result["problem_summary"],
+                stale_result["proposal_summary"],
+                stale_result["validation_plan"],
+                stale_result["risk_level"],
+            ),
+        )
+
+        revived_item_id = int(
+            self.connection.execute(
+                "SELECT id FROM review_items ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
+        )
+        rejected_now = now + 110
+        rejected_marker = self.runtime.iso_utc(
+            rejected_now - 100
+        )
+        rejected_occurrence = int(candidate["occurrence_count"])
+        self.connection.execute(
+            """
+            UPDATE candidates
+            SET status='rejected',updated_at=?,tombstone_until=?,
+                target_path=NULL,target_locator=?,proposal_intent=?,
+                problem_summary=?,proposal_summary=?,
+                validation_plan=?,risk_level=?
+            WHERE id=?
+            """,
+            (
+                rejected_marker,
+                self.runtime.iso_utc(rejected_now - 1),
+                redacted,
+                redacted,
+                redacted,
+                redacted,
+                redacted,
+                redacted,
+                candidate_id,
+            ),
+        )
+        same_rejected = self.reopen_review_item(
+            revived_item_id, rejected_now
+        )
+        same_rejected_path = self.write_result(
+            same_rejected, self.result_payload(same_rejected)
+        )
+        self.commit(
+            same_rejected, same_rejected_path, rejected_now + 2
+        )
+        candidate = self.connection.execute(
+            "SELECT * FROM candidates WHERE id=?", (candidate_id,)
+        ).fetchone()
+        self.assertEqual(candidate["status"], "rejected")
+        self.assertEqual(
+            candidate["occurrence_count"], rejected_occurrence
+        )
+        self.assertEqual(candidate["updated_at"], rejected_marker)
+        self.assertIsNone(candidate["target_path"])
+        for field in (
+            "target_locator",
+            "proposal_intent",
+            "problem_summary",
+            "proposal_summary",
+            "validation_plan",
+            "risk_level",
+        ):
+            self.assertEqual(candidate[field], redacted)
+
+        new_rejected = self.claim(1, rejected_now + 10)
+        new_rejected_payload = self.result_payload(new_rejected)
+        new_rejected_path = self.write_result(
+            new_rejected, new_rejected_payload
+        )
+        self.commit(
+            new_rejected, new_rejected_path, rejected_now + 11
+        )
+        candidate = self.connection.execute(
+            "SELECT * FROM candidates WHERE id=?", (candidate_id,)
+        ).fetchone()
+        self.assertEqual(candidate["status"], "proposed")
+        self.assertEqual(
+            candidate["occurrence_count"], rejected_occurrence + 1
+        )
+        self.assertEqual(
+            candidate["updated_at"],
+            self.runtime.iso_utc(rejected_now + 11),
+        )
+        self.assertIsNone(candidate["tombstone_until"])
+        rejected_result = new_rejected_payload["sessions"][0]
+        rejected_classification = rejected_result["classification"]
+        self.assertEqual(
+            (
+                candidate["target_path"],
+                candidate["target_locator"],
+                candidate["proposal_intent"],
+                candidate["problem_summary"],
+                candidate["proposal_summary"],
+                candidate["validation_plan"],
+                candidate["risk_level"],
+            ),
+            (
+                str(self.catalog_entry.skill_dir),
+                rejected_classification["target_locator"],
+                rejected_classification["proposal_intent"],
+                rejected_result["problem_summary"],
+                rejected_result["proposal_summary"],
+                rejected_result["validation_plan"],
+                rejected_result["risk_level"],
+            ),
+        )
+
+    def test_every_static_and_dynamic_digest_drift_rolls_back(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        for offset, (function_name, error) in enumerate(
+            (
+                (
+                    "load_review_runtime",
+                    ValueError("injected_runtime_failure"),
+                ),
+                (
+                    "build_catalog_snapshot",
+                    self.runtime.CatalogAdapterError(
+                        "injected_catalog_failure"
+                    ),
+                ),
+                (
+                    "current_review_digests",
+                    ValueError("injected_digest_failure"),
+                ),
+            )
+        ):
+            attempt_now = now + offset * 10
+            with self.subTest(
+                input_failure=function_name,
+                phase="preflight",
+            ):
+                claim = self.claim(1, attempt_now)
+                path = self.write_result(
+                    claim, self.result_payload(claim)
+                )
+                with mock.patch.object(
+                    self.runtime,
+                    function_name,
+                    side_effect=error,
+                ), self.assertRaises(type(error)):
+                    self.commit(claim, path, attempt_now + 1)
+                binding = self.runtime.load_review_result_binding(
+                    self.connection, int(claim["batch_id"])
+                )
+                self.assertEqual(binding["basename"], path.name)
+                self.assertTrue(path.exists())
+                self.assertEqual(
+                    list(self.runtime.review_result_root().iterdir()),
+                    [path],
+                )
+                self.assertEqual(
+                    self.connection.execute(
+                        "SELECT COUNT(*) FROM candidates"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.abort(claim, attempt_now + 2)
+
+        for offset, function_name in enumerate(
+            (
+                "load_review_runtime",
+                "build_catalog_snapshot",
+                "current_review_digests",
+            )
+        ):
+            attempt_now = now + 30 + offset * 10
+            with self.subTest(
+                input_failure=function_name,
+                phase="live_transaction",
+            ):
+                claim = self.claim(1, attempt_now)
+                path = self.write_result(
+                    claim, self.result_payload(claim)
+                )
+                contract = self.runtime.load_review_contract(
+                    self.connection,
+                    int(claim["batch_id"]),
+                    "final",
+                )
+                expected_digests = {
+                    name: contract[name]
+                    for name in (
+                        "policy_digest",
+                        "transcript_adapter_digest",
+                        "catalog_adapter_digest",
+                        "catalog_snapshot_digest",
+                    )
+                }
+                if function_name == "load_review_runtime":
+                    side_effect = [
+                        self.review_runtime,
+                        ValueError("injected_runtime_failure"),
+                    ]
+                    error_type = ValueError
+                elif function_name == "build_catalog_snapshot":
+                    side_effect = [
+                        self.catalog,
+                        self.runtime.CatalogAdapterError(
+                            "injected_catalog_failure"
+                        ),
+                    ]
+                    error_type = self.runtime.CatalogAdapterError
+                else:
+                    side_effect = [
+                        expected_digests,
+                        ValueError("injected_digest_failure"),
+                    ]
+                    error_type = ValueError
+                with mock.patch.object(
+                    self.runtime,
+                    function_name,
+                    side_effect=side_effect,
+                ), self.assertRaises(error_type):
+                    self.commit(claim, path, attempt_now + 1)
+                binding = self.runtime.load_review_result_binding(
+                    self.connection, int(claim["batch_id"])
+                )
+                self.assertEqual(binding["basename"], path.name)
+                self.assertTrue(path.exists())
+                self.assertEqual(
+                    list(self.runtime.review_result_root().iterdir()),
+                    [path],
+                )
+                self.assertEqual(
+                    self.connection.execute(
+                        "SELECT COUNT(*) FROM candidates"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.abort(claim, attempt_now + 2)
+
+        resolver_now = now + 70
+        claim = self.claim(1, resolver_now)
+        batch_id = int(claim["batch_id"])
+        path = self.write_result(claim, self.result_payload(claim))
+        with mock.patch.object(
+            self.runtime,
+            "resolve_catalog_target",
+            side_effect=self.runtime.CatalogAdapterError(
+                "injected_resolver_failure"
+            ),
+        ), self.assertRaises(self.runtime.CatalogAdapterError):
+            self.commit(claim, path, resolver_now + 1)
+        binding = self.runtime.load_review_result_binding(
+            self.connection, batch_id
+        )
+        counts = tuple(
+            self.connection.execute(
+                """
+                SELECT
+                  (SELECT COUNT(*) FROM candidates),
+                  (SELECT COUNT(*) FROM candidate_evidence),
+                  (SELECT COUNT(*) FROM metadata
+                   WHERE key LIKE 'candidate-session.%'),
+                  (SELECT COUNT(*) FROM metadata WHERE key=?)
+                """,
+                (self.runtime.review_audit_key(batch_id),),
+            ).fetchone()
+        )
+        self.assertEqual(counts, (0, 0, 0, 0))
+        self.assertEqual(binding["basename"], path.name)
+        self.assertTrue(path.exists())
+        self.assertEqual(
+            list(self.runtime.review_result_root().iterdir()), [path]
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT status FROM review_batches WHERE id=?",
+                (batch_id,),
+            ).fetchone()["status"],
+            "ready",
+        )
+        self.abort(claim, resolver_now + 2)
+
+        digest_functions = (
+            "improvement_policy_digest",
+            "transcript_adapter_digest",
+            "catalog_adapter_digest",
+        )
+        for offset, function_name in enumerate(digest_functions):
+            attempt_now = now + 100 + offset * 10
+            with self.subTest(function_name=function_name):
+                claim = self.claim(1, attempt_now)
+                path = self.write_result(
+                    claim, self.result_payload(claim)
+                )
+                with mock.patch.object(
+                    self.runtime,
+                    function_name,
+                    return_value="9" * 64,
+                ):
+                    retried = self.commit(
+                        claim, path, attempt_now + 1
+                    )
+                retry_path = Path(str(retried["result_path"]))
+                self.assertEqual(retried["status"], "retry")
+                self.assertEqual(
+                    self.connection.execute(
+                        "SELECT COUNT(*) FROM candidates"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertFalse(path.exists())
+                self.assertTrue(retry_path.exists())
+                self.abort(claim, attempt_now + 2)
+
+        drift_now = now + 140
+        claim = self.claim(1, drift_now)
+        path = self.write_result(claim, self.result_payload(claim))
+        changed_snapshot = replace(
+            self.catalog, snapshot_digest="8" * 64
+        )
+        with mock.patch.object(
+            self.runtime,
+            "load_review_runtime",
+            side_effect=[self.review_runtime, self.review_runtime],
+        ) as load_runtime, mock.patch.object(
+            self.runtime,
+            "build_catalog_snapshot",
+            side_effect=[self.catalog, changed_snapshot],
+        ) as build_snapshot:
+            retried = self.commit(claim, path, drift_now + 1)
+        retry_path = Path(str(retried["result_path"]))
+        self.assertEqual(retried["status"], "retry")
+        self.assertEqual(load_runtime.call_count, 2)
+        self.assertEqual(build_snapshot.call_count, 2)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM candidates"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertFalse(path.exists())
+        self.assertTrue(retry_path.exists())
+        self.abort(claim, drift_now + 2)
+
+        target_now = now + 160
+        claim = self.claim(1, target_now)
+        path = self.write_result(claim, self.result_payload(claim))
+        missing_target = replace(
+            self.catalog,
+            entries=(),
+            export_bytes=b"[]",
+        )
+        with mock.patch.object(
+            self.runtime,
+            "load_review_runtime",
+            side_effect=[self.review_runtime, self.review_runtime],
+        ) as load_runtime, mock.patch.object(
+            self.runtime,
+            "build_catalog_snapshot",
+            side_effect=[self.catalog, missing_target],
+        ) as build_snapshot:
+            retried = self.commit(claim, path, target_now + 1)
+        self.assertEqual(retried["status"], "retry")
+        self.assertEqual(load_runtime.call_count, 2)
+        self.assertEqual(build_snapshot.call_count, 2)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM candidates"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_result_binding_rotation_after_read_rolls_back_candidate_commit(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        claim = self.claim(1, now)
+        batch_id = int(claim["batch_id"])
+        owner_token = str(claim["owner_token"])
+        old_path = self.write_result(
+            claim, self.result_payload(claim)
+        )
+        generation_before = tuple(
+            self.connection.execute(
+                """
+                SELECT generation,status,reviewed_boundary,batch_id
+                FROM review_items
+                """
+            ).fetchone()
+        )
+        replacement_paths: list[Path] = []
+        original_reader = self.runtime.read_bound_review_result
+
+        def rotate_after_read(*args, **kwargs):
+            opened = original_reader(*args, **kwargs)
+            replacement_paths.append(
+                self.runtime.replace_invalid_review_result(
+                    self.connection,
+                    self.installation,
+                    batch_id,
+                    owner_token,
+                    opened,
+                    now + 2,
+                )
+            )
+            return opened
+
+        with mock.patch.object(
+            self.runtime,
+            "read_bound_review_result",
+            side_effect=rotate_after_read,
+        ), self.assertRaisesRegex(
+            ValueError, "^review_result_binding_mismatch$"
+        ):
+            self.commit(claim, old_path, now + 2)
+        replacement = replacement_paths[0]
+        binding = self.runtime.load_review_result_binding(
+            self.connection, batch_id
+        )
+        counts = tuple(
+            self.connection.execute(
+                """
+                SELECT
+                  (SELECT COUNT(*) FROM candidates),
+                  (SELECT COUNT(*) FROM candidate_evidence),
+                  (SELECT COUNT(*) FROM metadata
+                   WHERE key LIKE 'candidate-session.%'),
+                  (SELECT COUNT(*) FROM metadata WHERE key=?)
+                """,
+                (self.runtime.review_audit_key(batch_id),),
+            ).fetchone()
+        )
+        generation_after = tuple(
+            self.connection.execute(
+                """
+                SELECT generation,status,reviewed_boundary,batch_id
+                FROM review_items
+                """
+            ).fetchone()
+        )
+        batch_status = self.connection.execute(
+            "SELECT status FROM review_batches WHERE id=?",
+            (batch_id,),
+        ).fetchone()["status"]
+        self.assertEqual(counts, (0, 0, 0, 0))
+        self.assertEqual(generation_after, generation_before)
+        self.assertEqual(batch_status, "ready")
+        self.assertEqual(binding["basename"], replacement.name)
+        self.assertFalse(old_path.exists())
+        self.assertTrue(replacement.exists())
+        self.assertEqual(
+            list(self.runtime.review_result_root().iterdir()),
+            [replacement],
+        )
+        self.abort(claim, now + 3)
+
+        trigger_now = now + 10
+        trigger_claim = self.claim(1, trigger_now)
+        trigger_batch_id = int(trigger_claim["batch_id"])
+        trigger_path = self.write_result(
+            trigger_claim, self.result_payload(trigger_claim)
+        )
+        trigger_generation_before = tuple(
+            self.connection.execute(
+                """
+                SELECT generation,status,reviewed_boundary,batch_id
+                FROM review_items WHERE batch_id=?
+                """,
+                (trigger_batch_id,),
+            ).fetchone()
+        )
+        audit_key = self.runtime.review_audit_key(
+            trigger_batch_id
+        )
+        self.connection.execute(
+            f"""
+            CREATE TRIGGER fail_candidate_audit
+            BEFORE INSERT ON metadata
+            WHEN NEW.key='{audit_key}'
+            BEGIN
+              SELECT RAISE(ABORT,'forced_candidate_audit');
+            END
+            """
+        )
+        try:
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.commit(
+                    trigger_claim, trigger_path, trigger_now + 1
+                )
+        finally:
+            self.connection.execute(
+                "DROP TRIGGER fail_candidate_audit"
+            )
+        trigger_counts = tuple(
+            self.connection.execute(
+                """
+                SELECT
+                  (SELECT COUNT(*) FROM candidates),
+                  (SELECT COUNT(*) FROM candidate_evidence),
+                  (SELECT COUNT(*) FROM metadata
+                   WHERE key LIKE 'candidate-session.%'),
+                  (SELECT COUNT(*) FROM metadata WHERE key=?)
+                """,
+                (audit_key,),
+            ).fetchone()
+        )
+        trigger_generation_after = tuple(
+            self.connection.execute(
+                """
+                SELECT generation,status,reviewed_boundary,batch_id
+                FROM review_items WHERE batch_id=?
+                """,
+                (trigger_batch_id,),
+            ).fetchone()
+        )
+        trigger_binding = self.runtime.load_review_result_binding(
+            self.connection, trigger_batch_id
+        )
+        self.assertEqual(trigger_counts, (0, 0, 0, 0))
+        self.assertEqual(
+            trigger_generation_after, trigger_generation_before
+        )
+        self.assertEqual(trigger_binding["basename"], trigger_path.name)
+        self.assertTrue(trigger_path.exists())
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT status FROM review_batches WHERE id=?",
+                (trigger_batch_id,),
+            ).fetchone()["status"],
+            "ready",
+        )
+
+    def test_frozen_to_change_rolls_back_whole_result(self) -> None:
+        now = 2_000_000_000.0
+        claim = self.claim(1, now)
+        batch_id = int(claim["batch_id"])
+        path = self.write_result(claim, self.result_payload(claim))
+        original_reader = self.runtime.read_bound_review_result
+
+        def drift_after_read(*args, **kwargs):
+            opened = original_reader(*args, **kwargs)
+            self.connection.execute(
+                """
+                UPDATE review_items
+                SET frozen_to=frozen_to+1
+                WHERE batch_id=?
+                """,
+                (batch_id,),
+            )
+            self.connection.commit()
+            return opened
+
+        with mock.patch.object(
+            self.runtime,
+            "read_bound_review_result",
+            side_effect=drift_after_read,
+        ), self.assertRaisesRegex(
+            ValueError, "^review_generation_contract_mismatch$"
+        ):
+            self.commit(claim, path, now + 1)
+        counts = tuple(
+            self.connection.execute(
+                """
+                SELECT
+                  (SELECT COUNT(*) FROM candidates),
+                  (SELECT COUNT(*) FROM candidate_evidence),
+                  (SELECT COUNT(*) FROM metadata
+                   WHERE key LIKE 'candidate-session.%'),
+                  (SELECT COUNT(*) FROM metadata WHERE key=?)
+                """,
+                (self.runtime.review_audit_key(batch_id),),
+            ).fetchone()
+        )
+        binding = self.runtime.load_review_result_binding(
+            self.connection, batch_id
+        )
+        self.assertEqual(counts, (0, 0, 0, 0))
+        self.assertEqual(binding["basename"], path.name)
+        self.assertTrue(path.exists())
+        self.assertEqual(
+            list(self.runtime.review_result_root().iterdir()),
+            [path],
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT status FROM review_batches WHERE id=?",
+                (batch_id,),
+            ).fetchone()["status"],
+            "ready",
+        )

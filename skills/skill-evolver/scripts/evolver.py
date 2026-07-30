@@ -3335,6 +3335,646 @@ def candidate_evidence_aggregate_key(candidate_id: object) -> str:
     return f"candidate.{candidate_id}.evidence_aggregate"
 
 
+CANDIDATE_SESSION_LINK_MAX_BYTES = 512
+
+
+class _CandidateResultRetry(Exception):
+    pass
+
+
+def display_id(prefix: object, value: object) -> str:
+    if (
+        type(prefix) is not str
+        or re.fullmatch(r"[A-Z]{1,16}", prefix) is None
+        or type(value) is not int
+        or not 1 <= value <= SQLITE_INTEGER_MAX
+    ):
+        raise ValueError("invalid_display_id")
+    return f"{prefix}-{value:03d}"
+
+
+def load_candidate_session_link(
+    connection: sqlite3.Connection,
+    key: object,
+) -> Optional[dict[str, object]]:
+    if (
+        type(key) is not str
+        or re.fullmatch(r"candidate-session\.[0-9a-f]{64}", key)
+        is None
+    ):
+        raise ValueError("invalid_candidate_session_link")
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key=?", (key,)
+    ).fetchone()
+    if row is None:
+        return None
+    raw = row["value"]
+    if type(raw) is not str:
+        raise ValueError("invalid_candidate_session_link")
+    try:
+        encoded = raw.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("invalid_candidate_session_link") from None
+    if len(encoded) > CANDIDATE_SESSION_LINK_MAX_BYTES:
+        raise ValueError("invalid_candidate_session_link")
+    try:
+        value = _load_declarative_result_json(encoded)
+    except ValueError:
+        raise ValueError("invalid_candidate_session_link") from None
+    if (
+        type(value) is not dict
+        or set(value)
+        != {"schema_version", "candidate_id", "dedupe_expires_at"}
+        or type(value.get("schema_version")) is not int
+        or value["schema_version"] != 1
+        or type(value.get("candidate_id")) is not int
+        or not 1 <= value["candidate_id"] <= SQLITE_INTEGER_MAX
+        or type(value.get("dedupe_expires_at")) is not str
+        or canonical_json_bytes(value) != encoded
+    ):
+        raise ValueError("invalid_candidate_session_link")
+    try:
+        parse_iso_utc(value["dedupe_expires_at"])
+    except ValueError:
+        raise ValueError("invalid_candidate_session_link") from None
+    candidate = connection.execute(
+        "SELECT id FROM candidates WHERE id=?",
+        (value["candidate_id"],),
+    ).fetchone()
+    if candidate is None:
+        raise ValueError("invalid_candidate_session_link")
+    return value
+
+
+def current_review_digests(
+    runtime: ReviewRuntime,
+    snapshot: CatalogSnapshot,
+) -> dict[str, str]:
+    if (
+        type(runtime) is not ReviewRuntime
+        or type(snapshot) is not CatalogSnapshot
+    ):
+        raise ValueError("invalid_review_digest_inputs")
+    policy = load_improvement_policy(runtime)
+    return {
+        "policy_digest": improvement_policy_digest(policy),
+        "transcript_adapter_digest": transcript_adapter_digest(runtime),
+        "catalog_adapter_digest": catalog_adapter_digest(runtime),
+        "catalog_snapshot_digest": snapshot.snapshot_digest,
+    }
+
+
+def rotate_invalid_review_result(
+    connection: sqlite3.Connection,
+    installation: Installation,
+    batch_id: int,
+    owner_token: str,
+    opened: BoundReviewResult,
+    now: float,
+) -> dict[str, object]:
+    replacement = replace_invalid_review_result(
+        connection,
+        installation,
+        batch_id,
+        owner_token,
+        opened,
+        now,
+    )
+    return {
+        "schema_version": 1,
+        "status": "retry",
+        "batch_id": batch_id,
+        "error_code": "invalid_review_result",
+        "result_path": str(replacement),
+    }
+
+
+def upsert_validated_candidate(
+    connection: sqlite3.Connection,
+    prepared: dict[str, object],
+    now: float,
+) -> tuple[int, bool]:
+    if not connection.in_transaction:
+        raise ValueError("active_review_transaction_required")
+    result = prepared["result"]
+    classification = result["classification"]
+    entry = prepared["entry"]
+    fingerprint = prepared["fingerprint"]
+    link = prepared["link"]
+    existing = connection.execute(
+        "SELECT * FROM candidates WHERE fingerprint=?",
+        (fingerprint,),
+    ).fetchone()
+    now_text = iso_utc(now)
+    if existing is None:
+        cursor = connection.execute(
+            """
+            INSERT INTO candidates(
+              fingerprint,target_identity,target_skill,target_path,
+              problem_category,target_locator,proposal_intent,conflict_group,
+              problem_summary,proposal_summary,validation_plan,risk_level,
+              status,occurrence_count,first_seen_at,last_seen_at,updated_at,
+              tombstone_until
+            ) VALUES(?,?,?,?,?,?,?,NULL,?,?,?,?, 'proposed',1,?,?,?,NULL)
+            """,
+            (
+                fingerprint,
+                entry.identity,
+                entry.skill_dir.name,
+                str(entry.skill_dir),
+                classification["problem_category"],
+                classification["target_locator"],
+                classification["proposal_intent"],
+                result["problem_summary"],
+                result["proposal_summary"],
+                result["validation_plan"],
+                result["risk_level"],
+                now_text,
+                now_text,
+                now_text,
+            ),
+        )
+        candidate_id = int(cursor.lastrowid)
+        if not 1 <= candidate_id <= SQLITE_INTEGER_MAX:
+            raise ValueError("candidate_state_corrupt")
+        return candidate_id, True
+
+    candidate_id = existing["id"]
+    occurrence = existing["occurrence_count"]
+    if (
+        type(candidate_id) is not int
+        or not 1 <= candidate_id <= SQLITE_INTEGER_MAX
+        or type(occurrence) is not int
+        or not 1 <= occurrence < SQLITE_INTEGER_MAX
+        or type(existing["status"]) is not str
+        or not existing["status"]
+        or type(existing["fingerprint"]) is not str
+        or not _is_lower_hex(existing["fingerprint"], 64)
+        or existing["fingerprint"] != fingerprint
+        or type(existing["target_identity"]) is not str
+        or existing["target_identity"] != entry.identity
+        or type(existing["target_skill"]) is not str
+        or existing["target_skill"] != entry.skill_dir.name
+        or type(existing["problem_category"]) is not str
+        or existing["problem_category"] not in PROBLEM_CATEGORIES
+        or existing["problem_category"]
+        != classification["problem_category"]
+    ):
+        raise ValueError("candidate_state_corrupt")
+    status = existing["status"]
+    tombstone = existing["tombstone_until"]
+    if status != "rejected" and tombstone is not None:
+        raise ValueError("candidate_state_corrupt")
+    target_path = existing["target_path"]
+    if target_path is None:
+        if status not in {"stale", "rejected"} or any(
+            type(existing[field]) is not str
+            or re.fullmatch(
+                r"redacted:[0-9a-f]{64}", existing[field]
+            )
+            is None
+            for field in (
+                "target_locator",
+                "proposal_intent",
+                "problem_summary",
+                "proposal_summary",
+                "validation_plan",
+                "risk_level",
+            )
+        ):
+            raise ValueError("candidate_state_corrupt")
+    else:
+        if (
+            type(target_path) is not str
+            or target_path != str(entry.skill_dir)
+        ):
+            raise ValueError("candidate_state_corrupt")
+        try:
+            stored_fingerprint = candidate_fingerprint(
+                existing["target_identity"],
+                existing["problem_category"],
+                existing["target_locator"],
+                existing["proposal_intent"],
+            )
+        except ValueError:
+            raise ValueError("candidate_state_corrupt") from None
+        if stored_fingerprint != fingerprint:
+            raise ValueError("candidate_state_corrupt")
+    tombstone_active = False
+    if status == "rejected":
+        if type(tombstone) is not str:
+            raise ValueError("candidate_state_corrupt")
+        try:
+            tombstone_active = parse_iso_utc(tombstone) > now
+        except ValueError:
+            raise ValueError("candidate_state_corrupt") from None
+    if link is not None:
+        if link["candidate_id"] != candidate_id:
+            raise ValueError("candidate_state_corrupt")
+        return candidate_id, False
+
+    revive = status == "stale" or (
+        status == "rejected" and not tombstone_active
+    )
+    if revive:
+        changed = connection.execute(
+            """
+            UPDATE candidates
+            SET occurrence_count=occurrence_count+1,
+                last_seen_at=?,updated_at=?,status='proposed',
+                tombstone_until=NULL,target_path=?,target_locator=?,
+                proposal_intent=?,problem_summary=?,proposal_summary=?,
+                validation_plan=?,risk_level=?
+            WHERE id=?
+            """,
+            (
+                now_text,
+                now_text,
+                str(entry.skill_dir),
+                classification["target_locator"],
+                classification["proposal_intent"],
+                result["problem_summary"],
+                result["proposal_summary"],
+                result["validation_plan"],
+                result["risk_level"],
+                candidate_id,
+            ),
+        ).rowcount
+    else:
+        changed = connection.execute(
+            """
+            UPDATE candidates
+            SET occurrence_count=occurrence_count+1,last_seen_at=?
+            WHERE id=?
+            """,
+            (now_text, candidate_id),
+        ).rowcount
+    if changed != 1:
+        raise sqlite3.IntegrityError("candidate_update_race")
+    return candidate_id, False
+
+
+def commit_review_result(
+    connection: sqlite3.Connection,
+    installation: Installation,
+    config: Config,
+    batch_id: int,
+    owner_token: str,
+    result_path: Path,
+    now: float,
+) -> dict[str, object]:
+    try:
+        opened = read_bound_review_result(
+            connection,
+            installation,
+            batch_id,
+            owner_token,
+            result_path,
+            now,
+        )
+    except ReviewResultError as error:
+        if (
+            error.opened is None
+            or error.code
+            not in {"review_result_changed", "review_result_too_large"}
+        ):
+            raise
+        return rotate_invalid_review_result(
+            connection,
+            installation,
+            batch_id,
+            owner_token,
+            error.opened,
+            now,
+        )
+
+    try:
+        payload = _load_declarative_result_json(opened.encoded)
+    except ValueError:
+        return rotate_invalid_review_result(
+            connection,
+            installation,
+            batch_id,
+            owner_token,
+            opened,
+            now,
+        )
+
+    _batch, contract, owner_digest = require_live_review_batch(
+        connection,
+        installation,
+        batch_id,
+        owner_token,
+        now,
+    )
+    runtime = load_review_runtime()
+    snapshot = build_catalog_snapshot(runtime)
+    digests = current_review_digests(runtime, snapshot)
+    if any(
+        contract[name] != value for name, value in digests.items()
+    ):
+        return rotate_invalid_review_result(
+            connection,
+            installation,
+            batch_id,
+            owner_token,
+            opened,
+            now,
+        )
+    allowed_targets = frozenset(
+        entry.identity for entry in snapshot.entries
+    )
+    try:
+        validate_declarative_result(
+            payload, contract, allowed_targets
+        )
+    except ValueError:
+        return rotate_invalid_review_result(
+            connection,
+            installation,
+            batch_id,
+            owner_token,
+            opened,
+            now,
+        )
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            _live_batch, live_contract, live_owner_digest = (
+                require_live_review_batch(
+                    connection,
+                    installation,
+                    batch_id,
+                    owner_token,
+                    now,
+                )
+            )
+            if (
+                live_owner_digest != owner_digest
+                or sha256_json(live_contract)
+                != sha256_json(contract)
+            ):
+                raise ValueError("review_contract_changed")
+            live_runtime = load_review_runtime()
+            live_snapshot = build_catalog_snapshot(
+                live_runtime
+            )
+            live_digests = current_review_digests(
+                live_runtime, live_snapshot
+            )
+            if any(
+                live_contract[name] != value
+                for name, value in live_digests.items()
+            ):
+                raise _CandidateResultRetry
+            require_bound_review_result_binding(
+                connection, batch_id, opened
+            )
+            live_targets = frozenset(
+                entry.identity for entry in live_snapshot.entries
+            )
+            try:
+                validated = validate_declarative_result(
+                    payload, live_contract, live_targets
+                )
+            except ValueError:
+                raise _CandidateResultRetry from None
+
+            contract_sessions = {
+                session["session_ref"]: session
+                for session in live_contract["sessions"]
+            }
+            prepared: list[dict[str, object]] = []
+            new_fingerprints: set[str] = set()
+            for result in validated["sessions"]:
+                session = contract_sessions[result["session_ref"]]
+                row = connection.execute(
+                    """
+                    SELECT id,session_key,dedupe_expires_at
+                    FROM review_items WHERE id=?
+                    """,
+                    (session["review_item_id"],),
+                ).fetchone()
+                if row is None:
+                    raise ValueError("review_item_missing")
+                item: dict[str, object] = {
+                    "result": result,
+                    "session": session,
+                    "row": row,
+                }
+                if result["decision"] == "candidate":
+                    entry = resolve_catalog_target(
+                        live_snapshot,
+                        result["target_identity"],
+                    )
+                    classification = result["classification"]
+                    fingerprint = candidate_fingerprint(
+                        entry.identity,
+                        classification["problem_category"],
+                        classification["target_locator"],
+                        classification["proposal_intent"],
+                    )
+                    existing = connection.execute(
+                        """
+                        SELECT id FROM candidates
+                        WHERE fingerprint=?
+                        """,
+                        (fingerprint,),
+                    ).fetchone()
+                    link_key = candidate_session_link_key(
+                        installation, row["session_key"]
+                    )
+                    link = load_candidate_session_link(
+                        connection, link_key
+                    )
+                    row_expiry = row["dedupe_expires_at"]
+                    if (
+                        type(row_expiry) is not str
+                        or not _is_iso_utc_string(row_expiry)
+                    ):
+                        raise ValueError(
+                            "invalid_candidate_session_link"
+                        )
+                    if (
+                        link is not None
+                        and parse_iso_utc(
+                            link["dedupe_expires_at"]
+                        )
+                        < parse_iso_utc(row_expiry)
+                    ):
+                        raise ValueError(
+                            "invalid_candidate_session_link"
+                        )
+                    candidate_limit = link is not None and (
+                        existing is None
+                        or link["candidate_id"] != existing["id"]
+                    )
+                    if existing is None and not candidate_limit:
+                        new_fingerprints.add(fingerprint)
+                    item.update(
+                        {
+                            "entry": entry,
+                            "fingerprint": fingerprint,
+                            "link_key": link_key,
+                            "link": link,
+                            "candidate_limit": candidate_limit,
+                        }
+                    )
+                prepared.append(item)
+            if len(new_fingerprints) > min(
+                config.max_candidates_per_batch, 3
+            ):
+                raise _CandidateResultRetry
+
+            new_ids: set[int] = set()
+            merged_ids: set[int] = set()
+            semantic_exclusions: dict[str, int] = {}
+            candidate_count = 0
+            for item in prepared:
+                result = item["result"]
+                session = item["session"]
+                row = item["row"]
+                if result["decision"] == "excluded":
+                    reason = result["excluded_reason"]
+                    semantic_exclusions[reason] = (
+                        semantic_exclusions.get(reason, 0) + 1
+                    )
+                    complete_batch_review_generation(
+                        connection,
+                        session["review_item_id"],
+                        batch_id,
+                        owner_digest,
+                        session["expected_generation"],
+                        session["frozen_epoch"],
+                        session["frozen_from"],
+                        session["frozen_to"],
+                        session["frozen_locator_digest"],
+                        "excluded",
+                        reason,
+                        now,
+                    )
+                    continue
+                if item["candidate_limit"]:
+                    semantic_exclusions["candidate_limit"] = (
+                        semantic_exclusions.get("candidate_limit", 0)
+                        + 1
+                    )
+                    complete_batch_review_generation(
+                        connection,
+                        session["review_item_id"],
+                        batch_id,
+                        owner_digest,
+                        session["expected_generation"],
+                        session["frozen_epoch"],
+                        session["frozen_from"],
+                        session["frozen_to"],
+                        session["frozen_locator_digest"],
+                        "excluded",
+                        "candidate_limit",
+                        now,
+                    )
+                    continue
+                candidate_id, created = upsert_validated_candidate(
+                    connection, item, now
+                )
+                inserted_evidence = 0
+                for evidence in result["evidence"]:
+                    inserted_evidence += int(
+                        record_candidate_evidence(
+                            connection,
+                            candidate_id,
+                            session["review_item_id"],
+                            owner_digest,
+                            session["expected_generation"],
+                            evidence["signal_type"],
+                            evidence["source_kind"],
+                            evidence["summary"],
+                            now,
+                        )
+                    )
+                if item["link"] is None:
+                    if inserted_evidence < 1:
+                        raise ValueError(
+                            "candidate_evidence_required"
+                        )
+                    connection.execute(
+                        "INSERT INTO metadata(key,value) VALUES(?,?)",
+                        (
+                            item["link_key"],
+                            canonical_json_bytes(
+                                candidate_session_link_value(
+                                    candidate_id,
+                                    row["dedupe_expires_at"],
+                                )
+                            ).decode("utf-8"),
+                        ),
+                    )
+                candidate_count += 1
+                if created:
+                    new_ids.add(candidate_id)
+                elif candidate_id not in new_ids:
+                    merged_ids.add(candidate_id)
+                complete_batch_review_generation(
+                    connection,
+                    session["review_item_id"],
+                    batch_id,
+                    owner_digest,
+                    session["expected_generation"],
+                    session["frozen_epoch"],
+                    session["frozen_from"],
+                    session["frozen_to"],
+                    session["frozen_locator_digest"],
+                    "reviewed",
+                    None,
+                    now,
+                )
+            merged_ids.difference_update(new_ids)
+            audit = finalize_review_batch(
+                connection,
+                batch_id,
+                owner_digest,
+                "completed",
+                candidate_count,
+                semantic_exclusions,
+                now,
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+    except _CandidateResultRetry:
+        return rotate_invalid_review_result(
+            connection,
+            installation,
+            batch_id,
+            owner_token,
+            opened,
+            now,
+        )
+
+    deleted = delete_bound_review_result(opened)
+    audit_exclusions = audit["exclusion_counts"]
+    return {
+        "schema_version": 1,
+        "status": "completed",
+        "batch_id": batch_id,
+        "new_candidates": [
+            display_id("C", candidate_id)
+            for candidate_id in sorted(new_ids)
+        ],
+        "merged_candidates": [
+            display_id("C", candidate_id)
+            for candidate_id in sorted(merged_ids)
+        ],
+        "exclusion_counts": {
+            name: audit_exclusions[name]
+            for name in sorted(audit_exclusions)
+        },
+        "result_deleted": deleted,
+    }
+
+
 def load_review_runtime() -> ReviewRuntime:
     with RUNTIME_REFERENCE_PATH.open("rb") as stream:
         encoded = stream.read(RUNTIME_REFERENCE_MAX_BYTES + 1)
@@ -3927,7 +4567,7 @@ def finalize_review_batch(
         or terminal_status
         not in {"completed", "aborted", "expired", "failed"}
         or type(candidate_count) is not int
-        or not 0 <= candidate_count <= 3
+        or not 0 <= candidate_count <= REVIEW_BATCH_SESSIONS_MAX
         or not isinstance(exclusion_counts, dict)
         or "batch_capacity_released" in exclusion_counts
         or len(exclusion_counts) > REVIEW_BATCH_SESSIONS_MAX
