@@ -3,10 +3,10 @@ gsd_state_version: '1.0'
 status: planning
 progress:
   total_phases: 11
-  completed_phases: 3
-  total_plans: 3
-  completed_plans: 3
-  percent: 27
+  completed_phases: 4
+  total_plans: 4
+  completed_plans: 4
+  percent: 36
 ---
 
 # Project State
@@ -16,22 +16,22 @@ progress:
 See: `.planning/PROJECT.md` (updated 2026-07-27)
 
 **Core value:** 관찰은 최소화하고 판단과 스킬 변경 권한은 사용자에게 남긴다.
-**Current focus:** Phase 4 — Review and Inbox
+**Current focus:** Phase 5 — Read-only Quality Gate
 
 ## Current Position
 
-Phase: 4 of 11 (Review and Inbox)
+Phase: 5 of 11 (Read-only Quality Gate)
 Plan: 0 of 1 in current phase
-Status: Ready to replace the stale turn-level Review plan with a session-generation plan
-Last activity: 2026-07-29 — Phase 3 Runtime Queue gate recorded PASS;
-`CAPT-01` complete; canonical report and Task 7 plan corrections committed
+Status: Ready to design the read-only sample and human-label gate
+Last activity: 2026-07-30 — Phase 4 Review and Inbox gate recorded PASS;
+`REVIEW-01` complete; canonical report committed
 
-Progress: [███░░░░░░░] 27%
+Progress: [████░░░░░░] 36%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 3
+- Total plans completed: 4
 - Average duration: Not recorded
 - Total execution time: Not recorded
 
@@ -42,8 +42,9 @@ Progress: [███░░░░░░░] 27%
 | 1. Feasibility Spike | 1/1 | Not recorded | Not recorded |
 | 2. Session-Level Capture Design Amendment | 1/1 | Not recorded | Not recorded |
 | 3. Runtime Queue | 1/1 | Not recorded | Not recorded |
+| 4. Review and Inbox | 1/1 | Not recorded | Not recorded |
 
-**Recent Trend:** Three sequential phase gates recorded; Phase 2 and Phase 3 are PASS
+**Recent Trend:** Four sequential phase gates recorded; Phase 2, Phase 3 and Phase 4 are PASS
 
 ## Accumulated Context
 
@@ -68,29 +69,25 @@ Progress: [███░░░░░░░] 27%
 
 ### Pending Todos
 
-- Replace the superseded turn-level Review/Inbox plan with a session-generation
-  plan gated on `docs/release-reports/runtime-queue.json`.
-- Reuse the implemented claim, heartbeat, epoch adoption, evidence and
-  completion helpers; do not duplicate lease state or bump the schema.
-- Keep status/inspect read-only and require scoped approval for every
-  transcript read or global-root mutation.
+- Design the Phase 5 read-only sample and complete human-label contract.
+- Bind the Phase 5 sample to the committed policy and adapter digests.
+- Keep Runner, Prepare, Evaluate and Apply disabled until `QUALITY-01` passes.
 
 ### Blockers/Concerns
 
-- No Phase 3 product blocker remains: `docs/release-reports/runtime-queue.json` records `PASS`.
-- The original Phase 1 `FAIL` remains immutable predecessor evidence, not a current Phase 3 blocker.
-- The existing 2026-07-26 Review plan is turn-level and must not be executed
-  until rewritten for session generations.
+- No Phase 4 implementation blocker remains: `docs/release-reports/review-inbox.json` records `PASS`.
+- Phase 4 PASS proves deterministic mechanics and safety only; candidate quality remains unmeasured until Phase 5.
+- The original Phase 1 `FAIL` and superseded turn-level Review plan remain immutable historical evidence.
 
 ## Deferred Items
 
 | Category | Item | Status | Deferred At |
 |----------|------|--------|-------------|
 | Runtime | Turn-level queue implementation | Superseded; must not execute | Phase 2 amendment |
-| Review | Turn-level/20-item Review plan | Superseded; rewrite before execution | Phase 4 |
+| Review | Turn-level/20-item Review plan | Superseded; replaced by completed session-generation Review | Phase 4 |
 
 ## Session Continuity
 
-Last session: 2026-07-29
-Stopped at: Phase 3 complete and verified; Phase 4 Review plan rewrite is current
+Last session: 2026-07-30
+Stopped at: Phase 4 complete and verified; Phase 5 read-only quality planning is current
 Resume file: None

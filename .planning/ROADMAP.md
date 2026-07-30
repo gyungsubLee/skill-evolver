@@ -11,8 +11,8 @@ Skill Evolver는 Phase 1 Feasibility `FAIL`을 Phase 2의 session-level 계약�
 - [x] **Phase 1: Feasibility Spike** - CLI/Desktop probe를 실행하고 deterministic gate decision을 생성했다.
 - [x] **Phase 2: Session-Level Capture Design Amendment** - 실패한 turn/root 가정을 session-level queue와 접근 가능한 data-root 계약으로 수정하고 CLI/Desktop에서 재검증했다.
 - [x] **Phase 3: Runtime Queue** - amended PASS 계약에 따라 silent, bounded SQLite capture와 status를 제공한다.
-- [ ] **Phase 4: Review and Inbox** - 명시적 review로 안전한 candidate inbox를 제공한다. **(current)**
-- [ ] **Phase 5: Read-only Quality Gate** - 실제 sample과 attribution 품질로 Evaluate 진입 여부를 결정한다.
+- [x] **Phase 4: Review and Inbox** - 명시적 review로 안전한 candidate inbox를 제공한다.
+- [ ] **Phase 5: Read-only Quality Gate** - 실제 sample과 attribution 품질로 Evaluate 진입 여부를 결정한다. **(current)**
 - [ ] **Phase 6: Evaluate Runner Spike** - pinned runner의 격리·resource·재현성 계약을 검증한다.
 - [ ] **Phase 7: Evaluate Prepare** - 변경을 실행하지 않고 immutable candidate와 evaluation spec을 준비한다.
 - [ ] **Phase 8: Evaluate Execution** - exact spec digest에 결합된 old-versus-candidate 평가를 수행한다.
@@ -94,6 +94,8 @@ Plans:
 **Depends on**: Phase 3
 **Requirements**: REVIEW-01
 **Entry Gate**: Runtime Queue integration suite passes
+**Exit Gate**: Review/Inbox suite and canonical report are PASS
+**Gate Result**: **PASS** — `docs/release-reports/review-inbox.json`
 **Failure Route**: Phase 4 adapter, policy 또는 validation을 수정한다.
 **Success Criteria** (what must be TRUE):
   1. 인자 없는 호출과 status/inspect/defer/reject는 transcript를 열지 않고, explicit `review`만 bounded context를 읽는다.
@@ -103,7 +105,7 @@ Plans:
 **Plans**: 1 plan
 
 Plans:
-- [ ] 04-01: Transcript adapter, bounded review와 candidate inbox
+- [x] 04-01: Transcript adapter, bounded review와 candidate inbox — completed 2026-07-30
 
 ### Phase 5: Read-only Quality Gate
 **Goal**: human label과 실제 review sample로 candidate 품질과 안전성을 측정해 Evaluate 진입 여부를 결정한다.
@@ -227,8 +229,8 @@ Plans:
 | 1. Feasibility Spike | 1/1 | Complete (gate FAIL) | 2026-07-27 |
 | 2. Session-Level Capture Design Amendment | 1/1 | Complete (gate PASS) | 2026-07-29 |
 | 3. Runtime Queue | 1/1 | Complete (gate PASS) | 2026-07-29 |
-| 4. Review and Inbox | 0/1 | Not started (current) | - |
-| 5. Read-only Quality Gate | 0/1 | Not started | - |
+| 4. Review and Inbox | 1/1 | Complete (gate PASS) | 2026-07-30 |
+| 5. Read-only Quality Gate | 0/1 | Not started (current) | - |
 | 6. Evaluate Runner Spike | 0/1 | Not started | - |
 | 7. Evaluate Prepare | 0/1 | Not started | - |
 | 8. Evaluate Execution | 0/1 | Not started | - |

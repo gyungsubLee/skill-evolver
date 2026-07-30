@@ -17,7 +17,7 @@
 ### Read-only MVP
 
 - [x] **CAPT-01**: amended Feasibility PASS 뒤 중앙 Stop Hook은 승인된 workspace의 bounded session metadata를 SQLite schema v1 queue에 silent·idempotent하게 저장하고, bounded spool·retention·transcript-free status를 제공하며 모델·네트워크 호출이나 installed-skill mutation을 하지 않아야 한다.
-- [ ] **REVIEW-01**: 명시적인 `$skill-evolver review`만 allowlisted frozen session-generation context를 fail-closed로 읽고, batch당 최대 5 sessions, session별 100 records·2 MiB 및 batch 8 MiB 상한, lease, exclusion, secret sanitization, session당 candidate 1개와 batch당 신규 fingerprint 3개 제한을 적용해야 한다.
+- [x] **REVIEW-01**: 명시적인 `$skill-evolver review`만 allowlisted frozen session-generation context를 fail-closed로 읽고, batch당 최대 5 sessions, session별 100 records·2 MiB 및 batch 8 MiB 상한, lease, exclusion, secret sanitization, session당 candidate 1개와 batch당 신규 fingerprint 3개 제한을 적용해야 한다.
 - [ ] **QUALITY-01**: Read-only quality gate는 최소 10 sessions 또는 30 review items, evaluation-worth rate 0.50 이상, target misattribution 0.20 이하, external-content adoption 0건, 전 candidate human label과 policy/adapter digest를 확인해야 한다.
 
 ### Evaluate
@@ -46,7 +46,7 @@
 | FEAS-01 | Phase 1 | Complete |
 | GATE-01 | Phase 2 | Complete |
 | CAPT-01 | Phase 3 | Complete |
-| REVIEW-01 | Phase 4 | Pending |
+| REVIEW-01 | Phase 4 | Complete |
 | QUALITY-01 | Phase 5 | Pending |
 | RUNNER-01 | Phase 6 | Pending |
 | PREP-01 | Phase 7 | Pending |
