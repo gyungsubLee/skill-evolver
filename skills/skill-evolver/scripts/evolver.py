@@ -769,12 +769,33 @@ def _initial_session_meta(
     installation: Installation,
     frozen: FrozenTranscript,
 ) -> None:
-    length = min(frozen.frozen_to, SESSION_META_MAX_BYTES + 1)
-    prefix = _read_exact_at(descriptor, 0, length)
-    newline = prefix.find(b"\n")
-    if newline < 0 or newline + 1 > SESSION_META_MAX_BYTES:
-        raise _transcript_error("unsupported_transcript")
-    line = prefix[: newline + 1]
+    chunks: list[bytes] = []
+    offset = 0
+    line = b""
+    while offset < frozen.frozen_to:
+        length = min(
+            4_096,
+            frozen.frozen_to - offset,
+            SESSION_META_MAX_BYTES + 1 - offset,
+        )
+        if length <= 0:
+            break
+        chunk = _read_exact_at(descriptor, offset, length)
+        chunks.append(chunk)
+        combined = b"".join(chunks)
+        newline = combined.find(b"\n")
+        if newline >= 0:
+            if newline + 1 > SESSION_META_MAX_BYTES:
+                raise _transcript_error("unsupported_transcript")
+            line = combined[: newline + 1]
+            break
+        offset += len(chunk)
+    if not line:
+        raise _transcript_error(
+            "transcript_partial"
+            if frozen.frozen_to <= SESSION_META_MAX_BYTES
+            else "unsupported_transcript"
+        )
     try:
         value = json.loads(line)
     except (
@@ -815,7 +836,7 @@ def _bounded_reverse_context(
 def _close_transcript_descriptor(descriptor: int) -> None:
     try:
         os.close(descriptor)
-    except OSError:
+    except (OSError, RuntimeError):
         pass
 
 
@@ -846,7 +867,7 @@ def _open_matching_transcript(
         )
     except FileNotFoundError:
         return None
-    except OSError:
+    except (OSError, RuntimeError):
         raise _transcript_error("transcript_changed") from None
     try:
         info = os.fstat(descriptor)
@@ -1124,42 +1145,52 @@ def read_frozen_transcript(
             raise _transcript_error("transcript_changed")
         if header_error is not None:
             raise header_error
-        if delta_length > byte_limit:
-            raise _transcript_error("oversized_session")
-        delta = _read_exact_at(
-            descriptor, frozen.frozen_from, delta_length
-        )
-        if not delta.endswith(b"\n"):
-            raise _transcript_error("transcript_partial")
-        delta_records = _parse_jsonl_records(
-            delta,
-            frozen.frozen_from,
-            installation,
-            frozen,
-            evidence_eligible=True,
-        )
-        if len(delta_records) > record_limit:
-            raise _transcript_error("oversized_session")
-        context_start, context = _bounded_reverse_context(
-            descriptor,
-            frozen.frozen_from,
-            byte_limit - len(delta),
-        )
-        context_records = _parse_jsonl_records(
-            context,
-            context_start,
-            installation,
-            frozen,
-            evidence_eligible=False,
-        )
-        remaining_records = record_limit - len(delta_records)
-        if len(context_records) > remaining_records:
-            context_records = context_records[-remaining_records:]
-            if not remaining_records:
-                context_records = []
+        data_error: Optional[TranscriptAdapterError] = None
+        delta = b""
+        context = b""
+        delta_records: list[TranscriptRecord] = []
+        context_records: list[TranscriptRecord] = []
+        try:
+            if delta_length > byte_limit:
+                raise _transcript_error("oversized_session")
+            delta = _read_exact_at(
+                descriptor, frozen.frozen_from, delta_length
+            )
+            if not delta.endswith(b"\n"):
+                raise _transcript_error("transcript_partial")
+            delta_records = _parse_jsonl_records(
+                delta,
+                frozen.frozen_from,
+                installation,
+                frozen,
+                evidence_eligible=True,
+            )
+            if len(delta_records) > record_limit:
+                raise _transcript_error("oversized_session")
+            context_start, context = _bounded_reverse_context(
+                descriptor,
+                frozen.frozen_from,
+                byte_limit - len(delta),
+            )
+            context_records = _parse_jsonl_records(
+                context,
+                context_start,
+                installation,
+                frozen,
+                evidence_eligible=False,
+            )
+            remaining_records = record_limit - len(delta_records)
+            if len(context_records) > remaining_records:
+                context_records = context_records[-remaining_records:]
+                if not remaining_records:
+                    context_records = []
+        except TranscriptAdapterError as error:
+            data_error = error
         after = _stable_frozen_descriptor_stat(descriptor, frozen)
         if after != before:
             raise _transcript_error("transcript_changed")
+        if data_error is not None:
+            raise data_error
     finally:
         _close_transcript_descriptor(descriptor)
     records = tuple([*context_records, *delta_records])

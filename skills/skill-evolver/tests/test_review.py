@@ -639,6 +639,517 @@ class FrozenTranscriptTestCase(unittest.TestCase):
         return connection, transcript, frozen
 
 
+class FrozenTranscriptFailureTests(FrozenTranscriptTestCase):
+    def assert_transcript_error(
+        self,
+        lines: list[bytes],
+        *,
+        reviewed_boundary: int,
+        session_id: str,
+        code: str,
+        retryable: bool,
+        config=None,
+    ) -> None:
+        connection, _, frozen = self.capture_and_claim(
+            lines,
+            reviewed_boundary=reviewed_boundary,
+            session_id=session_id,
+        )
+        try:
+            with self.assertRaises(
+                self.runtime.TranscriptAdapterError
+            ) as raised:
+                self.runtime.read_frozen_transcript(
+                    self.installation,
+                    frozen,
+                    config or self.config,
+                    self.review,
+                )
+            self.assertEqual(raised.exception.code, code)
+            self.assertEqual(raised.exception.retryable, retryable)
+        finally:
+            connection.close()
+
+    def assert_data_change_precedes_error(
+        self,
+        lines: list[bytes],
+        *,
+        reviewed_boundary: int,
+        session_id: str,
+        config=None,
+    ) -> None:
+        connection, transcript, frozen = self.capture_and_claim(
+            lines,
+            reviewed_boundary=reviewed_boundary,
+            session_id=session_id,
+        )
+        real_pread = os.pread
+        changed = False
+
+        def change_after_delta_read(
+            descriptor: int,
+            length: int,
+            offset: int,
+        ) -> bytes:
+            nonlocal changed
+            result = real_pread(descriptor, length, offset)
+            if not changed and offset == frozen.frozen_from:
+                changed = True
+                current = transcript.stat()
+                os.utime(
+                    transcript,
+                    ns=(
+                        current.st_atime_ns,
+                        frozen.locator.mtime_ns + 1_000_000,
+                    ),
+                )
+            return result
+
+        try:
+            with mock.patch.object(
+                self.runtime.os,
+                "pread",
+                side_effect=change_after_delta_read,
+            ):
+                with self.assertRaises(
+                    self.runtime.TranscriptAdapterError
+                ) as raised:
+                    self.runtime.read_frozen_transcript(
+                        self.installation,
+                        frozen,
+                        config or self.config,
+                        self.review,
+                    )
+            current = transcript.stat()
+            self.assertTrue(changed)
+            self.assertEqual(
+                (current.st_dev, current.st_ino, current.st_size),
+                (
+                    frozen.locator.device,
+                    frozen.locator.inode,
+                    frozen.locator.size,
+                ),
+            )
+            self.assertNotEqual(
+                current.st_mtime_ns, frozen.locator.mtime_ns
+            )
+            self.assertEqual(raised.exception.code, "transcript_changed")
+            self.assertTrue(raised.exception.retryable)
+        finally:
+            connection.close()
+
+    def header(self, session_id: str) -> bytes:
+        return (
+            b'{"type":"session_meta","payload":{"session_id":"'
+            + session_id.encode("utf-8")
+            + b'"}}\n'
+        )
+
+    def message(self, text: bytes) -> bytes:
+        return (
+            b'{"type":"response_item","payload":{"type":"message",'
+            b'"role":"user","content":[{"type":"input_text","text":"'
+            + text
+            + b'"}]}}\n'
+        )
+
+    def test_partial_is_retryable_but_complete_malformed_is_terminal(
+        self,
+    ) -> None:
+        session_id = "partial-session"
+        header = self.header(session_id)
+        partial = self.message(b"incomplete").removesuffix(b"\n")
+        self.assert_transcript_error(
+            [header, partial],
+            reviewed_boundary=len(header),
+            session_id=session_id,
+            code="transcript_partial",
+            retryable=True,
+        )
+
+        session_id = "malformed-session"
+        header = self.header(session_id)
+        malformed = b'{"type":"response_item",bad}\n'
+        self.assert_transcript_error(
+            [header, malformed],
+            reviewed_boundary=len(header),
+            session_id=session_id,
+            code="unsupported_transcript",
+            retryable=False,
+        )
+
+        for label, data in (
+            ("partial", partial),
+            ("malformed", malformed),
+        ):
+            race_session = f"{label}-change-priority"
+            race_header = self.header(race_session)
+            with self.subTest(race=label):
+                self.assert_data_change_precedes_error(
+                    [race_header, data],
+                    reviewed_boundary=len(race_header),
+                    session_id=race_session,
+                )
+
+    def test_unknown_response_item_is_terminal(self) -> None:
+        session_id = "unknown-response-item"
+        header = self.header(session_id)
+        unknown = (
+            b'{"type":"response_item","payload":{"type":"future_message",'
+            b'"content":"unsupported"}}\n'
+        )
+        self.assert_transcript_error(
+            [header, unknown],
+            reviewed_boundary=len(header),
+            session_id=session_id,
+            code="unsupported_transcript",
+            retryable=False,
+        )
+
+    def test_compiled_byte_limit_overrides_hostile_config(self) -> None:
+        def exact_message(total: int) -> bytes:
+            prefix = (
+                b'{"type":"response_item","payload":{"type":"message",'
+                b'"role":"user","content":[{"type":"input_text","text":"'
+            )
+            suffix = b'"}]}}\n'
+            return (
+                prefix
+                + b"x" * (total - len(prefix) - len(suffix))
+                + suffix
+            )
+
+        exact_session = "exact-byte-session"
+        exact_header = self.header(exact_session)
+        exact_delta = exact_message(2_097_152)
+        connection, _, frozen = self.capture_and_claim(
+            [exact_header, exact_delta],
+            reviewed_boundary=len(exact_header),
+            session_id=exact_session,
+        )
+        hostile = replace(
+            self.config, max_transcript_bytes=20_000_000
+        )
+        try:
+            exported = self.runtime.read_frozen_transcript(
+                self.installation,
+                frozen,
+                hostile,
+                self.review,
+            )
+            self.assertEqual(exported.delta_source_bytes, 2_097_152)
+            self.assertEqual(len(exported.records), 1)
+        finally:
+            connection.close()
+
+        over_session = "over-byte-session"
+        over_header = self.header(over_session)
+        over_delta = exact_message(2_097_153)
+        self.assert_transcript_error(
+            [over_header, over_delta],
+            reviewed_boundary=len(over_header),
+            session_id=over_session,
+            code="oversized_session",
+            retryable=False,
+            config=hostile,
+        )
+
+    def test_compiled_record_limit_accepts_100_and_rejects_101(self) -> None:
+        hostile = replace(self.config, max_transcript_records=10_000)
+        exact_session = "exact-record-session"
+        exact_header = self.header(exact_session)
+        exact_records = [
+            self.message(f"record-{index:03d}".encode())
+            for index in range(100)
+        ]
+        connection, _, frozen = self.capture_and_claim(
+            [exact_header, *exact_records],
+            reviewed_boundary=len(exact_header),
+            session_id=exact_session,
+        )
+        try:
+            exported = self.runtime.read_frozen_transcript(
+                self.installation,
+                frozen,
+                hostile,
+                self.review,
+            )
+            self.assertEqual(len(exported.records), 100)
+        finally:
+            connection.close()
+
+        over_session = "over-record-session"
+        over_header = self.header(over_session)
+        over_records = [
+            self.message(f"record-{index:03d}".encode())
+            for index in range(101)
+        ]
+        self.assert_transcript_error(
+            [over_header, *over_records],
+            reviewed_boundary=len(over_header),
+            session_id=over_session,
+            code="oversized_session",
+            retryable=False,
+            config=hostile,
+        )
+
+        race_session = "over-record-change-priority"
+        race_header = self.header(race_session)
+        with self.subTest(race="record-limit"):
+            self.assert_data_change_precedes_error(
+                [race_header, *over_records],
+                reviewed_boundary=len(race_header),
+                session_id=race_session,
+                config=hostile,
+            )
+
+    def test_error_sets_match_every_public_classification(self) -> None:
+        self.assertEqual(
+            self.runtime.TRANSCRIPT_RETRYABLE_CODES,
+            frozenset(
+                {
+                    "transcript_missing",
+                    "transcript_changed",
+                    "transcript_partial",
+                }
+            ),
+        )
+        self.assertEqual(
+            self.runtime.TRANSCRIPT_TERMINAL_CODES,
+            frozenset(
+                {"oversized_session", "unsupported_transcript"}
+            ),
+        )
+        for code in self.runtime.TRANSCRIPT_RETRYABLE_CODES:
+            error = self.runtime._transcript_error(code)
+            self.assertEqual(error.code, code)
+            self.assertTrue(error.retryable)
+        for code in self.runtime.TRANSCRIPT_TERMINAL_CODES:
+            error = self.runtime._transcript_error(code)
+            self.assertEqual(error.code, code)
+            self.assertFalse(error.retryable)
+
+
+class FrozenTranscriptBoundedReadTests(FrozenTranscriptTestCase):
+    def test_reverse_context_never_scans_the_historical_prefix(self) -> None:
+        session_id = "bounded-pread-session"
+        header = (
+            b'{"type":"session_meta","payload":{"session_id":"'
+            + session_id.encode()
+            + b'"}}\n'
+        )
+        old = [
+            (
+                b'{"type":"event_msg","payload":{"type":"telemetry",'
+                + f'"index":{index}'.encode()
+                + b"}}\n"
+            )
+            for index in range(20_000)
+        ]
+        context = (
+            b'{"type":"response_item","payload":{"type":"message",'
+            b'"role":"assistant","content":[{"type":"output_text",'
+            b'"text":"newest context"}]}}\n'
+        )
+        delta = (
+            b'{"type":"response_item","payload":{"type":"message",'
+            b'"role":"user","content":[{"type":"input_text",'
+            b'"text":"exact delta"}]}}\n'
+        )
+        reviewed = len(header) + sum(len(line) for line in old) + len(context)
+        connection, _, frozen = self.capture_and_claim(
+            [header, *old, context, delta],
+            reviewed_boundary=reviewed,
+            session_id=session_id,
+        )
+        limited = replace(
+            self.config,
+            max_transcript_bytes=len(delta) + len(context),
+        )
+        calls: list[tuple[int, int]] = []
+        real_pread = os.pread
+
+        def tracked_pread(
+            descriptor: int, length: int, offset: int
+        ) -> bytes:
+            calls.append((offset, length))
+            return real_pread(descriptor, length, offset)
+
+        try:
+            with mock.patch.object(
+                self.runtime.os, "pread", side_effect=tracked_pread
+            ):
+                exported = self.runtime.read_frozen_transcript(
+                    self.installation,
+                    frozen,
+                    limited,
+                    self.review,
+                )
+        finally:
+            connection.close()
+        self.assertEqual(
+            [record.text for record in exported.records],
+            ["newest context", "exact delta"],
+        )
+        self.assertTrue(
+            all(length <= 65_537 for _, length in calls)
+        )
+
+        def sized_header(header_session: str, total: int) -> bytes:
+            prefix = (
+                b'{"type":"session_meta","payload":{"session_id":"'
+                + header_session.encode()
+                + b'","padding":"'
+            )
+            suffix = b'"}}\n'
+            return (
+                prefix
+                + b"x" * (total - len(prefix) - len(suffix))
+                + suffix
+            )
+
+        exact_session = "exact-header"
+        exact_header = sized_header(exact_session, 65_536)
+        connection, _, exact_frozen = self.capture_and_claim(
+            [exact_header, delta],
+            reviewed_boundary=len(exact_header),
+            session_id=exact_session,
+        )
+        try:
+            exact_export = self.runtime.read_frozen_transcript(
+                self.installation,
+                exact_frozen,
+                self.config,
+                self.review,
+            )
+            self.assertEqual(
+                [record.text for record in exact_export.records],
+                ["exact delta"],
+            )
+        finally:
+            connection.close()
+
+        over_session = "over-header"
+        over_header = sized_header(over_session, 65_537)
+        connection, _, over_frozen = self.capture_and_claim(
+            [over_header, delta],
+            reviewed_boundary=len(over_header),
+            session_id=over_session,
+        )
+        try:
+            with self.assertRaises(
+                self.runtime.TranscriptAdapterError
+            ) as over:
+                self.runtime.read_frozen_transcript(
+                    self.installation,
+                    over_frozen,
+                    self.config,
+                    self.review,
+                )
+            self.assertEqual(over.exception.code, "unsupported_transcript")
+            self.assertFalse(over.exception.retryable)
+        finally:
+            connection.close()
+
+        partial_session = "partial-header"
+        no_newline = b"x" * 65_536
+        connection, _, partial_frozen = self.capture_and_claim(
+            [no_newline],
+            reviewed_boundary=0,
+            session_id=partial_session,
+        )
+        try:
+            with self.assertRaises(
+                self.runtime.TranscriptAdapterError
+            ) as partial:
+                self.runtime.read_frozen_transcript(
+                    self.installation,
+                    partial_frozen,
+                    self.config,
+                    self.review,
+                )
+            self.assertEqual(partial.exception.code, "transcript_partial")
+            self.assertTrue(partial.exception.retryable)
+        finally:
+            connection.close()
+
+        initial_calls = [
+            (offset, length)
+            for offset, length in calls
+            if offset == 0
+        ]
+        self.assertEqual(initial_calls, [(0, 4_096)])
+        reverse_calls = [
+            (offset, length)
+            for offset, length in calls
+            if (
+                offset
+                == frozen.frozen_from - len(context)
+                and length == len(context)
+            )
+        ]
+        self.assertEqual(
+            reverse_calls,
+            [(frozen.frozen_from - len(context), len(context))],
+        )
+
+    def test_transcript_adapter_digest_is_static(self) -> None:
+        contract = self.runtime.transcript_adapter_contract(self.review)
+        self.assertEqual(contract["text_encoding"], "strict-utf-8")
+        self.assertEqual(
+            contract["relocation"],
+            {
+                "roots": "installation-transcript-roots",
+                "descriptor_relative": True,
+                "current_owner_only": True,
+                "same_device_inode_only": True,
+                "scan_max_entries": 4_096,
+                "scan_max_depth": 8,
+            },
+        )
+        self.assertEqual(
+            (
+                contract["limits"]["evidence_shape_nodes"],
+                contract["limits"]["evidence_shape_depth"],
+            ),
+            (4_096, 64),
+        )
+        before = self.runtime.transcript_adapter_digest(self.review)
+        session_id = "digest-session"
+        header = (
+            b'{"type":"session_meta","payload":{"session_id":"'
+            + session_id.encode()
+            + b'"}}\n'
+        )
+        first = (
+            b'{"type":"response_item","payload":{"type":"message",'
+            b'"role":"user","content":[{"type":"input_text",'
+            b'"text":"first content"}]}}\n'
+        )
+        connection, transcript, frozen = self.capture_and_claim(
+            [header, first],
+            reviewed_boundary=len(header),
+            session_id=session_id,
+        )
+        try:
+            self.runtime.read_frozen_transcript(
+                self.installation,
+                frozen,
+                self.config,
+                self.review,
+            )
+            transcript.write_bytes(
+                header
+                + first.replace(b"first content", b"other content")
+            )
+            self.assertEqual(
+                self.runtime.transcript_adapter_digest(self.review),
+                before,
+            )
+        finally:
+            connection.close()
+
+
 class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
     def test_half_open_delta_reverse_context_and_provenance(self) -> None:
         context_end = sum(len(line) for line in self.fixture_lines[:4])
@@ -1445,6 +1956,88 @@ class FrozenTranscriptIdentityTests(FrozenTranscriptTestCase):
         finally:
             connection.close()
 
+        exact_root = self.base / "exact-scan-root"
+        exact_root.mkdir(mode=0o700)
+        exact_installation = replace(
+            self.installation,
+            transcript_roots=(exact_root,),
+        )
+        for index in range(4_096):
+            (exact_root / f"entry-{index:04d}").write_bytes(b"x")
+        with self.subTest(relocation_entries=4_096):
+            with self.assertRaises(
+                self.runtime.TranscriptAdapterError
+            ) as exact_scan:
+                self.runtime.read_frozen_transcript(
+                    exact_installation,
+                    frozen,
+                    self.config,
+                    self.review,
+                )
+            self.assertEqual(
+                exact_scan.exception.code, "transcript_missing"
+            )
+            self.assertTrue(exact_scan.exception.retryable)
+        (exact_root / "entry-4096").write_bytes(b"x")
+        with self.subTest(relocation_entries=4_097):
+            with self.assertRaises(
+                self.runtime.TranscriptAdapterError
+            ) as saturated_scan:
+                self.runtime.read_frozen_transcript(
+                    exact_installation,
+                    frozen,
+                    self.config,
+                    self.review,
+                )
+            self.assertEqual(
+                saturated_scan.exception.code, "transcript_changed"
+            )
+            self.assertTrue(saturated_scan.exception.retryable)
+
+        depth_session = "relocation-depth-boundary"
+        depth_header = lines[0].replace(
+            b"fixture-session", depth_session.encode()
+        )
+        connection, transcript, depth_frozen = self.capture_and_claim(
+            [depth_header, lines[1]],
+            reviewed_boundary=len(depth_header),
+            session_id=depth_session,
+        )
+        depth_parent = self.sessions
+        for depth in range(1, 9):
+            depth_parent /= f"depth-{depth}"
+            depth_parent.mkdir(mode=0o700)
+        depth_eight = depth_parent / "moved.jsonl"
+        transcript.rename(depth_eight)
+        try:
+            with self.subTest(relocation_depth=8):
+                exported = self.runtime.read_frozen_transcript(
+                    self.installation,
+                    depth_frozen,
+                    self.config,
+                    self.review,
+                )
+                self.assertTrue(exported.read_path_changed)
+            depth_nine = depth_parent / "depth-9"
+            depth_nine.mkdir(mode=0o700)
+            depth_eight.rename(depth_nine / "moved.jsonl")
+            with self.subTest(relocation_depth=9):
+                with self.assertRaises(
+                    self.runtime.TranscriptAdapterError
+                ) as too_deep:
+                    self.runtime.read_frozen_transcript(
+                        self.installation,
+                        depth_frozen,
+                        self.config,
+                        self.review,
+                    )
+                self.assertEqual(
+                    too_deep.exception.code, "transcript_missing"
+                )
+                self.assertTrue(too_deep.exception.retryable)
+        finally:
+            connection.close()
+
         connection, transcript, frozen = self.capture_and_claim(
             [
                 lines[0].replace(
@@ -1495,46 +2088,163 @@ class FrozenTranscriptIdentityTests(FrozenTranscriptTestCase):
         finally:
             connection.close()
 
-        connection, _, frozen = self.capture_and_claim(
-            [
-                lines[0].replace(
-                    b"fixture-session", b"read-io-error"
-                ),
-                lines[1],
-            ],
-            reviewed_boundary=len(
-                lines[0].replace(
-                    b"fixture-session", b"read-io-error"
-                )
-            ),
-            session_id="read-io-error",
+        io_session = "read-io-error"
+        io_header = lines[0].replace(
+            b"fixture-session", io_session.encode()
         )
-        real_close = os.close
+        io_context = self.fixture_lines[6]
+        io_delta = lines[1]
+        connection, _, frozen = self.capture_and_claim(
+            [io_header, io_context, io_delta],
+            reviewed_boundary=len(io_header) + len(io_context),
+            session_id=io_session,
+        )
+        limited = replace(
+            self.config,
+            max_transcript_bytes=len(io_context) + len(io_delta),
+        )
+        real_pread = os.pread
+        stable_stat = self.runtime._stable_frozen_descriptor_stat
+        close_descriptor = self.runtime._close_transcript_descriptor
         try:
-            for operation in ("pread", "fstat"):
-                with self.subTest(operation=operation):
-                    with mock.patch.object(
-                        self.runtime.os,
-                        operation,
-                        side_effect=OSError("synthetic read failure"),
-                    ), mock.patch.object(
-                        self.runtime.os,
-                        "close",
-                        wraps=real_close,
-                    ) as close:
-                        with self.assertRaises(
-                            self.runtime.TranscriptAdapterError
-                        ) as raised:
-                            self.runtime.read_frozen_transcript(
-                                self.installation,
-                                frozen,
-                                self.config,
-                                self.review,
+            offsets = {
+                "header": 0,
+                "delta": frozen.frozen_from,
+                "context": len(io_header),
+            }
+            for error_type in (OSError, InterruptedError):
+                for phase, target_offset in offsets.items():
+                    def fail_selected_pread(
+                        descriptor: int,
+                        length: int,
+                        offset: int,
+                        *,
+                        target: int = target_offset,
+                        exception_type=error_type,
+                    ) -> bytes:
+                        if offset == target:
+                            raise exception_type(
+                                "synthetic pread failure"
                             )
-                    self.assertEqual(
-                        raised.exception.code, "transcript_changed"
-                    )
-                    self.assertTrue(raised.exception.retryable)
-                    close.assert_called_once()
+                        return real_pread(descriptor, length, offset)
+
+                    with self.subTest(
+                        operation="pread",
+                        phase=phase,
+                        error=error_type.__name__,
+                    ):
+                        with mock.patch.object(
+                            self.runtime.os,
+                            "pread",
+                            side_effect=fail_selected_pread,
+                        ), mock.patch.object(
+                            self.runtime,
+                            "_stable_frozen_descriptor_stat",
+                            wraps=stable_stat,
+                        ) as checked_stat, mock.patch.object(
+                            self.runtime,
+                            "_close_transcript_descriptor",
+                            wraps=close_descriptor,
+                        ) as close:
+                            with self.assertRaises(
+                                self.runtime.TranscriptAdapterError
+                            ) as raised:
+                                self.runtime.read_frozen_transcript(
+                                    self.installation,
+                                    frozen,
+                                    limited,
+                                    self.review,
+                                )
+                        self.assertEqual(
+                            raised.exception.code,
+                            "transcript_changed",
+                        )
+                        self.assertTrue(raised.exception.retryable)
+                        self.assertEqual(
+                            checked_stat.call_count,
+                            2 if phase == "header" else 3,
+                        )
+                        close.assert_called_once()
+
+            real_fstat = os.fstat
+            for error_type in (OSError, InterruptedError):
+                for phase, failure_call in (
+                    ("initial", 2),
+                    ("final", 4),
+                ):
+                    calls = 0
+
+                    def fail_selected_fstat(
+                        descriptor: int,
+                        *,
+                        target: int = failure_call,
+                        exception_type=error_type,
+                    ):
+                        nonlocal calls
+                        calls += 1
+                        if calls == target:
+                            raise exception_type(
+                                "synthetic fstat failure"
+                            )
+                        return real_fstat(descriptor)
+
+                    with self.subTest(
+                        operation="fstat",
+                        phase=phase,
+                        error=error_type.__name__,
+                    ):
+                        with mock.patch.object(
+                            self.runtime.os,
+                            "fstat",
+                            side_effect=fail_selected_fstat,
+                        ), mock.patch.object(
+                            self.runtime,
+                            "_close_transcript_descriptor",
+                            wraps=close_descriptor,
+                        ) as close:
+                            with self.assertRaises(
+                                self.runtime.TranscriptAdapterError
+                            ) as raised:
+                                self.runtime.read_frozen_transcript(
+                                    self.installation,
+                                    frozen,
+                                    limited,
+                                    self.review,
+                                )
+                        self.assertEqual(
+                            raised.exception.code,
+                            "transcript_changed",
+                        )
+                        self.assertTrue(raised.exception.retryable)
+                        self.assertEqual(calls, failure_call)
+                        close.assert_called_once()
+
+            with self.subTest(operation="direct-open-runtime-error"):
+                with mock.patch.object(
+                    self.runtime.os,
+                    "open",
+                    side_effect=RuntimeError("synthetic open failure"),
+                ):
+                    with self.assertRaises(
+                        self.runtime.TranscriptAdapterError
+                    ) as raised:
+                        self.runtime.read_frozen_transcript(
+                            self.installation,
+                            frozen,
+                            limited,
+                            self.review,
+                        )
+                self.assertEqual(
+                    raised.exception.code, "transcript_changed"
+                )
+                self.assertTrue(raised.exception.retryable)
+
+            with self.subTest(operation="best-effort-close-runtime-error"):
+                with mock.patch.object(
+                    self.runtime.os,
+                    "close",
+                    side_effect=RuntimeError("synthetic close failure"),
+                ):
+                    self.runtime._close_transcript_descriptor(-1)
         finally:
             connection.close()
