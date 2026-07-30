@@ -2112,7 +2112,11 @@ class FrozenTranscriptIdentityTests(FrozenTranscriptTestCase):
                 "delta": frozen.frozen_from,
                 "context": len(io_header),
             }
-            for error_type in (OSError, InterruptedError):
+            for error_type in (
+                OSError,
+                InterruptedError,
+                RuntimeError,
+            ):
                 for phase, target_offset in offsets.items():
                     def fail_selected_pread(
                         descriptor: int,
@@ -2167,7 +2171,11 @@ class FrozenTranscriptIdentityTests(FrozenTranscriptTestCase):
                         close.assert_called_once()
 
             real_fstat = os.fstat
-            for error_type in (OSError, InterruptedError):
+            for error_type in (
+                OSError,
+                InterruptedError,
+                RuntimeError,
+            ):
                 for phase, failure_call in (
                     ("initial", 2),
                     ("final", 4),

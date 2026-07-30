@@ -754,7 +754,7 @@ def _read_exact_at(
     while remaining:
         try:
             chunk = os.pread(descriptor, remaining, offset)
-        except OSError:
+        except (OSError, RuntimeError):
             raise _transcript_error("transcript_changed") from None
         if not chunk:
             raise _transcript_error("transcript_changed")
