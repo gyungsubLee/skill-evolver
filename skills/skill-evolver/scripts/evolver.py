@@ -2537,7 +2537,8 @@ def _recover_expired_review_leases(
             frozen_epoch=NULL,frozen_from=NULL,frozen_to=NULL,
             frozen_locator_json=NULL,lease_owner=NULL,lease_expires_at=NULL,
             pending_since=COALESCE(pending_since,?)
-        WHERE status='reviewing' AND lease_expires_at < ?
+        WHERE status='reviewing' AND batch_id IS NULL
+          AND lease_expires_at < ?
         """,
         (iso_utc(now), iso_utc(now)),
     ).rowcount
@@ -2557,6 +2558,91 @@ def recover_expired_review_leases(
         raise
 
 
+def _claim_review_generation(
+    connection: sqlite3.Connection,
+    session_key_value: str,
+    owner: str,
+    now: float,
+    config: Config,
+    *,
+    batch_id: Optional[int],
+) -> dict[str, object]:
+    if not connection.in_transaction:
+        raise ValueError("active_review_transaction_required")
+    if not isinstance(owner, str) or not owner:
+        raise ValueError("invalid_lease_owner")
+    if batch_id is None:
+        if len(owner.encode("utf-8")) > 128:
+            raise ValueError("invalid_lease_owner")
+    elif (
+        type(batch_id) is not int
+        or batch_id < 1
+        or len(owner) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in owner
+        )
+    ):
+        raise ValueError("invalid_lease_owner")
+    row = connection.execute(
+        "SELECT * FROM review_items WHERE session_key=?",
+        (session_key_value,),
+    ).fetchone()
+    if row is None or row["status"] != "pending":
+        raise ValueError("session_not_pending")
+    if row["binding_status"] != "accepted":
+        raise ValueError("transcript_binding_required")
+    review_from = int(row["reviewed_boundary"])
+    review_to = int(row["observed_boundary"])
+    if review_to <= review_from:
+        raise ValueError("empty_generation")
+    locator = {
+        "path": str(row["transcript_path"]),
+        "size": int(row["transcript_size"]),
+        "mtime_ns": int(row["transcript_mtime_ns"]),
+        "device": int(row["transcript_device"]),
+        "inode": int(row["transcript_inode"]),
+    }
+    locator_json = canonical_json_bytes(locator).decode("utf-8")
+    changed = connection.execute(
+        """
+        UPDATE review_items
+        SET status='reviewing',batch_id=COALESCE(?,batch_id),
+            review_started_at=?,frozen_epoch=?,
+            frozen_from=?,frozen_to=?,frozen_locator_json=?,
+            lease_owner=?,lease_expires_at=?
+        WHERE session_key=? AND status='pending'
+        """,
+        (
+            batch_id,
+            iso_utc(now),
+            int(row["transcript_epoch"]),
+            review_from,
+            review_to,
+            locator_json,
+            owner,
+            iso_utc(now + config.lease_seconds),
+            session_key_value,
+        ),
+    ).rowcount
+    if changed != 1:
+        raise sqlite3.IntegrityError("review_claim_race")
+    return {
+        "review_item_id": int(row["id"]),
+        "session_key": session_key_value,
+        "generation": int(row["generation"]),
+        "transcript_epoch": int(row["transcript_epoch"]),
+        "review_from": review_from,
+        "review_to": review_to,
+        "locator": locator,
+        "locator_digest": hashlib.sha256(
+            locator_json.encode("utf-8")
+        ).hexdigest(),
+        "lease_owner": owner,
+        "lease_expires_at": iso_utc(now + config.lease_seconds),
+    }
+
+
 def claim_review_generation(
     connection: sqlite3.Connection,
     session_key_value: str,
@@ -2569,56 +2655,27 @@ def claim_review_generation(
     connection.execute("BEGIN IMMEDIATE")
     try:
         _recover_expired_review_leases(connection, now)
-        row = connection.execute(
-            "SELECT * FROM review_items WHERE session_key=?",
-            (session_key_value,),
-        ).fetchone()
-        if row is None or row["status"] != "pending":
-            raise ValueError("session_not_pending")
-        if row["binding_status"] != "accepted":
-            raise ValueError("transcript_binding_required")
-        review_from = int(row["reviewed_boundary"])
-        review_to = int(row["observed_boundary"])
-        if review_to <= review_from:
-            raise ValueError("empty_generation")
-        locator = {
-            "path": str(row["transcript_path"]),
-            "size": int(row["transcript_size"]),
-            "mtime_ns": int(row["transcript_mtime_ns"]),
-            "device": int(row["transcript_device"]),
-            "inode": int(row["transcript_inode"]),
-        }
-        changed = connection.execute(
-            """
-            UPDATE review_items
-            SET status='reviewing',review_started_at=?,frozen_epoch=?,
-                frozen_from=?,frozen_to=?,frozen_locator_json=?,
-                lease_owner=?,lease_expires_at=?
-            WHERE session_key=? AND status='pending'
-            """,
-            (
-                iso_utc(now),
-                int(row["transcript_epoch"]),
-                review_from,
-                review_to,
-                canonical_json_bytes(locator).decode("utf-8"),
-                owner,
-                iso_utc(now + config.lease_seconds),
-                session_key_value,
-            ),
-        ).rowcount
-        if changed != 1:
-            raise sqlite3.IntegrityError("review_claim_race")
+        claim = _claim_review_generation(
+            connection,
+            session_key_value,
+            owner,
+            now,
+            config,
+            batch_id=None,
+        )
         connection.commit()
         return {
-            "session_key": session_key_value,
-            "generation": int(row["generation"]),
-            "transcript_epoch": int(row["transcript_epoch"]),
-            "review_from": review_from,
-            "review_to": review_to,
-            "locator": locator,
-            "lease_owner": owner,
-            "lease_expires_at": iso_utc(now + config.lease_seconds),
+            name: claim[name]
+            for name in (
+                "session_key",
+                "generation",
+                "transcript_epoch",
+                "review_from",
+                "review_to",
+                "locator",
+                "lease_owner",
+                "lease_expires_at",
+            )
         }
     except BaseException:
         connection.rollback()
@@ -2636,8 +2693,8 @@ def heartbeat_review_generation(
         """
         UPDATE review_items
         SET lease_expires_at=MAX(lease_expires_at,?)
-        WHERE session_key=? AND status='reviewing' AND lease_owner=?
-          AND lease_expires_at>=?
+        WHERE session_key=? AND status='reviewing' AND batch_id IS NULL
+          AND lease_owner=? AND lease_expires_at>=?
         """,
         (
             iso_utc(now + config.lease_seconds),
@@ -2647,6 +2704,217 @@ def heartbeat_review_generation(
         ),
     ).rowcount
     return changed == 1
+
+
+RETRYABLE_TRANSCRIPT_ERRORS = frozenset(
+    {"transcript_missing", "transcript_changed", "transcript_partial"}
+)
+
+
+def _load_batch_review_generation(
+    connection: sqlite3.Connection,
+    review_item_id: int,
+    batch_id: int,
+    owner_digest: str,
+    expected_generation: int,
+    expected_epoch: int,
+    expected_from: int,
+    expected_to: int,
+    expected_locator_digest: str,
+    now: float,
+) -> sqlite3.Row:
+    if not connection.in_transaction:
+        raise ValueError("active_review_transaction_required")
+    if (
+        any(
+            type(value) is not int or value < 0
+            for value in (
+                review_item_id,
+                batch_id,
+                expected_generation,
+                expected_epoch,
+                expected_from,
+                expected_to,
+            )
+        )
+        or review_item_id < 1
+        or batch_id < 1
+        or expected_generation < 1
+        or expected_to <= expected_from
+        or not isinstance(owner_digest, str)
+        or len(owner_digest) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in owner_digest
+        )
+        or not isinstance(expected_locator_digest, str)
+        or len(expected_locator_digest) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in expected_locator_digest
+        )
+    ):
+        raise ValueError("review_generation_contract_mismatch")
+    row = connection.execute(
+        """
+        SELECT * FROM review_items
+        WHERE id=? AND batch_id=? AND status='reviewing'
+          AND lease_owner=? AND lease_expires_at>=?
+          AND generation=? AND frozen_epoch=? AND frozen_from=? AND frozen_to=?
+        """,
+        (
+            review_item_id,
+            batch_id,
+            owner_digest,
+            iso_utc(now),
+            expected_generation,
+            expected_epoch,
+            expected_from,
+            expected_to,
+        ),
+    ).fetchone()
+    if (
+        row is None
+        or row["frozen_locator_json"] is None
+        or not hmac.compare_digest(
+            hashlib.sha256(
+                str(row["frozen_locator_json"]).encode("utf-8")
+            ).hexdigest(),
+            expected_locator_digest,
+        )
+    ):
+        raise ValueError("review_generation_contract_mismatch")
+    return row
+
+
+def fail_review_generation(
+    connection: sqlite3.Connection,
+    review_item_id: int,
+    batch_id: int,
+    owner_digest: str,
+    expected_generation: int,
+    expected_epoch: int,
+    expected_from: int,
+    expected_to: int,
+    expected_locator_digest: str,
+    error_code: str,
+    now: float,
+) -> dict[str, object]:
+    if (
+        not isinstance(error_code, str)
+        or error_code not in RETRYABLE_TRANSCRIPT_ERRORS
+    ):
+        raise ValueError("invalid_retryable_review_error")
+    row = _load_batch_review_generation(
+        connection,
+        review_item_id,
+        batch_id,
+        owner_digest,
+        expected_generation,
+        expected_epoch,
+        expected_from,
+        expected_to,
+        expected_locator_digest,
+        now,
+    )
+    connection.execute(
+        """
+        UPDATE review_items
+        SET status='pending',batch_id=NULL,review_started_at=NULL,
+            frozen_epoch=NULL,frozen_from=NULL,frozen_to=NULL,
+            frozen_locator_json=NULL,lease_owner=NULL,lease_expires_at=NULL,
+            pending_since=COALESCE(pending_since,?),error_code=?
+        WHERE id=?
+        """,
+        (iso_utc(now), error_code, review_item_id),
+    )
+    return {
+        "review_item_id": review_item_id,
+        "status": "pending",
+        "generation": int(row["generation"]),
+        "reviewed_boundary": int(row["reviewed_boundary"]),
+        "error_code": error_code,
+    }
+
+
+def complete_batch_review_generation(
+    connection: sqlite3.Connection,
+    review_item_id: int,
+    batch_id: int,
+    owner_digest: str,
+    expected_generation: int,
+    expected_epoch: int,
+    expected_from: int,
+    expected_to: int,
+    expected_locator_digest: str,
+    outcome: str,
+    reason: Optional[str],
+    now: float,
+) -> dict[str, object]:
+    if not isinstance(outcome, str) or outcome not in {
+        "reviewed",
+        "excluded",
+    }:
+        raise ValueError("invalid_review_outcome")
+    if outcome == "excluded" and (
+        not isinstance(reason, str) or not reason
+    ):
+        raise ValueError("missing_exclusion_reason")
+    row = _load_batch_review_generation(
+        connection,
+        review_item_id,
+        batch_id,
+        owner_digest,
+        expected_generation,
+        expected_epoch,
+        expected_from,
+        expected_to,
+        expected_locator_digest,
+        now,
+    )
+    current_locator_json = canonical_json_bytes(
+        {
+            "path": str(row["transcript_path"]),
+            "size": int(row["transcript_size"]),
+            "mtime_ns": int(row["transcript_mtime_ns"]),
+            "device": int(row["transcript_device"]),
+            "inode": int(row["transcript_inode"]),
+        }
+    ).decode("utf-8")
+    new_work = (
+        row["binding_status"] != "accepted"
+        or int(row["transcript_epoch"]) != expected_epoch
+        or int(row["observed_boundary"]) > expected_to
+        or str(row["frozen_locator_json"]) != current_locator_json
+    )
+    status = "pending" if new_work else outcome
+    generation = int(row["generation"]) + int(new_work)
+    connection.execute(
+        """
+        UPDATE review_items
+        SET status=?,generation=?,reviewed_boundary=?,reviewed_at=?,
+            pending_since=?,excluded_reason=?,batch_id=NULL,
+            review_started_at=NULL,frozen_epoch=NULL,frozen_from=NULL,
+            frozen_to=NULL,frozen_locator_json=NULL,lease_owner=NULL,
+            lease_expires_at=NULL,error_code=NULL
+        WHERE id=?
+        """,
+        (
+            status,
+            generation,
+            expected_to,
+            iso_utc(now),
+            iso_utc(now) if new_work else None,
+            reason if outcome == "excluded" and not new_work else None,
+            review_item_id,
+        ),
+    )
+    return {
+        "review_item_id": review_item_id,
+        "status": status,
+        "generation": generation,
+        "reviewed_boundary": expected_to,
+    }
 
 
 def complete_review_generation(
@@ -2666,8 +2934,8 @@ def complete_review_generation(
     row = connection.execute(
         """
         SELECT * FROM review_items
-        WHERE session_key=? AND status='reviewing' AND lease_owner=?
-          AND lease_expires_at>=?
+        WHERE session_key=? AND status='reviewing' AND batch_id IS NULL
+          AND lease_owner=? AND lease_expires_at>=?
         """,
         (session_key_value, owner, iso_utc(now)),
     ).fetchone()
