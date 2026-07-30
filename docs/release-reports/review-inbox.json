@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "decision": "PASS",
+  "implementation_commit": "5fadf3a193c3445a6f14eb8eb654b5da8f561f5d",
+  "upstream": {
+    "path": "skill-evolver/docs/release-reports/runtime-queue.json",
+    "sha256": "c551176e5925a4c18ed54875ca28dcd089c0de2b38a873819fe219a8dcf29674",
+    "decision": "PASS"
+  },
+  "digests": {
+    "improvement_policy_sha256": "2a90a7c6d9fa39f31d41d2efe9de47bbb5a3de832caac3863fe10310c18ee362",
+    "transcript_adapter_sha256": "75eb1edf40bc6f1d5848d74e0d1de413505e53eae84ae82830452969006bd1b6",
+    "catalog_adapter_sha256": "f10f93c08906253ad75ee47b7512808290aab45b1d6d54c5df051c50ba20314d"
+  },
+  "production_sha256": {
+    "skill-evolver/README.md": "607f1c78cffb3b6e2db95763a14006861e9e7d244248b73c95ebfec8790d281d",
+    "skill-evolver/skills/skill-evolver/SKILL.md": "2aee032378df60db33af6804920c92c4ff3e426754811da734455df1903e6733",
+    "skill-evolver/skills/skill-evolver/references/runtime.json": "2e91e603b066ffff4e2805df20f3d8d4e03bbdd0d78bbe205d4e31b31833393d",
+    "skill-evolver/skills/skill-evolver/references/improvement-policy.md": "2a90a7c6d9fa39f31d41d2efe9de47bbb5a3de832caac3863fe10310c18ee362",
+    "skill-evolver/skills/skill-evolver/scripts/evolver.py": "2bc8187a081ecaa4efa9ae09a6a9f0b49cb22e7176acc5f308903a6e79a1c82a",
+    "skill-evolver/skills/skill-evolver/tests/test_capture.py": "cdf2fd626462223e98c0220e670df8ae56bb4de0ca5b4e9c6e047cc96596e074",
+    "skill-evolver/skills/skill-evolver/tests/test_review.py": "23ebdab2d5ae8179388cecbbb9e8a6e0062c0a7379e68ab7a40f193bf7bf0a62",
+    "skill-evolver/hooks/hooks.json": "a6bd79c7dbddd98fb318186444d2e2c61fe792f8569787f79a9689c7904659ec",
+    "skill-evolver/.codex-plugin/plugin.json": "acc1dacfeba7b9f89369254414f4d57619005ed30de3292c66847629a56de41e",
+    ".agents/plugins/marketplace.json": "e5639e4b95eba663435044031268bb11fac22fe7c539885570ab7bfab4bb1936"
+  },
+  "checks": {
+    "explicit_review_only": true,
+    "exact_session_result_coverage": true,
+    "frozen_generation_revalidated": true,
+    "static_and_dynamic_digests_revalidated": true,
+    "candidate_transaction_atomic": true,
+    "one_candidate_per_session": true,
+    "three_new_fingerprints_per_batch": true,
+    "split_result_cleanup_boundaries": true,
+    "status_and_inspect_read_only": true,
+    "retention_30_90_180": true,
+    "installed_skill_writes_zero": true,
+    "staging_writes_zero": true,
+    "snapshot_writes_zero": true
+  },
+  "tests": {
+    "result": "PASS",
+    "tests_run": 365,
+    "review_tests_run": 110,
+    "capture_tests_run": 82,
+    "historical_skip_count": 3,
+    "historical_skips": [
+      "test_manifest_and_hook_are_discoverable",
+      "test_readme_stages_exact_private_v2_gate_inventory",
+      "test_skill_is_explicit_only"
+    ]
+  },
+  "independent_reviews": {
+    "specification": "CLEAN",
+    "security_privacy": "CLEAN"
+  },
+  "quality_gate_claimed": false,
+  "next_action": "begin_phase_5_read_only_quality_sample"
+}
