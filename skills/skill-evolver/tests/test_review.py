@@ -1236,3 +1236,305 @@ class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
             self.assertFalse(raised.exception.retryable)
         finally:
             connection.close()
+
+
+class FrozenTranscriptIdentityTests(FrozenTranscriptTestCase):
+    def test_same_inode_relocation_is_accepted_but_replacement_is_changed(
+        self,
+    ) -> None:
+        lines = [self.fixture_lines[0], self.fixture_lines[5]]
+        connection, transcript, frozen = self.capture_and_claim(
+            lines,
+            reviewed_boundary=len(lines[0]),
+        )
+        relocated = self.sessions / "relocated"
+        relocated.mkdir(mode=0o700)
+        moved = relocated / "moved.jsonl"
+        transcript.rename(moved)
+        try:
+            exported = self.runtime.read_frozen_transcript(
+                self.installation,
+                frozen,
+                self.config,
+                self.review,
+            )
+            self.assertTrue(exported.read_path_changed)
+            self.assertEqual(
+                [record.text for record in exported.records],
+                ["sanitized direct correction"],
+            )
+            self.assertEqual(frozen.locator.path, transcript)
+            self.assertEqual(
+                (moved.stat().st_dev, moved.stat().st_ino),
+                (frozen.locator.device, frozen.locator.inode),
+            )
+        finally:
+            connection.close()
+
+        replacement_session = "replacement-session"
+        replacement_lines = [
+            self.fixture_lines[0].replace(
+                b"fixture-session", replacement_session.encode()
+            ),
+            self.fixture_lines[5],
+        ]
+        connection, transcript, frozen = self.capture_and_claim(
+            replacement_lines,
+            reviewed_boundary=len(replacement_lines[0]),
+            session_id=replacement_session,
+        )
+        preserved = self.sessions / "preserved-original-inode.jsonl"
+        transcript.rename(preserved)
+        transcript.write_bytes(b"".join(replacement_lines))
+        try:
+            with self.assertRaises(
+                self.runtime.TranscriptAdapterError
+            ) as raised:
+                self.runtime.read_frozen_transcript(
+                    self.installation,
+                    frozen,
+                    self.config,
+                    self.review,
+                )
+            self.assertEqual(raised.exception.code, "transcript_changed")
+            self.assertTrue(raised.exception.retryable)
+        finally:
+            connection.close()
+
+    def test_relocation_directory_swap_cannot_read_outside(self) -> None:
+        session_id = "relocation-directory-swap"
+        lines = [
+            self.fixture_lines[0].replace(
+                b"fixture-session", session_id.encode()
+            ),
+            self.fixture_lines[5],
+        ]
+        connection, transcript, frozen = self.capture_and_claim(
+            lines,
+            reviewed_boundary=len(lines[0]),
+            session_id=session_id,
+        )
+        relocated = self.sessions / "relocated-swap"
+        relocated.mkdir(mode=0o700)
+        moved = relocated / "moved.jsonl"
+        transcript.rename(moved)
+        outside = self.base / "outside-relocation"
+        outside.mkdir(mode=0o700)
+        (outside / "moved.jsonl").write_bytes(
+            lines[0]
+            + lines[1].replace(
+                b"sanitized direct correction",
+                b"outside sentinel",
+            )
+        )
+        preserved = self.sessions / "pinned-relocated-swap"
+        real_open = os.open
+        swapped = False
+
+        def swap_before_final_open(
+            name, flags, *args, **kwargs
+        ):
+            nonlocal swapped
+            if (
+                name == "moved.jsonl"
+                and kwargs.get("dir_fd") is not None
+                and not swapped
+            ):
+                relocated.rename(preserved)
+                relocated.symlink_to(
+                    outside, target_is_directory=True
+                )
+                swapped = True
+            return real_open(name, flags, *args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                self.runtime.os,
+                "open",
+                side_effect=swap_before_final_open,
+            ):
+                exported = self.runtime.read_frozen_transcript(
+                    self.installation,
+                    frozen,
+                    self.config,
+                    self.review,
+                )
+            self.assertTrue(swapped)
+            self.assertTrue(exported.read_path_changed)
+            self.assertEqual(
+                [record.text for record in exported.records],
+                ["sanitized direct correction"],
+            )
+            self.assertNotIn(
+                "outside sentinel",
+                [record.text for record in exported.records],
+            )
+        finally:
+            connection.close()
+
+    def test_frozen_locator_digest_includes_claim_time_path_and_stat(
+        self,
+    ) -> None:
+        lines = [self.fixture_lines[0], self.fixture_lines[5]]
+        connection, _, frozen = self.capture_and_claim(
+            lines,
+            reviewed_boundary=len(lines[0]),
+        )
+        try:
+            payload = self.runtime.transcript_locator_payload(
+                frozen.locator
+            )
+            self.assertEqual(
+                set(payload),
+                {"path", "size", "mtime_ns", "device", "inode"},
+            )
+            self.assertEqual(
+                self.runtime.transcript_locator_digest(frozen.locator),
+                self.runtime.sha256_json(payload),
+            )
+            changed_path = replace(
+                frozen.locator,
+                path=frozen.locator.path.with_name("relocated.jsonl"),
+            )
+            self.assertNotEqual(
+                self.runtime.transcript_locator_digest(frozen.locator),
+                self.runtime.transcript_locator_digest(changed_path),
+            )
+        finally:
+            connection.close()
+
+    def test_missing_and_during_read_change_are_retryable(self) -> None:
+        lines = [self.fixture_lines[0], self.fixture_lines[5]]
+        connection, transcript, frozen = self.capture_and_claim(
+            lines,
+            reviewed_boundary=len(lines[0]),
+        )
+        transcript.unlink()
+        try:
+            with self.assertRaises(
+                self.runtime.TranscriptAdapterError
+            ) as missing:
+                self.runtime.read_frozen_transcript(
+                    self.installation,
+                    frozen,
+                    self.config,
+                    self.review,
+                )
+            self.assertEqual(missing.exception.code, "transcript_missing")
+            self.assertTrue(missing.exception.retryable)
+            for index in range(3):
+                (self.sessions / f"junk-{index}").write_bytes(b"x")
+            with mock.patch.object(
+                self.runtime,
+                "TRANSCRIPT_RELOCATION_SCAN_MAX_ENTRIES",
+                2,
+            ):
+                with self.assertRaises(
+                    self.runtime.TranscriptAdapterError
+                ) as saturated:
+                    self.runtime.read_frozen_transcript(
+                        self.installation,
+                        frozen,
+                        self.config,
+                        self.review,
+                    )
+            self.assertEqual(
+                saturated.exception.code, "transcript_changed"
+            )
+            self.assertTrue(saturated.exception.retryable)
+        finally:
+            connection.close()
+
+        connection, transcript, frozen = self.capture_and_claim(
+            [
+                lines[0].replace(
+                    b"fixture-session", b"changing-during-read"
+                ),
+                lines[1],
+            ],
+            reviewed_boundary=len(
+                lines[0].replace(
+                    b"fixture-session", b"changing-during-read"
+                )
+            ),
+            session_id="changing-during-read",
+        )
+        real_pread = os.pread
+        changed = False
+
+        def append_during_read(
+            descriptor: int, length: int, offset: int
+        ) -> bytes:
+            nonlocal changed
+            result = real_pread(descriptor, length, offset)
+            if not changed:
+                changed = True
+                with transcript.open("ab") as stream:
+                    stream.write(b'{"type":"event_msg","payload":{}}\n')
+            return result
+
+        try:
+            with mock.patch.object(
+                self.runtime.os,
+                "pread",
+                side_effect=append_during_read,
+            ):
+                with self.assertRaises(
+                    self.runtime.TranscriptAdapterError
+                ) as changing:
+                    self.runtime.read_frozen_transcript(
+                        self.installation,
+                        frozen,
+                        self.config,
+                        self.review,
+                    )
+            self.assertEqual(
+                changing.exception.code, "transcript_changed"
+            )
+            self.assertTrue(changing.exception.retryable)
+        finally:
+            connection.close()
+
+        connection, _, frozen = self.capture_and_claim(
+            [
+                lines[0].replace(
+                    b"fixture-session", b"read-io-error"
+                ),
+                lines[1],
+            ],
+            reviewed_boundary=len(
+                lines[0].replace(
+                    b"fixture-session", b"read-io-error"
+                )
+            ),
+            session_id="read-io-error",
+        )
+        real_close = os.close
+        try:
+            for operation in ("pread", "fstat"):
+                with self.subTest(operation=operation):
+                    with mock.patch.object(
+                        self.runtime.os,
+                        operation,
+                        side_effect=OSError("synthetic read failure"),
+                    ), mock.patch.object(
+                        self.runtime.os,
+                        "close",
+                        wraps=real_close,
+                    ) as close:
+                        with self.assertRaises(
+                            self.runtime.TranscriptAdapterError
+                        ) as raised:
+                            self.runtime.read_frozen_transcript(
+                                self.installation,
+                                frozen,
+                                self.config,
+                                self.review,
+                            )
+                    self.assertEqual(
+                        raised.exception.code, "transcript_changed"
+                    )
+                    self.assertTrue(raised.exception.retryable)
+                    close.assert_called_once()
+        finally:
+            connection.close()
