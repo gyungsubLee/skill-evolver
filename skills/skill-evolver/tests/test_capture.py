@@ -234,6 +234,29 @@ class RuntimeStoreTests(unittest.TestCase):
 
         self.assertEqual(config.pending_limit_sessions, 200)
         self.assertEqual(config.review_batch_sessions, 5)
+        self.assertEqual(config.deferred_to_stale_days, 30)
+        self.assertEqual(config.rejected_tombstone_days, 90)
+        self.assertEqual(
+            config.terminal_candidate_retention_days, 90
+        )
+        self.assertEqual(
+            {
+                "deferred_to_stale_days": (
+                    config.deferred_to_stale_days
+                ),
+                "rejected_tombstone_days": (
+                    config.rejected_tombstone_days
+                ),
+                "terminal_candidate_retention_days": (
+                    config.terminal_candidate_retention_days
+                ),
+            },
+            {
+                "deferred_to_stale_days": 30,
+                "rejected_tombstone_days": 90,
+                "terminal_candidate_retention_days": 90,
+            },
+        )
         self.assertEqual(
             tables,
             {
@@ -266,6 +289,90 @@ class RuntimeStoreTests(unittest.TestCase):
             stat.S_IMODE(installation.identity_key.stat().st_mode), 0o600
         )
         self.assertEqual(len(installation.identity_key.read_bytes()), 32)
+
+    def test_load_config_accepts_only_three_legacy_missing_keys(
+        self,
+    ) -> None:
+        installation_path = self.runtime.initialize_runtime(
+            self.base / "legacy-candidate-retention",
+            (self.sessions,),
+            self.config,
+        )
+        installation = self.runtime.load_installation(
+            installation_path
+        )
+        payload = json.loads(
+            installation.config_path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            self.runtime.LEGACY_OPTIONAL_CONFIG_KEYS,
+            {
+                "deferred_to_stale_days",
+                "rejected_tombstone_days",
+                "terminal_candidate_retention_days",
+            },
+        )
+        for key in self.runtime.LEGACY_OPTIONAL_CONFIG_KEYS:
+            payload.pop(key)
+        installation.config_path.write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+        installation.config_path.chmod(0o600)
+        loaded = self.runtime.load_config(installation)
+        self.assertEqual(loaded.deferred_to_stale_days, 30)
+        self.assertEqual(loaded.rejected_tombstone_days, 90)
+        self.assertEqual(
+            loaded.terminal_candidate_retention_days, 90
+        )
+
+    def test_load_config_rejects_old_missing_or_unknown_keys(
+        self,
+    ) -> None:
+        self.assertEqual(
+            self.runtime.LEGACY_OPTIONAL_CONFIG_KEYS,
+            {
+                "deferred_to_stale_days",
+                "rejected_tombstone_days",
+                "terminal_candidate_retention_days",
+            },
+        )
+        mutations = tuple(
+            (f"missing-{key}", key, None)
+            for key in self.runtime.DEFAULTS
+            if key
+            not in {
+                "deferred_to_stale_days",
+                "rejected_tombstone_days",
+                "terminal_candidate_retention_days",
+            }
+        ) + (("unknown", "unexpected_retention_days", 7),)
+        for name, key, value in mutations:
+            with self.subTest(name=name):
+                installation_path = self.runtime.initialize_runtime(
+                    self.base / name,
+                    (self.sessions,),
+                    self.config,
+                )
+                installation = self.runtime.load_installation(
+                    installation_path
+                )
+                payload = json.loads(
+                    installation.config_path.read_text(
+                        encoding="utf-8"
+                    )
+                )
+                if value is None:
+                    payload.pop(key)
+                else:
+                    payload[key] = value
+                installation.config_path.write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+                installation.config_path.chmod(0o600)
+                with self.assertRaisesRegex(
+                    ValueError, "^invalid_config_keys$"
+                ):
+                    self.runtime.load_config(installation)
 
     def test_status_database_is_read_only_openable_immediately_after_init(self) -> None:
         installation_path = self.runtime.initialize_runtime(
@@ -3434,12 +3541,15 @@ class MaintenanceStatusTests(unittest.TestCase):
         self.runtime.upsert_session(
             connection, event, key, self.runtime_config, now
         )
-        review_item_id = int(
-            connection.execute(
-                "SELECT id FROM review_items WHERE session_key=?",
-                (key,),
-            ).fetchone()["id"]
-        )
+        review_item = connection.execute(
+            """
+            SELECT id,dedupe_expires_at
+            FROM review_items WHERE session_key=?
+            """,
+            (key,),
+        ).fetchone()
+        review_item_id = int(review_item["id"])
+        dedupe_expires_at = review_item["dedupe_expires_at"]
         candidate = connection.execute(
             """
             INSERT INTO candidates(
@@ -3471,6 +3581,19 @@ class MaintenanceStatusTests(unittest.TestCase):
         )
         candidate_id = int(candidate.lastrowid)
         connection.execute(
+            "INSERT INTO metadata(key,value) VALUES(?,?)",
+            (
+                self.runtime.candidate_session_link_key(
+                    self.installation, key
+                ),
+                self.runtime.canonical_json_bytes(
+                    self.runtime.candidate_session_link_value(
+                        candidate_id, dedupe_expires_at
+                    )
+                ).decode("utf-8"),
+            ),
+        )
+        connection.execute(
             """
             INSERT INTO candidate_evidence(
               candidate_id,review_item_id,session_key,generation,signal_type,
@@ -3483,7 +3606,7 @@ class MaintenanceStatusTests(unittest.TestCase):
                 key,
                 1,
                 "verification_failure",
-                "user_direct",
+                "tool_output",
                 "summary",
                 self.runtime.iso_utc(now),
             ),
@@ -3511,16 +3634,29 @@ class MaintenanceStatusTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM candidate_evidence"
             ).fetchone()[0]
         )
-        aggregate = connection.execute(
+        candidate = connection.execute(
             "SELECT occurrence_count FROM candidates WHERE id=?",
             (candidate_id,),
         ).fetchone()
+        aggregate = self.runtime.load_candidate_evidence_aggregate(
+            connection, candidate_id
+        )
         connection.close()
 
         self.assertEqual(result["dedupe_deleted"], 1)
         self.assertEqual(remaining_keys, 0)
         self.assertEqual(evidence_rows, 0)
-        self.assertEqual(aggregate["occurrence_count"], 4)
+        self.assertEqual(candidate["occurrence_count"], 4)
+        self.assertEqual(
+            aggregate["counts"],
+            [
+                {
+                    "signal_type": "verification_failure",
+                    "source_kind": "tool_output",
+                    "count": 1,
+                }
+            ],
+        )
 
     def test_maintenance_recovers_lease_and_redacts_reviewed_raw_metadata(
         self,

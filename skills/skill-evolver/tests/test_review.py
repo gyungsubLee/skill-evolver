@@ -10446,6 +10446,8 @@ class CandidateCommitTests(CandidateBatchFixture):
             ).fetchone()["status"],
             "ready",
         )
+
+
         self.abort(claim, resolver_now + 2)
 
         digest_functions = (
@@ -10698,6 +10700,7 @@ class CandidateCommitTests(CandidateBatchFixture):
             "ready",
         )
 
+
     def test_frozen_to_change_rolls_back_whole_result(self) -> None:
         now = 2_000_000_000.0
         claim = self.claim(1, now)
@@ -10755,4 +10758,1407 @@ class CandidateCommitTests(CandidateBatchFixture):
                 (batch_id,),
             ).fetchone()["status"],
             "ready",
+        )
+
+
+class CandidateMaintenanceTests(CandidateBatchFixture):
+    def committed_candidate(
+        self,
+        now: float,
+        *,
+        locator_suffix: str = "",
+    ) -> tuple[int, dict[str, object]]:
+        claim = self.claim(1, now)
+        path = self.write_result(
+            claim,
+            self.result_payload(
+                claim, locator_suffix=locator_suffix
+            ),
+        )
+        self.commit(claim, path, now + 1)
+        candidate_id = int(
+            self.connection.execute(
+                "SELECT id FROM candidates ORDER BY id DESC LIMIT 1"
+            ).fetchone()["id"]
+        )
+        return candidate_id, claim
+
+    def test_30_90_180_maintenance_preserves_only_counts(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        claim = self.claim(1, now)
+        payload = self.result_payload(claim)
+        initial_summary = "redacted:valid-model-summary"
+        payload["sessions"][0]["problem_summary"] = initial_summary
+        path = self.write_result(claim, payload)
+        self.commit(claim, path, now + 1)
+        candidate_id = int(
+            self.connection.execute(
+                "SELECT id FROM candidates"
+            ).fetchone()["id"]
+        )
+        status_started_at = self.runtime.iso_utc(now + 2)
+        self.connection.execute(
+            """
+            UPDATE candidates
+            SET status='deferred',updated_at=?
+            WHERE id=?
+            """,
+            (status_started_at, candidate_id),
+        )
+        self.connection.executemany(
+            """
+            INSERT INTO candidates(
+              fingerprint,target_identity,target_skill,target_path,
+              problem_category,target_locator,proposal_intent,
+              conflict_group,problem_summary,proposal_summary,
+              validation_plan,risk_level,status,occurrence_count,
+              first_seen_at,last_seen_at,updated_at,tombstone_until
+            ) VALUES(
+              ?,?,?,?, ?,?,?,NULL, ?,?,?,?, 'deferred',1,?,?,?,NULL
+            )
+            """,
+            [
+                (
+                    f"{index + 2:064x}",
+                    self.catalog_entry.identity,
+                    self.catalog_entry.skill_dir.name,
+                    str(self.catalog_entry.skill_dir),
+                    "verification",
+                    f"bulk locator {index}",
+                    "require successful verification",
+                    f"bulk problem {index}",
+                    "bulk proposal",
+                    "run bulk regression",
+                    "low",
+                    status_started_at,
+                    status_started_at,
+                    status_started_at,
+                )
+                for index in range(200)
+            ],
+        )
+
+        at_30 = now + 2 + 30 * 86_400
+        first = self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            at_30,
+        )
+        status_counts = dict(
+            self.connection.execute(
+                """
+                SELECT status,COUNT(*) FROM candidates
+                GROUP BY status
+                """
+            ).fetchall()
+        )
+        first_candidate = self.connection.execute(
+            "SELECT status,updated_at FROM candidates WHERE id=?",
+            (candidate_id,),
+        ).fetchone()
+        self.assertEqual(first["candidates_staled"], 200)
+        self.assertEqual(status_counts, {"deferred": 1, "stale": 200})
+        self.assertEqual(
+            tuple(first_candidate),
+            ("stale", self.runtime.iso_utc(at_30)),
+        )
+
+        at_90_terminal = at_30 + 90 * 86_400
+        second = self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            at_90_terminal,
+        )
+        redacted = self.connection.execute(
+            """
+            SELECT status,updated_at,target_path,target_locator,
+              proposal_intent,problem_summary,proposal_summary,
+              validation_plan,risk_level
+            FROM candidates WHERE id=?
+            """,
+            (candidate_id,),
+        ).fetchone()
+        candidate_shapes = tuple(
+            self.connection.execute(
+                """
+                SELECT
+                  SUM(target_path IS NULL),
+                  SUM(target_path IS NOT NULL)
+                FROM candidates
+                """
+            ).fetchone()
+        )
+        evidence = int(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM candidate_evidence"
+            ).fetchone()[0]
+        )
+        links = int(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM metadata "
+                "WHERE key LIKE 'candidate-session.%'"
+            ).fetchone()[0]
+        )
+        aggregate_key = (
+            self.runtime.candidate_evidence_aggregate_key(
+                candidate_id
+            )
+        )
+        aggregate_raw = self.connection.execute(
+            "SELECT value FROM metadata WHERE key=?",
+            (aggregate_key,),
+        ).fetchone()["value"]
+        aggregate = self.runtime.load_candidate_evidence_aggregate(
+            self.connection, candidate_id
+        )
+        self.assertEqual(second["candidates_staled"], 1)
+        self.assertEqual(second["candidate_text_redacted"], 200)
+        self.assertEqual(
+            second["terminal_evidence_aggregated"], 1
+        )
+        self.assertEqual(candidate_shapes, (200, 1))
+        self.assertEqual(redacted["status"], "stale")
+        self.assertEqual(
+            redacted["updated_at"], self.runtime.iso_utc(at_30)
+        )
+        self.assertIsNone(redacted["target_path"])
+        self.assertEqual(
+            redacted["problem_summary"],
+            self.runtime.redacted_marker(initial_summary),
+        )
+        for name in (
+            "target_locator",
+            "proposal_intent",
+            "problem_summary",
+            "proposal_summary",
+            "validation_plan",
+            "risk_level",
+        ):
+            self.assertRegex(
+                redacted[name], r"^redacted:[0-9a-f]{64}$"
+            )
+        self.assertEqual(evidence, 0)
+        self.assertEqual(links, 1)
+        self.assertEqual(
+            aggregate["counts"],
+            [
+                {
+                    "signal_type": "explicit_correction",
+                    "source_kind": "user_direct",
+                    "count": 1,
+                }
+            ],
+        )
+        self.assertEqual(
+            aggregate_raw,
+            self.runtime.canonical_json_bytes(
+                aggregate
+            ).decode("utf-8"),
+        )
+        self.assertLessEqual(
+            len(aggregate_raw.encode("utf-8")), 4_096
+        )
+        self.assertNotIn("session", aggregate_raw)
+        self.assertNotIn(initial_summary, aggregate_raw)
+
+        at_180 = now + self.config.session_dedupe_days * 86_400
+        due = self.runtime.iso_utc(at_180)
+        raw_expired = self.runtime.iso_utc(now)
+        self.connection.executemany(
+            """
+            INSERT INTO review_items(
+              session_key,status,last_stop_ns,first_stop_at,last_stop_at,
+              reviewed_at,raw_metadata_expires_at,dedupe_expires_at,
+              raw_redacted_at
+            ) VALUES(?,'reviewed',0,?,?,?,?,?,?)
+            """,
+            [
+                (
+                    f"{index + 1_000:064x}",
+                    raw_expired,
+                    raw_expired,
+                    raw_expired,
+                    raw_expired,
+                    due,
+                    raw_expired,
+                )
+                for index in range(200)
+            ],
+        )
+        exact_link = self.connection.execute(
+            """
+            SELECT metadata.key FROM metadata AS metadata
+            WHERE metadata.key LIKE 'candidate-session.%'
+            """
+        ).fetchone()["key"]
+        unrelated_link = f"candidate-session.{'f' * 64}"
+        self.assertNotEqual(unrelated_link, exact_link)
+        self.connection.execute(
+            "INSERT INTO metadata(key,value) VALUES(?,?)",
+            (unrelated_link, '{"unrelated":true}'),
+        )
+
+        third = self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            at_180,
+        )
+        remaining = tuple(
+            self.connection.execute(
+                """
+                SELECT
+                  (SELECT COUNT(*) FROM review_items),
+                  (SELECT COUNT(*) FROM candidate_evidence),
+                  (SELECT COUNT(*) FROM metadata WHERE key=?),
+                  (SELECT COUNT(*) FROM metadata WHERE key=?)
+                """,
+                (exact_link, unrelated_link),
+            ).fetchone()
+        )
+        occurrence = int(
+            self.connection.execute(
+                "SELECT occurrence_count FROM candidates WHERE id=?",
+                (candidate_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual(third["dedupe_deleted"], 200)
+        self.assertEqual(
+            third["candidate_session_links_deleted"], 1
+        )
+        self.assertEqual(remaining, (1, 0, 0, 1))
+        self.assertEqual(occurrence, 1)
+        self.assertEqual(
+            self.runtime.load_candidate_evidence_aggregate(
+                self.connection, candidate_id
+            )["counts"],
+            aggregate["counts"],
+        )
+
+        fourth = self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            at_180 + 1,
+        )
+        self.assertEqual(fourth["dedupe_deleted"], 1)
+        self.assertEqual(
+            fourth["candidate_session_links_deleted"], 0
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM review_items"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertIsNotNone(
+            self.connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (unrelated_link,),
+            ).fetchone()
+        )
+
+    def test_stale_and_expired_tombstone_require_new_session_evidence(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        candidate_id, _ = self.committed_candidate(now)
+        self.connection.execute(
+            """
+            UPDATE candidates
+            SET status='deferred',updated_at=?
+            WHERE id=?
+            """,
+            (self.runtime.iso_utc(now + 2), candidate_id),
+        )
+        at_30 = now + 2 + 30 * 86_400
+        invalid_deferred_tombstone = self.runtime.iso_utc(
+            at_30 + 100
+        )
+        self.connection.execute(
+            """
+            UPDATE candidates SET tombstone_until=? WHERE id=?
+            """,
+            (invalid_deferred_tombstone, candidate_id),
+        )
+        with self.subTest(
+            maintenance_state="deferred-with-tombstone"
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "^candidate_maintenance_state_corrupt$",
+            ):
+                self.runtime.run_maintenance(
+                    self.connection,
+                    self.installation,
+                    self.config,
+                    at_30,
+                )
+            self.assertEqual(
+                tuple(
+                    self.connection.execute(
+                        """
+                        SELECT status,updated_at,tombstone_until
+                        FROM candidates WHERE id=?
+                        """,
+                        (candidate_id,),
+                    ).fetchone()
+                ),
+                (
+                    "deferred",
+                    self.runtime.iso_utc(now + 2),
+                    invalid_deferred_tombstone,
+                ),
+            )
+            self.assertIsNone(
+                self.connection.execute(
+                    "SELECT value FROM metadata "
+                    "WHERE key='last_maintenance_at'"
+                ).fetchone()
+            )
+        self.connection.execute(
+            """
+            UPDATE candidates SET tombstone_until=NULL WHERE id=?
+            """,
+            (candidate_id,),
+        )
+        first = self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            at_30,
+        )
+        self.assertEqual(first["candidates_staled"], 1)
+        at_90_terminal = at_30 + 90 * 86_400
+        invalid_stale_tombstone = self.runtime.iso_utc(
+            at_90_terminal + 100
+        )
+        self.connection.execute(
+            """
+            UPDATE candidates SET tombstone_until=? WHERE id=?
+            """,
+            (invalid_stale_tombstone, candidate_id),
+        )
+        before_stale = tuple(
+            self.connection.execute(
+                """
+                SELECT status,updated_at,target_path,tombstone_until
+                FROM candidates WHERE id=?
+                """,
+                (candidate_id,),
+            ).fetchone()
+        )
+        with self.subTest(
+            maintenance_state="stale-with-tombstone"
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "^candidate_maintenance_state_corrupt$",
+            ):
+                self.runtime.run_maintenance(
+                    self.connection,
+                    self.installation,
+                    self.config,
+                    at_90_terminal,
+                )
+            self.assertEqual(
+                tuple(
+                    self.connection.execute(
+                        """
+                        SELECT status,updated_at,target_path,
+                          tombstone_until
+                        FROM candidates WHERE id=?
+                        """,
+                        (candidate_id,),
+                    ).fetchone()
+                ),
+                before_stale,
+            )
+            self.assertEqual(
+                self.connection.execute(
+                    "SELECT COUNT(*) FROM candidate_evidence "
+                    "WHERE candidate_id=?",
+                    (candidate_id,),
+                ).fetchone()[0],
+                1,
+            )
+        self.connection.execute(
+            """
+            UPDATE candidates SET tombstone_until=NULL WHERE id=?
+            """,
+            (candidate_id,),
+        )
+        second = self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            at_90_terminal,
+        )
+        redacted = self.connection.execute(
+            """
+            SELECT updated_at,target_path,target_locator,proposal_intent,
+              problem_summary,proposal_summary,validation_plan,risk_level
+            FROM candidates WHERE id=?
+            """,
+            (candidate_id,),
+        ).fetchone()
+        self.assertEqual(second["candidate_text_redacted"], 1)
+        self.assertEqual(
+            redacted["updated_at"], self.runtime.iso_utc(at_30)
+        )
+        self.assertIsNone(redacted["target_path"])
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM candidate_evidence "
+                "WHERE candidate_id=?",
+                (candidate_id,),
+            ).fetchone()[0],
+            0,
+        )
+        for name in (
+            "target_locator",
+            "proposal_intent",
+            "problem_summary",
+            "proposal_summary",
+            "validation_plan",
+            "risk_level",
+        ):
+            self.assertRegex(
+                redacted[name], r"^redacted:[0-9a-f]{64}$"
+            )
+
+        replay_now = at_90_terminal + 1
+        replay_id, _ = self.committed_candidate(
+            replay_now, locator_suffix=" replay protection"
+        )
+        replay_item_id = int(
+            self.connection.execute(
+                """
+                SELECT review_item_id FROM candidate_evidence
+                WHERE candidate_id=?
+                """,
+                (replay_id,),
+            ).fetchone()["review_item_id"]
+        )
+        self.connection.execute(
+            """
+            UPDATE candidates
+            SET status='stale',updated_at=?
+            WHERE id=?
+            """,
+            (
+                self.runtime.iso_utc(
+                    replay_now
+                    - self.config.terminal_candidate_retention_days
+                    * 86_400
+                ),
+                replay_id,
+            ),
+        )
+        self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            replay_now + 2,
+        )
+        replay_aggregate = (
+            self.runtime.load_candidate_evidence_aggregate(
+                self.connection, replay_id
+            )
+        )
+        self.assertEqual(
+            replay_aggregate["counts"],
+            [
+                {
+                    "count": 1,
+                    "signal_type": "explicit_correction",
+                    "source_kind": "user_direct",
+                }
+            ],
+        )
+        self.assertEqual(
+            self.connection.execute(
+                """
+                SELECT COUNT(*) FROM candidate_evidence
+                WHERE candidate_id=?
+                """,
+                (replay_id,),
+            ).fetchone()[0],
+            0,
+        )
+
+        replay_claim = self.reopen_review_item(
+            replay_item_id, replay_now + 3
+        )
+        replay_path = self.write_result(
+            replay_claim,
+            self.result_payload(
+                replay_claim, locator_suffix=" replay protection"
+            ),
+        )
+        self.commit(replay_claim, replay_path, replay_now + 5)
+        self.assertEqual(
+            self.connection.execute(
+                """
+                SELECT COUNT(*) FROM candidate_evidence
+                WHERE candidate_id=?
+                """,
+                (replay_id,),
+            ).fetchone()[0],
+            0,
+        )
+        self.connection.execute(
+            """
+            UPDATE review_items SET dedupe_expires_at=?
+            WHERE id=?
+            """,
+            (self.runtime.iso_utc(replay_now + 7), replay_item_id),
+        )
+        replay_cleanup = self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            replay_now + 7,
+        )
+        self.assertEqual(replay_cleanup["dedupe_deleted"], 1)
+        self.assertEqual(
+            self.runtime.load_candidate_evidence_aggregate(
+                self.connection, replay_id
+            )["counts"],
+            replay_aggregate["counts"],
+        )
+        self.assertEqual(
+            self.connection.execute(
+                """
+                SELECT COUNT(*) FROM candidate_evidence
+                WHERE candidate_id=?
+                """,
+                (replay_id,),
+            ).fetchone()[0],
+            0,
+        )
+
+        revive_at = at_90_terminal + 10
+        stale_claim = self.claim(1, revive_at)
+        stale_payload = self.result_payload(stale_claim)
+        stale_result = stale_payload["sessions"][0]
+        stale_result["problem_summary"] = "Fresh validated problem."
+        stale_result["proposal_summary"] = "Fresh validated proposal."
+        stale_result["validation_plan"] = "Run the fresh regression."
+        stale_result["risk_level"] = "medium"
+        stale_path = self.write_result(stale_claim, stale_payload)
+        self.commit(stale_claim, stale_path, revive_at + 1)
+        revived_at = self.runtime.iso_utc(revive_at + 1)
+        revived = self.connection.execute(
+            """
+            SELECT status,occurrence_count,updated_at,target_path,
+              target_locator,proposal_intent,problem_summary,
+              proposal_summary,validation_plan,risk_level
+            FROM candidates WHERE id=?
+            """,
+            (candidate_id,),
+        ).fetchone()
+        classification = stale_result["classification"]
+        self.assertEqual(
+            tuple(revived),
+            (
+                "proposed",
+                2,
+                revived_at,
+                str(self.catalog_entry.skill_dir),
+                classification["target_locator"],
+                classification["proposal_intent"],
+                stale_result["problem_summary"],
+                stale_result["proposal_summary"],
+                stale_result["validation_plan"],
+                stale_result["risk_level"],
+            ),
+        )
+
+        active_claim = self.claim(1, revive_at + 10)
+        active_path = self.write_result(
+            active_claim, self.result_payload(active_claim)
+        )
+        self.commit(active_claim, active_path, revive_at + 11)
+        active = self.connection.execute(
+            """
+            SELECT status,occurrence_count,updated_at
+            FROM candidates WHERE id=?
+            """,
+            (candidate_id,),
+        ).fetchone()
+        self.assertEqual(
+            tuple(active), ("proposed", 3, revived_at)
+        )
+
+        rejected_at = revive_at + 20
+        tombstone_until = (
+            rejected_at
+            + self.config.rejected_tombstone_days * 86_400
+        )
+        rejected_clock = self.runtime.iso_utc(rejected_at)
+        self.connection.execute(
+            """
+            UPDATE candidates
+            SET status='rejected',updated_at=?,tombstone_until=?
+            WHERE id=?
+            """,
+            (
+                rejected_clock,
+                self.runtime.iso_utc(tombstone_until),
+                candidate_id,
+            ),
+        )
+        rejected_claim = self.claim(1, rejected_at + 1)
+        rejected_path = self.write_result(
+            rejected_claim, self.result_payload(rejected_claim)
+        )
+        self.commit(
+            rejected_claim, rejected_path, rejected_at + 2
+        )
+        active_rejected = self.connection.execute(
+            """
+            SELECT status,occurrence_count,updated_at,tombstone_until
+            FROM candidates WHERE id=?
+            """,
+            (candidate_id,),
+        ).fetchone()
+        self.assertEqual(
+            tuple(active_rejected),
+            (
+                "rejected",
+                4,
+                rejected_clock,
+                self.runtime.iso_utc(tombstone_until),
+            ),
+        )
+
+        expired_at = tombstone_until + 1
+        expired_claim = self.claim(1, expired_at)
+        expired_payload = self.result_payload(expired_claim)
+        expired_path = self.write_result(
+            expired_claim, expired_payload
+        )
+        self.commit(expired_claim, expired_path, expired_at + 1)
+        expired = self.connection.execute(
+            """
+            SELECT status,occurrence_count,updated_at,tombstone_until,
+              target_path
+            FROM candidates WHERE id=?
+            """,
+            (candidate_id,),
+        ).fetchone()
+        self.assertEqual(
+            tuple(expired),
+            (
+                "proposed",
+                5,
+                self.runtime.iso_utc(expired_at + 1),
+                None,
+                str(self.catalog_entry.skill_dir),
+            ),
+        )
+
+        strict_now = expired_at + 20
+        strict_id, _ = self.committed_candidate(
+            strict_now, locator_suffix=" aggregate"
+        )
+        strict_updated_at = self.runtime.iso_utc(strict_now + 1)
+        self.connection.execute(
+            """
+            UPDATE candidates
+            SET status='stale',updated_at=?
+            WHERE id=?
+            """,
+            (strict_updated_at, strict_id),
+        )
+        strict_due = (
+            strict_now
+            + 1
+            + self.config.terminal_candidate_retention_days
+            * 86_400
+        )
+        aggregate_key = (
+            self.runtime.candidate_evidence_aggregate_key(strict_id)
+        )
+        maintenance_marker = self.runtime.iso_utc(strict_now)
+        self.connection.execute(
+            """
+            INSERT INTO metadata(key,value)
+            VALUES('last_maintenance_at',?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (maintenance_marker,),
+        )
+        self.connection.execute(
+            """
+            UPDATE candidates
+            SET status='rejected',tombstone_until='not-utc'
+            WHERE id=?
+            """,
+            (strict_id,),
+        )
+        with self.subTest(
+            maintenance_state="rejected-invalid-tombstone"
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "^candidate_maintenance_state_corrupt$",
+            ):
+                self.runtime.run_maintenance(
+                    self.connection,
+                    self.installation,
+                    self.config,
+                    strict_due,
+                )
+            self.assertEqual(
+                tuple(
+                    self.connection.execute(
+                        """
+                        SELECT status,tombstone_until,target_path
+                        FROM candidates WHERE id=?
+                        """,
+                        (strict_id,),
+                    ).fetchone()
+                ),
+                (
+                    "rejected",
+                    "not-utc",
+                    str(self.catalog_entry.skill_dir),
+                ),
+            )
+            self.assertEqual(
+                self.connection.execute(
+                    "SELECT COUNT(*) FROM candidate_evidence "
+                    "WHERE candidate_id=?",
+                    (strict_id,),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                self.connection.execute(
+                    "SELECT value FROM metadata "
+                    "WHERE key='last_maintenance_at'"
+                ).fetchone()["value"],
+                maintenance_marker,
+            )
+        self.connection.execute(
+            """
+            UPDATE candidates
+            SET status='stale',tombstone_until=NULL WHERE id=?
+            """,
+            (strict_id,),
+        )
+        live_shape = self.connection.execute(
+            """
+            SELECT target_path,target_locator,proposal_intent,
+              problem_summary,proposal_summary,validation_plan,risk_level
+            FROM candidates WHERE id=?
+            """,
+            (strict_id,),
+        ).fetchone()
+        marker = f"redacted:{'a' * 64}"
+        self.connection.execute(
+            """
+            UPDATE candidates
+            SET target_path=NULL,target_locator=?,proposal_intent=?,
+                problem_summary='not-redacted',proposal_summary=?,
+                validation_plan=?,risk_level=?
+            WHERE id=?
+            """,
+            (marker, marker, marker, marker, marker, strict_id),
+        )
+        with self.subTest(
+            maintenance_state="mixed-redacted-sentinel"
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "^candidate_maintenance_state_corrupt$",
+            ):
+                self.runtime.run_maintenance(
+                    self.connection,
+                    self.installation,
+                    self.config,
+                    strict_due,
+                )
+            self.assertEqual(
+                self.connection.execute(
+                    "SELECT problem_summary FROM candidates WHERE id=?",
+                    (strict_id,),
+                ).fetchone()["problem_summary"],
+                "not-redacted",
+            )
+            self.assertEqual(
+                self.connection.execute(
+                    "SELECT COUNT(*) FROM candidate_evidence "
+                    "WHERE candidate_id=?",
+                    (strict_id,),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                self.connection.execute(
+                    "SELECT value FROM metadata "
+                    "WHERE key='last_maintenance_at'"
+                ).fetchone()["value"],
+                maintenance_marker,
+            )
+        self.connection.execute(
+            """
+            UPDATE candidates
+            SET target_path=?,target_locator=?,proposal_intent=?,
+                problem_summary=?,proposal_summary=?,
+                validation_plan=?,risk_level=?
+            WHERE id=?
+            """,
+            (*tuple(live_shape), strict_id),
+        )
+        valid_empty = {
+            "schema_version": 1,
+            "counts": [],
+            "updated_at": self.runtime.iso_utc(strict_now),
+        }
+        allowed_a = {
+            "signal_type": "explicit_correction",
+            "source_kind": "user_direct",
+            "count": 1,
+        }
+        allowed_b = {
+            "signal_type": "verification_failure",
+            "source_kind": "tool_output",
+            "count": 1,
+        }
+        strict_evidence = self.connection.execute(
+            """
+            SELECT session_key FROM candidate_evidence
+            WHERE candidate_id=?
+            """,
+            (strict_id,),
+        ).fetchone()
+        strict_link_key = self.runtime.candidate_session_link_key(
+            self.installation, strict_evidence["session_key"]
+        )
+        strict_link_value = self.connection.execute(
+            "SELECT value FROM metadata WHERE key=?",
+            (strict_link_key,),
+        ).fetchone()["value"]
+        self.connection.execute(
+            "DELETE FROM metadata WHERE key=?", (strict_link_key,)
+        )
+        with self.subTest(maintenance_mismatch="90-day-link"):
+            with self.assertRaisesRegex(
+                ValueError, "^candidate_maintenance_mismatch$"
+            ):
+                self.runtime.run_maintenance(
+                    self.connection,
+                    self.installation,
+                    self.config,
+                    strict_due,
+                )
+            self.assertEqual(
+                self.connection.execute(
+                    "SELECT COUNT(*) FROM candidate_evidence "
+                    "WHERE candidate_id=?",
+                    (strict_id,),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                self.connection.execute(
+                    "SELECT value FROM metadata "
+                    "WHERE key='last_maintenance_at'"
+                ).fetchone()["value"],
+                maintenance_marker,
+            )
+        self.connection.execute(
+            "INSERT INTO metadata(key,value) VALUES(?,?)",
+            (strict_link_key, strict_link_value),
+        )
+        original_problem = self.connection.execute(
+            "SELECT problem_summary FROM candidates WHERE id=?",
+            (strict_id,),
+        ).fetchone()["problem_summary"]
+        for name, malformed in (
+            ("blob", sqlite3.Binary(b"private")),
+        ):
+            self.connection.execute(
+                """
+                UPDATE candidates SET problem_summary=? WHERE id=?
+                """,
+                (malformed, strict_id),
+            )
+            with self.subTest(invalid_redaction_value=name):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^invalid_candidate_redaction_value$",
+                ):
+                    self.runtime.run_maintenance(
+                        self.connection,
+                        self.installation,
+                        self.config,
+                        strict_due,
+                    )
+                self.assertEqual(
+                    self.connection.execute(
+                        "SELECT problem_summary FROM candidates "
+                        "WHERE id=?",
+                        (strict_id,),
+                    ).fetchone()["problem_summary"],
+                    malformed,
+                )
+                self.assertEqual(
+                    self.connection.execute(
+                        "SELECT COUNT(*) FROM candidate_evidence "
+                        "WHERE candidate_id=?",
+                        (strict_id,),
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertIsNone(
+                    self.connection.execute(
+                        "SELECT value FROM metadata WHERE key=?",
+                        (aggregate_key,),
+                    ).fetchone()
+                )
+                self.assertEqual(
+                    self.connection.execute(
+                        "SELECT value FROM metadata "
+                        "WHERE key='last_maintenance_at'"
+                    ).fetchone()["value"],
+                    maintenance_marker,
+                )
+            self.connection.execute(
+                """
+                UPDATE candidates SET problem_summary=? WHERE id=?
+                """,
+                (original_problem, strict_id),
+            )
+        invalid_aggregates = (
+            (
+                "oversize",
+                "x" * 4_097,
+            ),
+            (
+                "present-empty",
+                self.runtime.canonical_json_bytes(
+                    valid_empty
+                ).decode("utf-8"),
+            ),
+            (
+                "noncanonical",
+                json.dumps(valid_empty),
+            ),
+            (
+                "escaped-surrogate",
+                (
+                    '{"counts":[],"schema_version":1,'
+                    '"updated_at":"\\ud800"}'
+                ),
+            ),
+            (
+                "duplicate-json-key",
+                (
+                    '{"counts":[],"counts":[],"schema_version":1,'
+                    f'"updated_at":"{valid_empty["updated_at"]}"}}'
+                ),
+            ),
+            (
+                "private-extra-key",
+                self.runtime.canonical_json_bytes(
+                    {**valid_empty, "session_id": "private"}
+                ).decode("utf-8"),
+            ),
+            (
+                "missing-updated-at",
+                self.runtime.canonical_json_bytes(
+                    {
+                        "schema_version": 1,
+                        "counts": [],
+                        "updated_at": None,
+                    }
+                ).decode("utf-8"),
+            ),
+            (
+                "unsorted",
+                self.runtime.canonical_json_bytes(
+                    {
+                        **valid_empty,
+                        "counts": [allowed_b, allowed_a],
+                    }
+                ).decode("utf-8"),
+            ),
+            (
+                "duplicate-pair",
+                self.runtime.canonical_json_bytes(
+                    {
+                        **valid_empty,
+                        "counts": [allowed_a, allowed_a],
+                    }
+                ).decode("utf-8"),
+            ),
+            (
+                "invalid-pair",
+                self.runtime.canonical_json_bytes(
+                    {
+                        **valid_empty,
+                        "counts": [
+                            {
+                                **allowed_a,
+                                "source_kind": "assistant",
+                            }
+                        ],
+                    }
+                ).decode("utf-8"),
+            ),
+            (
+                "boolean-count",
+                self.runtime.canonical_json_bytes(
+                    {
+                        **valid_empty,
+                        "counts": [{**allowed_a, "count": True}],
+                    }
+                ).decode("utf-8"),
+            ),
+            (
+                "zero-count",
+                self.runtime.canonical_json_bytes(
+                    {
+                        **valid_empty,
+                        "counts": [{**allowed_a, "count": 0}],
+                    }
+                ).decode("utf-8"),
+            ),
+            (
+                "overflow-count",
+                self.runtime.canonical_json_bytes(
+                    {
+                        **valid_empty,
+                        "counts": [
+                            {
+                                **allowed_a,
+                                "count": (
+                                    self.runtime.SQLITE_INTEGER_MAX + 1
+                                ),
+                            }
+                        ],
+                    }
+                ).decode("utf-8"),
+            ),
+            (
+                "aggregate-total-overflow",
+                self.runtime.canonical_json_bytes(
+                    {
+                        **valid_empty,
+                        "counts": [
+                            {
+                                **allowed_a,
+                                "count": (
+                                    self.runtime.SQLITE_INTEGER_MAX
+                                ),
+                            },
+                            allowed_b,
+                        ],
+                    }
+                ).decode("utf-8"),
+            ),
+        )
+        for name, raw in invalid_aggregates:
+            with self.subTest(invalid_aggregate=name):
+                self.connection.execute(
+                    """
+                    INSERT INTO metadata(key,value) VALUES(?,?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                    """,
+                    (aggregate_key, raw),
+                )
+                before = tuple(
+                    self.connection.execute(
+                        """
+                        SELECT status,updated_at,target_path
+                        FROM candidates WHERE id=?
+                        """,
+                        (strict_id,),
+                    ).fetchone()
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^invalid_candidate_evidence_aggregate$",
+                ):
+                    self.runtime.run_maintenance(
+                        self.connection,
+                        self.installation,
+                        self.config,
+                        strict_due,
+                    )
+                after = tuple(
+                    self.connection.execute(
+                        """
+                        SELECT status,updated_at,target_path
+                        FROM candidates WHERE id=?
+                        """,
+                        (strict_id,),
+                    ).fetchone()
+                )
+                self.assertEqual(after, before)
+                self.assertEqual(
+                    self.connection.execute(
+                        "SELECT COUNT(*) FROM candidate_evidence "
+                        "WHERE candidate_id=?",
+                        (strict_id,),
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    self.connection.execute(
+                        "SELECT value FROM metadata WHERE key=?",
+                        (aggregate_key,),
+                    ).fetchone()["value"],
+                    raw,
+                )
+                self.assertEqual(
+                    self.connection.execute(
+                        "SELECT value FROM metadata "
+                        "WHERE key='last_maintenance_at'"
+                    ).fetchone()["value"],
+                    maintenance_marker,
+                )
+        max_count_raw = self.runtime.canonical_json_bytes(
+            {
+                **valid_empty,
+                "counts": [
+                    {
+                        **allowed_b,
+                        "count": self.runtime.SQLITE_INTEGER_MAX,
+                    }
+                ],
+            }
+        ).decode("utf-8")
+        self.connection.execute(
+            """
+            INSERT INTO metadata(key,value) VALUES(?,?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (aggregate_key, max_count_raw),
+        )
+        with self.subTest(invalid_aggregate="merge-overflow"):
+            with self.assertRaisesRegex(
+                ValueError,
+                "^invalid_candidate_evidence_aggregate$",
+            ):
+                self.runtime.run_maintenance(
+                    self.connection,
+                    self.installation,
+                    self.config,
+                    strict_due,
+                )
+            self.assertEqual(
+                self.connection.execute(
+                    "SELECT COUNT(*) FROM candidate_evidence "
+                    "WHERE candidate_id=?",
+                    (strict_id,),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                self.connection.execute(
+                    "SELECT value FROM metadata WHERE key=?",
+                    (aggregate_key,),
+                ).fetchone()["value"],
+                max_count_raw,
+            )
+            self.assertEqual(
+                self.connection.execute(
+                    "SELECT value FROM metadata "
+                    "WHERE key='last_maintenance_at'"
+                ).fetchone()["value"],
+                maintenance_marker,
+            )
+        self.connection.execute(
+            "DELETE FROM metadata WHERE key=?", (aggregate_key,)
+        )
+
+        evidence = self.connection.execute(
+            """
+            SELECT review_item_id,session_key
+            FROM candidate_evidence WHERE candidate_id=?
+            """,
+            (strict_id,),
+        ).fetchone()
+        review_item_id = int(evidence["review_item_id"])
+        session_key = str(evidence["session_key"])
+        mismatch_due = strict_due + 1
+        mismatch_expiry = self.runtime.iso_utc(mismatch_due)
+        future_expiry = self.runtime.iso_utc(
+            mismatch_due + 365 * 86_400
+        )
+        self.connection.execute(
+            """
+            UPDATE candidates
+            SET status='proposed',updated_at=?
+            WHERE id=?
+            """,
+            (self.runtime.iso_utc(mismatch_due), strict_id),
+        )
+        self.connection.execute(
+            """
+            UPDATE review_items
+            SET dedupe_expires_at=CASE WHEN id=? THEN ? ELSE ? END
+            """,
+            (review_item_id, mismatch_expiry, future_expiry),
+        )
+        link_key = self.runtime.candidate_session_link_key(
+            self.installation, session_key
+        )
+        valid_link = self.runtime.canonical_json_bytes(
+            self.runtime.candidate_session_link_value(
+                strict_id, mismatch_expiry
+            )
+        ).decode("utf-8")
+        self.connection.execute(
+            "UPDATE metadata SET value=? WHERE key=?",
+            (valid_link, link_key),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO metadata(key,value)
+            VALUES('last_maintenance_at',?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (maintenance_marker,),
+        )
+
+        def assert_mismatch() -> None:
+            with self.assertRaisesRegex(
+                ValueError, "^candidate_maintenance_mismatch$"
+            ):
+                self.runtime.run_maintenance(
+                    self.connection,
+                    self.installation,
+                    self.config,
+                    mismatch_due,
+                )
+            self.assertIsNotNone(
+                self.connection.execute(
+                    "SELECT id FROM review_items WHERE id=?",
+                    (review_item_id,),
+                ).fetchone()
+            )
+            self.assertEqual(
+                self.connection.execute(
+                    "SELECT COUNT(*) FROM candidate_evidence "
+                    "WHERE review_item_id=?",
+                    (review_item_id,),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                self.connection.execute(
+                    "SELECT value FROM metadata "
+                    "WHERE key='last_maintenance_at'"
+                ).fetchone()["value"],
+                maintenance_marker,
+            )
+
+        wrong_session = "e" * 64
+        self.connection.execute(
+            """
+            UPDATE candidate_evidence SET session_key=?
+            WHERE candidate_id=?
+            """,
+            (wrong_session, strict_id),
+        )
+        with self.subTest(maintenance_mismatch="evidence-session"):
+            assert_mismatch()
+        self.connection.execute(
+            """
+            UPDATE candidate_evidence SET session_key=?
+            WHERE candidate_id=?
+            """,
+            (session_key, strict_id),
+        )
+
+        self.connection.execute(
+            "DELETE FROM metadata WHERE key=?", (link_key,)
+        )
+        with self.subTest(maintenance_mismatch="missing-link"):
+            assert_mismatch()
+        self.connection.execute(
+            "INSERT INTO metadata(key,value) VALUES(?,?)",
+            (link_key, valid_link),
+        )
+
+        wrong_link = self.runtime.canonical_json_bytes(
+            self.runtime.candidate_session_link_value(
+                candidate_id, mismatch_expiry
+            )
+        ).decode("utf-8")
+        self.connection.execute(
+            "UPDATE metadata SET value=? WHERE key=?",
+            (wrong_link, link_key),
+        )
+        with self.subTest(maintenance_mismatch="candidate-link"):
+            assert_mismatch()
+
+        earlier_expiry_link = self.runtime.canonical_json_bytes(
+            self.runtime.candidate_session_link_value(
+                strict_id,
+                self.runtime.iso_utc(mismatch_due - 1),
+            )
+        ).decode("utf-8")
+        self.connection.execute(
+            "UPDATE metadata SET value=? WHERE key=?",
+            (earlier_expiry_link, link_key),
+        )
+        with self.subTest(maintenance_mismatch="link-expiry"):
+            assert_mismatch()
+        later_expiry_link = self.runtime.canonical_json_bytes(
+            self.runtime.candidate_session_link_value(
+                strict_id,
+                self.runtime.iso_utc(mismatch_due + 1),
+            )
+        ).decode("utf-8")
+        self.connection.execute(
+            "UPDATE metadata SET value=? WHERE key=?",
+            (later_expiry_link, link_key),
+        )
+
+        completed = self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            mismatch_due,
+        )
+        self.assertEqual(completed["dedupe_deleted"], 1)
+        self.assertEqual(
+            completed["candidate_session_links_deleted"], 1
+        )
+        self.assertIsNone(
+            self.connection.execute(
+                "SELECT id FROM review_items WHERE id=?",
+                (review_item_id,),
+            ).fetchone()
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM candidate_evidence "
+                "WHERE candidate_id=?",
+                (strict_id,),
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.runtime.load_candidate_evidence_aggregate(
+                self.connection, strict_id
+            )["counts"],
+            [
+                {
+                    "signal_type": "explicit_correction",
+                    "source_kind": "user_direct",
+                    "count": 1,
+                }
+            ],
         )

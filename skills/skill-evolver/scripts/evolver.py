@@ -1605,7 +1605,17 @@ DEFAULTS = {
     "max_candidates_per_batch": 3,
     "lease_seconds": 600,
     "lease_heartbeat_seconds": 60,
+    "deferred_to_stale_days": 30,
+    "rejected_tombstone_days": 90,
+    "terminal_candidate_retention_days": 90,
 }
+LEGACY_OPTIONAL_CONFIG_KEYS = frozenset(
+    {
+        "deferred_to_stale_days",
+        "rejected_tombstone_days",
+        "terminal_candidate_retention_days",
+    }
+)
 HARD_LIMITS = {
     "spool_limit_files": 200,
     "spool_limit_bytes": 10_485_760,
@@ -1755,6 +1765,9 @@ class Config:
     max_candidates_per_batch: int
     lease_seconds: int
     lease_heartbeat_seconds: int
+    deferred_to_stale_days: int
+    rejected_tombstone_days: int
+    terminal_candidate_retention_days: int
 
 
 @dataclass(frozen=True)
@@ -3336,6 +3349,290 @@ def candidate_evidence_aggregate_key(candidate_id: object) -> str:
 
 
 CANDIDATE_SESSION_LINK_MAX_BYTES = 512
+CANDIDATE_EVIDENCE_AGGREGATE_MAX_BYTES = 4_096
+CANDIDATE_REDACTION_VALUE_MAX_BYTES = 4_096
+
+
+def redacted_marker(value: object) -> str:
+    if type(value) is not str or not value:
+        raise ValueError("invalid_candidate_redaction_value")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(
+            "invalid_candidate_redaction_value"
+        ) from None
+    if len(encoded) > CANDIDATE_REDACTION_VALUE_MAX_BYTES:
+        raise ValueError("invalid_candidate_redaction_value")
+    return f"redacted:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def load_candidate_evidence_aggregate(
+    connection: sqlite3.Connection,
+    candidate_id: int,
+) -> dict[str, object]:
+    key = candidate_evidence_aggregate_key(candidate_id)
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key=?", (key,)
+    ).fetchone()
+    if row is None:
+        return {
+            "schema_version": 1,
+            "counts": [],
+            "updated_at": None,
+        }
+    raw = row["value"]
+    if type(raw) is not str:
+        raise ValueError("invalid_candidate_evidence_aggregate")
+    try:
+        encoded = raw.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(
+            "invalid_candidate_evidence_aggregate"
+        ) from None
+    if len(encoded) > CANDIDATE_EVIDENCE_AGGREGATE_MAX_BYTES:
+        raise ValueError("invalid_candidate_evidence_aggregate")
+    try:
+        payload = _load_declarative_result_json(encoded)
+        canonical = canonical_json_bytes(payload)
+    except (UnicodeError, ValueError):
+        raise ValueError(
+            "invalid_candidate_evidence_aggregate"
+        ) from None
+    if (
+        type(payload) is not dict
+        or set(payload)
+        != {"schema_version", "counts", "updated_at"}
+        or type(payload.get("schema_version")) is not int
+        or payload["schema_version"] != 1
+        or type(payload.get("counts")) is not list
+        or not payload["counts"]
+        or len(payload["counts"]) > len(SIGNAL_SOURCE_PAIRS)
+        or type(payload.get("updated_at")) is not str
+        or canonical != encoded
+    ):
+        raise ValueError("invalid_candidate_evidence_aggregate")
+    try:
+        parse_iso_utc(payload["updated_at"])
+    except ValueError:
+        raise ValueError(
+            "invalid_candidate_evidence_aggregate"
+        ) from None
+    pairs: list[tuple[str, str]] = []
+    total = 0
+    for item in payload["counts"]:
+        if (
+            type(item) is not dict
+            or set(item)
+            != {"signal_type", "source_kind", "count"}
+            or type(item.get("signal_type")) is not str
+            or type(item.get("source_kind")) is not str
+            or (
+                item["signal_type"],
+                item["source_kind"],
+            )
+            not in SIGNAL_SOURCE_PAIRS
+            or type(item.get("count")) is not int
+            or not 1 <= item["count"] <= SQLITE_INTEGER_MAX
+            or total > SQLITE_INTEGER_MAX - item["count"]
+        ):
+            raise ValueError(
+                "invalid_candidate_evidence_aggregate"
+            )
+        pairs.append(
+            (item["signal_type"], item["source_kind"])
+        )
+        total += item["count"]
+    if pairs != sorted(pairs) or len(pairs) != len(set(pairs)):
+        raise ValueError("invalid_candidate_evidence_aggregate")
+    return payload
+
+
+def merge_candidate_evidence_aggregate(
+    connection: sqlite3.Connection,
+    candidate_id: int,
+    counts: dict[tuple[str, str], int],
+    now: float,
+) -> None:
+    if not connection.in_transaction:
+        raise ValueError("active_review_transaction_required")
+    current = load_candidate_evidence_aggregate(
+        connection, candidate_id
+    )
+    merged = {
+        (item["signal_type"], item["source_kind"]): item["count"]
+        for item in current["counts"]
+    }
+    if type(counts) is not dict or not counts:
+        raise ValueError("invalid_candidate_evidence_aggregate")
+    for pair, count in counts.items():
+        if (
+            type(pair) is not tuple
+            or len(pair) != 2
+            or any(type(value) is not str for value in pair)
+            or pair not in SIGNAL_SOURCE_PAIRS
+            or type(count) is not int
+            or not 1 <= count <= SQLITE_INTEGER_MAX
+        ):
+            raise ValueError(
+                "invalid_candidate_evidence_aggregate"
+            )
+        total = merged.get(pair, 0) + count
+        if total > SQLITE_INTEGER_MAX:
+            raise ValueError(
+                "invalid_candidate_evidence_aggregate"
+            )
+        merged[pair] = total
+    if sum(merged.values()) > SQLITE_INTEGER_MAX:
+        raise ValueError("invalid_candidate_evidence_aggregate")
+    payload = {
+        "schema_version": 1,
+        "counts": [
+            {
+                "signal_type": signal_type,
+                "source_kind": source_kind,
+                "count": count,
+            }
+            for (signal_type, source_kind), count in sorted(
+                merged.items()
+            )
+        ],
+        "updated_at": iso_utc(now),
+    }
+    encoded = canonical_json_bytes(payload)
+    if len(encoded) > CANDIDATE_EVIDENCE_AGGREGATE_MAX_BYTES:
+        raise ValueError("invalid_candidate_evidence_aggregate")
+    connection.execute(
+        """
+        INSERT INTO metadata(key,value) VALUES(?,?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (
+            candidate_evidence_aggregate_key(candidate_id),
+            encoded.decode("utf-8"),
+        ),
+    )
+
+
+def require_candidate_evidence_bindings(
+    connection: sqlite3.Connection,
+    installation: Installation,
+    candidate_ids: list[int],
+) -> None:
+    if (
+        not connection.in_transaction
+        or type(installation) is not Installation
+        or type(candidate_ids) is not list
+        or len(candidate_ids) != len(set(candidate_ids))
+        or any(
+            type(candidate_id) is not int
+            or not 1 <= candidate_id <= SQLITE_INTEGER_MAX
+            for candidate_id in candidate_ids
+        )
+    ):
+        raise ValueError("invalid_candidate_maintenance_input")
+    if not candidate_ids:
+        return
+    marks = ",".join("?" for _ in candidate_ids)
+    for row in connection.execute(
+        f"""
+        SELECT evidence.candidate_id,evidence.review_item_id,
+          evidence.session_key AS evidence_session_key,
+          item.session_key AS item_session_key,
+          item.dedupe_expires_at
+        FROM candidate_evidence AS evidence
+        LEFT JOIN review_items AS item
+          ON item.id=evidence.review_item_id
+        WHERE evidence.candidate_id IN ({marks})
+        ORDER BY evidence.rowid
+        """,
+        candidate_ids,
+    ):
+        candidate_id = row["candidate_id"]
+        review_item_id = row["review_item_id"]
+        evidence_session_key = row["evidence_session_key"]
+        item_session_key = row["item_session_key"]
+        dedupe_expires_at = row["dedupe_expires_at"]
+        if (
+            type(candidate_id) is not int
+            or candidate_id not in candidate_ids
+            or type(review_item_id) is not int
+            or type(evidence_session_key) is not str
+            or type(item_session_key) is not str
+            or evidence_session_key != item_session_key
+            or type(dedupe_expires_at) is not str
+            or not _is_iso_utc_string(dedupe_expires_at)
+        ):
+            raise ValueError("candidate_maintenance_mismatch")
+        link = load_candidate_session_link(
+            connection,
+            candidate_session_link_key(
+                installation, evidence_session_key
+            ),
+        )
+        if (
+            link is None
+            or link["candidate_id"] != candidate_id
+            or parse_iso_utc(link["dedupe_expires_at"])
+            < parse_iso_utc(dedupe_expires_at)
+        ):
+            raise ValueError("candidate_maintenance_mismatch")
+
+
+def aggregate_candidate_evidence_rows(
+    connection: sqlite3.Connection,
+    candidate_ids: list[int],
+    now: float,
+) -> int:
+    if (
+        not connection.in_transaction
+        or type(candidate_ids) is not list
+        or len(candidate_ids) != len(set(candidate_ids))
+        or any(
+            type(candidate_id) is not int
+            or not 1 <= candidate_id <= SQLITE_INTEGER_MAX
+            for candidate_id in candidate_ids
+        )
+    ):
+        raise ValueError("invalid_candidate_maintenance_input")
+    if not candidate_ids:
+        return 0
+    marks = ",".join("?" for _ in candidate_ids)
+    grouped: dict[int, dict[tuple[str, str], int]] = {}
+    total = 0
+    for row in connection.execute(
+        f"""
+        SELECT candidate_id,signal_type,source_kind,COUNT(*) AS count
+        FROM candidate_evidence
+        WHERE candidate_id IN ({marks})
+        GROUP BY candidate_id,signal_type,source_kind
+        """,
+        candidate_ids,
+    ):
+        candidate_id = row["candidate_id"]
+        pair = (row["signal_type"], row["source_kind"])
+        count = row["count"]
+        if (
+            type(candidate_id) is not int
+            or candidate_id not in candidate_ids
+            or type(pair[0]) is not str
+            or type(pair[1]) is not str
+            or type(count) is not int
+            or count < 1
+        ):
+            raise ValueError(
+                "invalid_candidate_evidence_aggregate"
+            )
+        grouped.setdefault(candidate_id, {})[pair] = count
+        total += count
+    for candidate_id, counts in grouped.items():
+        merge_candidate_evidence_aggregate(
+            connection,
+            candidate_id,
+            counts,
+            now,
+        )
+    return total
 
 
 class _CandidateResultRetry(Exception):
@@ -3879,21 +4176,21 @@ def commit_review_result(
                     connection, item, now
                 )
                 inserted_evidence = 0
-                for evidence in result["evidence"]:
-                    inserted_evidence += int(
-                        record_candidate_evidence(
-                            connection,
-                            candidate_id,
-                            session["review_item_id"],
-                            owner_digest,
-                            session["expected_generation"],
-                            evidence["signal_type"],
-                            evidence["source_kind"],
-                            evidence["summary"],
-                            now,
-                        )
-                    )
                 if item["link"] is None:
+                    for evidence in result["evidence"]:
+                        inserted_evidence += int(
+                            record_candidate_evidence(
+                                connection,
+                                candidate_id,
+                                session["review_item_id"],
+                                owner_digest,
+                                session["expected_generation"],
+                                evidence["signal_type"],
+                                evidence["source_kind"],
+                                evidence["summary"],
+                                now,
+                            )
+                        )
                     if inserted_evidence < 1:
                         raise ValueError(
                             "candidate_evidence_required"
@@ -5760,8 +6057,21 @@ def load_installation(path: Path) -> Installation:
 def load_config(installation: Installation) -> Config:
     payload = json.loads(installation.config_path.read_text(encoding="utf-8"))
     allowed = set(DEFAULTS) | {"capture_paused", "exclude_roots"}
-    if not isinstance(payload, dict) or set(payload) != allowed:
+    keys = set(payload) if isinstance(payload, dict) else set()
+    required = allowed - LEGACY_OPTIONAL_CONFIG_KEYS
+    if (
+        not isinstance(payload, dict)
+        or not required.issubset(keys)
+        or not keys.issubset(allowed)
+    ):
         raise ValueError("invalid_config_keys")
+    payload = {
+        **{
+            key: DEFAULTS[key]
+            for key in LEGACY_OPTIONAL_CONFIG_KEYS
+        },
+        **payload,
+    }
     paused = payload["capture_paused"]
     if type(paused) is not bool:
         raise ValueError("invalid_config_capture_paused")
@@ -7785,26 +8095,375 @@ def run_maintenance(
             """,
             (iso_utc(now), iso_utc(now), iso_utc(now)),
         ).rowcount
-        dedupe_cutoff = iso_utc(now)
-        connection.execute(
-            """
-            DELETE FROM candidate_evidence
-            WHERE session_key IN (
-              SELECT session_key FROM review_items
-              WHERE dedupe_expires_at <= ?
-                AND status NOT IN ('pending','reviewing')
-            )
-            """,
-            (dedupe_cutoff,),
+
+        stale_cutoff = iso_utc(
+            now - config.deferred_to_stale_days * 86_400
         )
-        dedupe_deleted = connection.execute(
-            """
-            DELETE FROM review_items
-            WHERE dedupe_expires_at <= ?
-              AND status NOT IN ('pending','reviewing')
-            """,
-            (dedupe_cutoff,),
-        ).rowcount
+        stale_rows = list(
+            connection.execute(
+                """
+                SELECT id,tombstone_until FROM candidates
+                WHERE status='deferred' AND updated_at<=?
+                ORDER BY updated_at,id
+                LIMIT ?
+                """,
+                (
+                    stale_cutoff,
+                    REVIEW_MAINTENANCE_BATCH_MAX,
+                ),
+            )
+        )
+        if any(
+            row["tombstone_until"] is not None
+            for row in stale_rows
+        ):
+            raise ValueError("candidate_maintenance_state_corrupt")
+        stale_ids = [int(row["id"]) for row in stale_rows]
+        if stale_ids:
+            marks = ",".join("?" for _ in stale_ids)
+            candidates_staled = connection.execute(
+                f"""
+                UPDATE candidates
+                SET status='stale',updated_at=?
+                WHERE id IN ({marks}) AND status='deferred'
+                """,
+                (iso_utc(now), *stale_ids),
+            ).rowcount
+            if candidates_staled != len(stale_ids):
+                raise sqlite3.IntegrityError(
+                    "candidate_stale_transition_race"
+                )
+        else:
+            candidates_staled = 0
+
+        terminal_cutoff = iso_utc(
+            now
+            - config.terminal_candidate_retention_days * 86_400
+        )
+        terminal_rows = list(
+            connection.execute(
+                """
+                SELECT id,status,tombstone_until,target_path,
+                  target_locator,proposal_intent,problem_summary,
+                  proposal_summary,validation_plan,risk_level
+                FROM candidates
+                WHERE status IN ('rejected','stale')
+                  AND updated_at<=?
+                  AND (
+                    target_path IS NOT NULL
+                    OR EXISTS(
+                      SELECT 1 FROM candidate_evidence AS evidence
+                      WHERE evidence.candidate_id=candidates.id
+                    )
+                  )
+                ORDER BY updated_at,id
+                LIMIT ?
+                """,
+                (
+                    terminal_cutoff,
+                    REVIEW_MAINTENANCE_BATCH_MAX,
+                ),
+            )
+        )
+        terminal_candidate_ids = [
+            int(row["id"]) for row in terminal_rows
+        ]
+        for candidate in terminal_rows:
+            status = candidate["status"]
+            tombstone = candidate["tombstone_until"]
+            if status == "stale":
+                valid_tombstone = tombstone is None
+            else:
+                valid_tombstone = type(tombstone) is str
+                if valid_tombstone:
+                    try:
+                        parse_iso_utc(tombstone)
+                    except ValueError:
+                        valid_tombstone = False
+            if not valid_tombstone:
+                raise ValueError(
+                    "candidate_maintenance_state_corrupt"
+                )
+            if candidate["target_path"] is None and any(
+                type(candidate[name]) is not str
+                or re.fullmatch(
+                    r"redacted:[0-9a-f]{64}", candidate[name]
+                )
+                is None
+                for name in (
+                    "target_locator",
+                    "proposal_intent",
+                    "problem_summary",
+                    "proposal_summary",
+                    "validation_plan",
+                    "risk_level",
+                )
+            ):
+                raise ValueError(
+                    "candidate_maintenance_state_corrupt"
+                )
+        require_candidate_evidence_bindings(
+            connection,
+            installation,
+            terminal_candidate_ids,
+        )
+        terminal_evidence_aggregated = (
+            aggregate_candidate_evidence_rows(
+                connection,
+                terminal_candidate_ids,
+                now,
+            )
+        )
+        if terminal_candidate_ids:
+            marks = ",".join(
+                "?" for _ in terminal_candidate_ids
+            )
+            evidence_deleted = connection.execute(
+                f"""
+                DELETE FROM candidate_evidence
+                WHERE candidate_id IN ({marks})
+                """,
+                terminal_candidate_ids,
+            ).rowcount
+            if evidence_deleted != terminal_evidence_aggregated:
+                raise sqlite3.IntegrityError(
+                    "terminal_candidate_evidence_purge_race"
+                )
+        candidate_text_redacted = 0
+        for candidate in terminal_rows:
+            if candidate["target_path"] is None:
+                continue
+            redacted_marker(candidate["target_path"])
+            markers = [
+                redacted_marker(candidate[name])
+                for name in (
+                    "target_locator",
+                    "proposal_intent",
+                    "problem_summary",
+                    "proposal_summary",
+                    "validation_plan",
+                    "risk_level",
+                )
+            ]
+            changed = connection.execute(
+                """
+                UPDATE candidates
+                SET target_path=NULL,target_locator=?,proposal_intent=?,
+                    problem_summary=?,proposal_summary=?,
+                    validation_plan=?,risk_level=?
+                WHERE id=? AND target_path IS NOT NULL
+                  AND status IN ('rejected','stale')
+                """,
+                (*markers, int(candidate["id"])),
+            ).rowcount
+            if changed != 1:
+                raise sqlite3.IntegrityError(
+                    "terminal_candidate_redaction_race"
+                )
+            candidate_text_redacted += 1
+        if terminal_candidate_ids:
+            marks = ",".join(
+                "?" for _ in terminal_candidate_ids
+            )
+            if connection.execute(
+                f"""
+                SELECT EXISTS(
+                  SELECT 1 FROM candidate_evidence
+                  WHERE candidate_id IN ({marks})
+                )
+                """,
+                terminal_candidate_ids,
+            ).fetchone()[0]:
+                raise sqlite3.IntegrityError(
+                    "terminal_candidate_evidence_retained"
+                )
+
+        dedupe_cutoff = iso_utc(now)
+        expiring_sessions = list(
+            connection.execute(
+                """
+                SELECT id,session_key,dedupe_expires_at
+                FROM review_items
+                WHERE dedupe_expires_at<=?
+                  AND status NOT IN ('pending','reviewing')
+                ORDER BY dedupe_expires_at,id
+                LIMIT ?
+                """,
+                (
+                    dedupe_cutoff,
+                    REVIEW_MAINTENANCE_BATCH_MAX,
+                ),
+            )
+        )
+        expiring_ids: list[int] = []
+        expiring_keys: list[str] = []
+        expiry_by_id: dict[int, str] = {}
+        session_by_id: dict[int, str] = {}
+        for row in expiring_sessions:
+            review_item_id = row["id"]
+            session_key_value = row["session_key"]
+            expiry = row["dedupe_expires_at"]
+            if (
+                type(review_item_id) is not int
+                or review_item_id < 1
+                or type(session_key_value) is not str
+                or not _is_lower_hex(session_key_value, 64)
+                or type(expiry) is not str
+                or not _is_iso_utc_string(expiry)
+                or review_item_id in session_by_id
+                or session_key_value in expiring_keys
+            ):
+                raise ValueError("candidate_maintenance_mismatch")
+            expiring_ids.append(review_item_id)
+            expiring_keys.append(session_key_value)
+            session_by_id[review_item_id] = session_key_value
+            expiry_by_id[review_item_id] = expiry
+
+        evidence_rows: list[sqlite3.Row] = []
+        if expiring_ids:
+            id_marks = ",".join("?" for _ in expiring_ids)
+            key_marks = ",".join("?" for _ in expiring_keys)
+            evidence_rows = list(
+                connection.execute(
+                    f"""
+                    SELECT rowid AS evidence_rowid,candidate_id,
+                      review_item_id,session_key,signal_type,source_kind
+                    FROM candidate_evidence
+                    WHERE review_item_id IN ({id_marks})
+                       OR session_key IN ({key_marks})
+                    ORDER BY rowid
+                    """,
+                    (*expiring_ids, *expiring_keys),
+                )
+            )
+        grouped_counts: dict[
+            int, dict[tuple[str, str], int]
+        ] = {}
+        candidates_by_session: dict[str, set[int]] = {}
+        evidence_rowids: list[int] = []
+        for evidence in evidence_rows:
+            evidence_rowid = evidence["evidence_rowid"]
+            candidate_id = evidence["candidate_id"]
+            review_item_id = evidence["review_item_id"]
+            session_key_value = evidence["session_key"]
+            pair = (
+                evidence["signal_type"],
+                evidence["source_kind"],
+            )
+            if (
+                type(evidence_rowid) is not int
+                or type(candidate_id) is not int
+                or not 1 <= candidate_id <= SQLITE_INTEGER_MAX
+                or type(review_item_id) is not int
+                or review_item_id not in session_by_id
+                or type(session_key_value) is not str
+                or session_by_id[review_item_id]
+                != session_key_value
+            ):
+                raise ValueError("candidate_maintenance_mismatch")
+            if (
+                type(pair[0]) is not str
+                or type(pair[1]) is not str
+                or pair not in SIGNAL_SOURCE_PAIRS
+            ):
+                raise ValueError(
+                    "invalid_candidate_evidence_aggregate"
+                )
+            counts_by_pair = grouped_counts.setdefault(
+                candidate_id, {}
+            )
+            count = counts_by_pair.get(pair, 0) + 1
+            if count > SQLITE_INTEGER_MAX:
+                raise ValueError(
+                    "invalid_candidate_evidence_aggregate"
+                )
+            counts_by_pair[pair] = count
+            candidates_by_session.setdefault(
+                session_key_value, set()
+            ).add(candidate_id)
+            evidence_rowids.append(evidence_rowid)
+
+        link_keys: list[str] = []
+        links_present: set[str] = set()
+        for review_item_id, session_key_value in zip(
+            expiring_ids, expiring_keys
+        ):
+            link_key = candidate_session_link_key(
+                installation, session_key_value
+            )
+            link_keys.append(link_key)
+            link = load_candidate_session_link(
+                connection, link_key
+            )
+            evidence_candidates = candidates_by_session.get(
+                session_key_value, set()
+            )
+            if link is None:
+                if evidence_candidates:
+                    raise ValueError(
+                        "candidate_maintenance_mismatch"
+                    )
+                continue
+            if parse_iso_utc(link["dedupe_expires_at"]) < parse_iso_utc(
+                expiry_by_id[review_item_id]
+            ):
+                raise ValueError("candidate_maintenance_mismatch")
+            if evidence_candidates != {link["candidate_id"]}:
+                if evidence_candidates:
+                    raise ValueError(
+                        "candidate_maintenance_mismatch"
+                    )
+            links_present.add(link_key)
+
+        for candidate_id, counts_by_pair in grouped_counts.items():
+            merge_candidate_evidence_aggregate(
+                connection, candidate_id, counts_by_pair, now
+            )
+        if evidence_rowids:
+            marks = ",".join("?" for _ in evidence_rowids)
+            evidence_deleted = connection.execute(
+                f"""
+                DELETE FROM candidate_evidence
+                WHERE rowid IN ({marks})
+                """,
+                evidence_rowids,
+            ).rowcount
+            if evidence_deleted != len(evidence_rowids):
+                raise sqlite3.IntegrityError(
+                    "candidate_session_evidence_purge_race"
+                )
+        candidate_session_links_deleted = 0
+        for link_key in link_keys:
+            deleted = connection.execute(
+                "DELETE FROM metadata WHERE key=?",
+                (link_key,),
+            ).rowcount
+            if link_key in links_present and deleted != 1:
+                raise sqlite3.IntegrityError(
+                    "candidate_session_link_purge_race"
+                )
+            if link_key not in links_present and deleted != 0:
+                raise sqlite3.IntegrityError(
+                    "candidate_session_link_purge_race"
+                )
+            candidate_session_links_deleted += deleted
+        if expiring_ids:
+            marks = ",".join("?" for _ in expiring_ids)
+            dedupe_deleted = connection.execute(
+                f"""
+                DELETE FROM review_items
+                WHERE id IN ({marks})
+                  AND status NOT IN ('pending','reviewing')
+                  AND dedupe_expires_at<=?
+                """,
+                (*expiring_ids, dedupe_cutoff),
+            ).rowcount
+            if dedupe_deleted != len(expiring_ids):
+                raise sqlite3.IntegrityError(
+                    "review_item_dedupe_purge_race"
+                )
+        else:
+            dedupe_deleted = 0
         terminal_cutoff = iso_utc(
             now - REVIEW_BATCH_AUDIT_TTL_SECONDS
         )
@@ -7900,6 +8559,14 @@ def run_maintenance(
         "pending_expired": pending_expired,
         "capacity_expired": capacity_expired,
         "raw_redacted": raw_redacted,
+        "candidates_staled": candidates_staled,
+        "terminal_evidence_aggregated": (
+            terminal_evidence_aggregated
+        ),
+        "candidate_text_redacted": candidate_text_redacted,
+        "candidate_session_links_deleted": (
+            candidate_session_links_deleted
+        ),
         "dedupe_deleted": dedupe_deleted,
         "terminal_batches_deleted": terminal_batches_deleted,
         "result_cleanup_failed": result_cleanup_failed,
