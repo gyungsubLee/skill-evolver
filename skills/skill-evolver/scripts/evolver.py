@@ -9219,13 +9219,49 @@ def cmd_review_abort(args: argparse.Namespace) -> int:
 def cmd_catalog_inspect(args: argparse.Namespace) -> int:
     load_installation(Path(args.installation))
     runtime = load_review_runtime()
-    snapshot = build_catalog_snapshot(runtime)
-    entry = resolve_catalog_target(
-        snapshot, str(args.target_identity)
-    )
-    content = inspect_catalog_target(
-        runtime, snapshot, entry.identity
-    )
+    if len(runtime.mutable_skill_roots) != 1:
+        raise CatalogAdapterError("catalog_root_invalid")
+    root = runtime.mutable_skill_roots[0]
+    target_identity = str(args.target_identity)
+    descriptor = _catalog_root_descriptor(root)
+    entry: Optional[CatalogEntry] = None
+    content: Optional[bytes] = None
+    scanned = 0
+    try:
+        with os.scandir(descriptor) as children:
+            for child in children:
+                if child.name in CATALOG_EXCLUDED_NAMES:
+                    continue
+                scanned += 1
+                if scanned > runtime.catalog_max_skills:
+                    raise CatalogAdapterError(
+                        "catalog_inventory_saturated"
+                    )
+                if f"user-skill:{child.name}" != target_identity:
+                    continue
+                try:
+                    entry, content = _read_catalog_entry(
+                        runtime,
+                        root,
+                        descriptor,
+                        child.name,
+                    )
+                except (
+                    CatalogAdapterError,
+                    OSError,
+                    UnicodeError,
+                    ValueError,
+                ):
+                    entry = None
+                    content = None
+    finally:
+        os.close(descriptor)
+    if (
+        entry is None
+        or content is None
+        or entry.identity != target_identity
+    ):
+        raise CatalogAdapterError("catalog_target_unknown")
     write_json_stdout(
         {
             "schema_version": 1,

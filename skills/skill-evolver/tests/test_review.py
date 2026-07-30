@@ -12933,14 +12933,43 @@ class ReviewSurfaceTests(CandidateBatchFixture):
         )
 
     def test_catalog_inspect_returns_one_bound_target(self) -> None:
-        payload = self.capture_handler(
-            self.runtime.cmd_catalog_inspect,
-            argparse.Namespace(
-                installation=str(
-                    self.installation.data_root / "installation.json"
+        sibling = self.skill_root / "sibling-skill"
+        sibling.mkdir(mode=0o700)
+        (sibling / "SKILL.md").write_text(
+            "---\n"
+            "name: Sibling Skill\n"
+            "description: Must remain unread\n"
+            "---\n",
+            encoding="utf-8",
+        )
+        opened_names: list[str] = []
+        read_entry = self.runtime._read_catalog_entry
+
+        def track_entry(*args: object):
+            opened_names.append(str(args[3]))
+            return read_entry(*args)
+
+        with mock.patch.object(
+            self.runtime,
+            "build_catalog_snapshot",
+            side_effect=AssertionError("catalog-wide snapshot"),
+        ), mock.patch.object(
+            self.runtime,
+            "_read_catalog_entry",
+            side_effect=track_entry,
+        ):
+            payload = self.capture_handler(
+                self.runtime.cmd_catalog_inspect,
+                argparse.Namespace(
+                    installation=str(
+                        self.installation.data_root
+                        / "installation.json"
+                    ),
+                    target_identity=self.catalog_entry.identity,
                 ),
-                target_identity=self.catalog_entry.identity,
-            ),
+            )
+        self.assertEqual(
+            opened_names, [self.catalog_entry.skill_dir.name]
         )
         self.assertEqual(
             set(payload),
