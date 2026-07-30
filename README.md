@@ -180,6 +180,24 @@ needs its own fully expanded approval and exact installation data root. The
 inbox records proposals and aggregate evidence; it does not apply a candidate,
 edit an installed skill, stage changes, or create a snapshot.
 
+## Real session quality boundary
+
+`quality-open`, `quality-seal`, and `quality-gate` are separately approved explicit mutations.
+Each requires its own approval for one fully expanded literal command and the
+exact installation data root; approval for one never authorizes another.
+`quality-status` is read-only.
+
+The model may explain sanitized `inspect` output, but it never infers or enters a label.
+Only the user runs a fully expanded `quality-label` command in a user-controlled external terminal.
+The agent never invokes `quality-label`, including through a PTY.
+Give the user a command containing the literal resolved script, installation
+path, and actual candidate display ID. No judgment flags or placeholders are allowed.
+TTY is an attestation boundary, not proof of user identity.
+
+A PASS unlocks only the Phase 6 evaluate-runner spike.
+It does not authorize evaluation, preparation, or apply.
+Synthetic sessions and fixtures never count as real quality evidence.
+
 ## Uninstall
 
 Uninstalling stops new Hook writes but preserves the private inbox:

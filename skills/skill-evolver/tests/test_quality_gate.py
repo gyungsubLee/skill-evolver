@@ -5,6 +5,8 @@ import io
 import json
 import os
 import sqlite3
+import unittest
+from pathlib import Path
 from unittest import mock
 
 from test_review import CandidateBatchFixture
@@ -3279,3 +3281,74 @@ class QualityTerminalGateTests(CandidateBatchFixture):
             ],
             "quality_collection_expired",
         )
+
+
+class QualityBoundaryDocumentationTests(unittest.TestCase):
+    HEADING = "## Real session quality boundary\n"
+
+    def boundary_sections(self) -> list[str]:
+        project = Path(__file__).resolve().parents[3]
+        paths = (
+            project / "README.md",
+            project / "skills" / "skill-evolver" / "SKILL.md",
+        )
+        sections = []
+        for path in paths:
+            text = path.read_text(encoding="utf-8")
+            self.assertEqual(text.count(self.HEADING), 1)
+            section = text.split(
+                self.HEADING, 1
+            )[1].split("\n## ", 1)[0]
+            sections.append(" ".join(section.split()))
+        return sections
+
+    def test_real_quality_boundary_is_explicit_in_skill_and_readme(
+        self,
+    ) -> None:
+        required = (
+            "`quality-open`, `quality-seal`, and `quality-gate` are "
+            "separately approved explicit mutations.",
+            "Each requires its own approval for one fully expanded "
+            "literal command and the exact installation data root; "
+            "approval for one never authorizes another.",
+            "`quality-status` is read-only.",
+            "The model may explain sanitized `inspect` output, but it "
+            "never infers or enters a label.",
+            "Only the user runs a fully expanded `quality-label` command "
+            "in a user-controlled external terminal.",
+            "The agent never invokes `quality-label`, including through "
+            "a PTY.",
+            "Give the user a command containing the literal resolved "
+            "script, installation path, and actual candidate display "
+            "ID.",
+            "TTY is an attestation boundary, not proof of user identity.",
+            "A PASS unlocks only the Phase 6 evaluate-runner spike.",
+            "It does not authorize evaluation, preparation, or apply.",
+            "Synthetic sessions and fixtures never count as real quality "
+            "evidence.",
+            "No judgment flags or placeholders are allowed.",
+        )
+        for section in self.boundary_sections():
+            for phrase in required:
+                with self.subTest(phrase=phrase):
+                    self.assertIn(phrase, section)
+
+    def test_quality_boundary_has_no_judgment_flags_or_placeholders(
+        self,
+    ) -> None:
+        forbidden = (
+            "--evaluation-worthy",
+            "--target-correct",
+            "--external-content-adoption",
+            "PATH",
+            "C-NNN",
+            "...",
+            "…",
+            "${",
+            "$(",
+            "<candidate",
+        )
+        for section in self.boundary_sections():
+            for value in forbidden:
+                with self.subTest(value=value):
+                    self.assertNotIn(value, section)

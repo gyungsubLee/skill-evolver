@@ -117,6 +117,24 @@ terminal state.
 Do not quote transcript text in summaries. Use only the documented signal and
 exclusion enums. Never call a model from Python. Never apply a candidate.
 
+## Real session quality boundary
+
+`quality-open`, `quality-seal`, and `quality-gate` are separately approved explicit mutations.
+Each requires its own approval for one fully expanded literal command and the
+exact installation data root; approval for one never authorizes another.
+`quality-status` is read-only.
+
+The model may explain sanitized `inspect` output, but it never infers or enters a label.
+Only the user runs a fully expanded `quality-label` command in a user-controlled external terminal.
+The agent never invokes `quality-label`, including through a PTY.
+Give the user a command containing the literal resolved script, installation
+path, and actual candidate display ID. No judgment flags or placeholders are allowed.
+TTY is an attestation boundary, not proof of user identity.
+
+A PASS unlocks only the Phase 6 evaluate-runner spike.
+It does not authorize evaluation, preparation, or apply.
+Synthetic sessions and fixtures never count as real quality evidence.
+
 ## Explicit inbox mutations
 
 Use the exact candidate display ID returned by Python. `defer` accepts only a
