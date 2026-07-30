@@ -13554,6 +13554,7 @@ class ReviewSurfaceTests(CandidateBatchFixture):
                 "review-heartbeat",
                 "review-commit",
                 "review-abort",
+                "quality-open",
                 "catalog-inspect",
                 "inspect",
                 "defer",

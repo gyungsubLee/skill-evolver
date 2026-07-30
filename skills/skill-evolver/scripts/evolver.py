@@ -30,8 +30,21 @@ MAX_HOOK_BYTES = 65_536
 SQLITE_INTEGER_MAX = 9_223_372_036_854_775_807
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
+PLUGIN_ROOT = SKILL_ROOT.parents[1]
 RUNTIME_REFERENCE_PATH = SKILL_ROOT / "references/runtime.json"
 POLICY_PATH = SKILL_ROOT / "references/improvement-policy.md"
+PHASE4_RELEASE_REPORT_PATH = (
+    PLUGIN_ROOT / "docs/release-reports/review-inbox.json"
+)
+PHASE3_RELEASE_REPORT_PATH = (
+    PLUGIN_ROOT / "docs/release-reports/runtime-queue.json"
+)
+PHASE4_RELEASE_REPORT_SHA256 = (
+    "54a329aed87df395a8594a5758ec0e831840f15dbc7f8d7745b9d148f646fdaa"
+)
+PHASE4_IMPLEMENTATION_COMMIT = (
+    "5fadf3a193c3445a6f14eb8eb654b5da8f561f5d"
+)
 
 REVIEW_BATCH_SESSIONS_MAX = 5
 TRANSCRIPT_SESSION_MAX_BYTES = 2_097_152
@@ -61,6 +74,38 @@ REVIEW_RESULT_TTL_SECONDS = 3_600
 REVIEW_BATCH_AUDIT_TTL_SECONDS = 90 * 86_400
 REVIEW_MAINTENANCE_BATCH_MAX = 200
 CANDIDATE_TERMINAL_MAX_DAYS = 90
+QUALITY_EPOCH_MAX = 8
+QUALITY_OBSERVATION_MAX = 100
+QUALITY_EPOCH_MAX_BYTES = 16_384
+QUALITY_OBSERVATION_MAX_BYTES = 8_192
+QUALITY_SOURCE_MAX_BYTES = 1_048_576
+QUALITY_PHASE4_REPORT_MAX_BYTES = 16_384
+QUALITY_COLLECTION_TTL_SECONDS = 30 * 86_400
+QUALITY_SEALED_TTL_SECONDS = 14 * 86_400
+QUALITY_PRIVATE_TTL_SECONDS = 180 * 86_400
+QUALITY_ACTIVE_EPOCH_KEY = "quality.active_epoch"
+QUALITY_NEXT_EPOCH_KEY = "quality.next_epoch_id"
+REVIEW_NEXT_BATCH_ID_KEY = "review.next_batch_id"
+QUALITY_INVALID_REASONS = frozenset(
+    {
+        "quality_observation_capacity",
+        "quality_provenance_drift",
+    }
+)
+QUALITY_PROVENANCE_FIELDS = (
+    "phase4_report_digest",
+    "runtime_digest",
+    "quality_contract_digest",
+    "identity_key_fingerprint",
+    "policy_digest",
+    "transcript_adapter_digest",
+    "catalog_adapter_digest",
+)
+QUALITY_RETRY_CHANGE_FIELDS = tuple(
+    name
+    for name in QUALITY_PROVENANCE_FIELDS
+    if name != "phase4_report_digest"
+)
 
 
 @dataclass(frozen=True)
@@ -101,6 +146,61 @@ def review_audit_key(batch_id: int) -> str:
     if type(batch_id) is not int or batch_id < 1:
         raise ValueError("invalid_review_batch_id")
     return f"review.batch.{batch_id}.audit"
+
+
+def next_review_batch_id(
+    connection: sqlite3.Connection,
+    *,
+    initialize: bool,
+) -> int:
+    maximum = int(
+        connection.execute(
+            "SELECT COALESCE(MAX(id),0) FROM review_batches"
+        ).fetchone()[0]
+    )
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key=?",
+        (REVIEW_NEXT_BATCH_ID_KEY,),
+    ).fetchone()
+    if row is None:
+        active = connection.execute(
+            "SELECT 1 FROM metadata WHERE key=?",
+            (QUALITY_ACTIVE_EPOCH_KEY,),
+        ).fetchone()
+        lineage = connection.execute(
+            """
+            SELECT 1 FROM metadata
+            WHERE key GLOB 'quality.epoch.*'
+              AND key NOT GLOB '*.batch.*'
+              AND key NOT GLOB '*.label.*'
+            LIMIT 1
+            """
+        ).fetchone()
+        if active is not None or lineage is not None:
+            raise ValueError("review_batch_sequence_missing")
+        next_id = maximum + 1
+        if initialize:
+            connection.execute(
+                "INSERT INTO metadata(key,value) VALUES(?,?)",
+                (REVIEW_NEXT_BATCH_ID_KEY, str(next_id)),
+            )
+    else:
+        raw = row["value"]
+        if (
+            type(raw) is not str
+            or re.fullmatch(r"[1-9][0-9]*", raw) is None
+            or len(raw) > 19
+        ):
+            raise ValueError("invalid_review_batch_sequence")
+        next_id = int(raw)
+    if (
+        not maximum < next_id <= SQLITE_INTEGER_MAX
+        or str(next_id) != (
+            str(row["value"]) if row is not None else str(next_id)
+        )
+    ):
+        raise ValueError("invalid_review_batch_sequence")
+    return next_id
 
 
 SEED_CONTRACT_KEYS = frozenset(
@@ -480,15 +580,28 @@ def _prepare_review_batch(
             return prepared
         owner_token = secrets.token_hex(32)
         owner_digest = review_owner_digest(installation, owner_token)
-        batch_id = int(
-            connection.execute(
-                """
-                INSERT INTO review_batches(status,started_at)
-                VALUES('preparing',?)
-                """,
-                (iso_utc(now),),
-            ).lastrowid
+        batch_id = next_review_batch_id(
+            connection, initialize=True
         )
+        connection.execute(
+            """
+            INSERT INTO review_batches(id,status,started_at)
+            VALUES(?,'preparing',?)
+            """,
+            (batch_id, iso_utc(now)),
+        )
+        connection.execute(
+            "UPDATE metadata SET value=? WHERE key=? AND value=?",
+            (
+                str(batch_id + 1),
+                REVIEW_NEXT_BATCH_ID_KEY,
+                str(batch_id),
+            ),
+        )
+        if connection.execute("SELECT changes()").fetchone()[0] != 1:
+            raise sqlite3.IntegrityError(
+                "review_batch_sequence_race"
+            )
         claims: list[dict[str, object]] = []
         sessions: list[dict[str, object]] = []
         for row in rows:
@@ -4311,6 +4424,1101 @@ def current_review_digests(
     }
 
 
+QUALITY_EPOCH_KEYS = frozenset(
+    {
+        "schema_version",
+        "epoch_id",
+        "state",
+        "started_at",
+        "collection_expires_at",
+        "first_batch_id",
+        "predecessor",
+        *QUALITY_PROVENANCE_FIELDS,
+        "invalid_reason",
+        "invalidated_at",
+        "sealed",
+        "terminal",
+        "ended_at",
+    }
+)
+QUALITY_OBSERVATION_KEYS = frozenset(
+    {
+        "schema_version",
+        "epoch_id",
+        "batch_id",
+        "audit_digest",
+        "policy_digest",
+        "transcript_adapter_digest",
+        "catalog_adapter_digest",
+        "catalog_snapshot_digest",
+        "decisions",
+        "finished_at",
+    }
+)
+
+
+def parse_quality_epoch_display_id(value: object) -> int:
+    if type(value) is not str:
+        raise ValueError("invalid_quality_epoch_id")
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError:
+        raise ValueError("invalid_quality_epoch_id") from None
+    if (
+        re.fullmatch(
+            r"Q-(?:00[1-9]|0[1-9][0-9]|[1-9][0-9]{2,})",
+            value,
+        )
+        is None
+        or len(encoded) > 32
+    ):
+        raise ValueError("invalid_quality_epoch_id")
+    epoch_id = int(value[2:])
+    if (
+        epoch_id > QUALITY_EPOCH_MAX
+        or display_id("Q", epoch_id) != value
+    ):
+        raise ValueError("invalid_quality_epoch_id")
+    return epoch_id
+
+
+def quality_epoch_key(epoch_id: object) -> str:
+    number = parse_quality_epoch_display_id(epoch_id)
+    return f"quality.epoch.{display_id('Q', number)}"
+
+
+def quality_observation_key(
+    epoch_id: object, batch_id: object
+) -> str:
+    number = parse_quality_epoch_display_id(epoch_id)
+    if (
+        type(batch_id) is not int
+        or not 1 <= batch_id <= SQLITE_INTEGER_MAX
+    ):
+        raise ValueError("invalid_review_batch_id")
+    return (
+        f"quality.epoch.{display_id('Q', number)}"
+        f".batch.{batch_id}"
+    )
+
+
+def _read_quality_source(
+    path: Path,
+    maximum: int,
+    error_code: str,
+    *,
+    required_mode: Optional[int] = None,
+) -> bytes:
+    if (
+        not isinstance(path, Path)
+        or not path.is_absolute()
+        or type(maximum) is not int
+        or maximum < 1
+        or type(error_code) is not str
+        or not error_code
+        or (
+            required_mode is not None
+            and (
+                type(required_mode) is not int
+                or not 0 <= required_mode <= 0o777
+            )
+        )
+    ):
+        raise ValueError(error_code)
+
+    def valid(info: os.stat_result) -> bool:
+        return (
+            stat.S_ISREG(info.st_mode)
+            and info.st_uid == os.getuid()
+            and info.st_size <= maximum
+            and (
+                required_mode is None
+                or (
+                    stat.S_IMODE(info.st_mode) == required_mode
+                    and info.st_nlink == 1
+                )
+            )
+        )
+
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            str(path),
+            os.O_RDONLY
+            | os.O_NONBLOCK
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        before = os.fstat(descriptor)
+        if not valid(before):
+            raise ValueError(error_code)
+        chunks: list[bytes] = []
+        remaining = maximum + 1
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        encoded = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (
+            len(encoded) > maximum
+            or not valid(after)
+            or (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+        ):
+            raise ValueError(error_code)
+        return encoded
+    except (OSError, RuntimeError):
+        raise ValueError(error_code) from None
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def phase4_release_report_digest() -> str:
+    encoded = _read_quality_source(
+        PHASE4_RELEASE_REPORT_PATH,
+        QUALITY_PHASE4_REPORT_MAX_BYTES,
+        "invalid_phase4_release_report",
+    )
+    try:
+        report = _load_declarative_result_json(encoded)
+    except ValueError:
+        raise ValueError("invalid_phase4_release_report") from None
+    if not isinstance(report, dict):
+        raise ValueError("invalid_phase4_release_report")
+    checks = report.get("checks")
+    upstream = report.get("upstream")
+    digests = report.get("digests")
+    production = report.get("production_sha256")
+    tests = report.get("tests")
+    reviews = report.get("independent_reviews")
+    expected_production = {
+        "skill-evolver/README.md",
+        "skill-evolver/skills/skill-evolver/SKILL.md",
+        "skill-evolver/skills/skill-evolver/references/runtime.json",
+        (
+            "skill-evolver/skills/skill-evolver/references/"
+            "improvement-policy.md"
+        ),
+        "skill-evolver/skills/skill-evolver/scripts/evolver.py",
+        "skill-evolver/skills/skill-evolver/tests/test_capture.py",
+        "skill-evolver/skills/skill-evolver/tests/test_review.py",
+        "skill-evolver/hooks/hooks.json",
+        "skill-evolver/.codex-plugin/plugin.json",
+        ".agents/plugins/marketplace.json",
+    }
+    expected_checks = {
+        "explicit_review_only",
+        "exact_session_result_coverage",
+        "frozen_generation_revalidated",
+        "static_and_dynamic_digests_revalidated",
+        "candidate_transaction_atomic",
+        "one_candidate_per_session",
+        "three_new_fingerprints_per_batch",
+        "split_result_cleanup_boundaries",
+        "status_and_inspect_read_only",
+        "retention_30_90_180",
+        "installed_skill_writes_zero",
+        "staging_writes_zero",
+        "snapshot_writes_zero",
+    }
+    try:
+        upstream_encoded = _read_quality_source(
+            PHASE3_RELEASE_REPORT_PATH,
+            QUALITY_PHASE4_REPORT_MAX_BYTES,
+            "invalid_phase4_release_report",
+        )
+    except ValueError:
+        raise ValueError("invalid_phase4_release_report") from None
+    report_digest = hashlib.sha256(encoded).hexdigest()
+    if (
+        report_digest != PHASE4_RELEASE_REPORT_SHA256
+        or set(report)
+        != {
+            "schema_version",
+            "decision",
+            "implementation_commit",
+            "upstream",
+            "digests",
+            "production_sha256",
+            "checks",
+            "tests",
+            "independent_reviews",
+            "quality_gate_claimed",
+            "next_action",
+        }
+        or type(report.get("schema_version")) is not int
+        or report.get("schema_version") != 1
+        or report.get("decision") != "PASS"
+        or report.get("implementation_commit")
+        != PHASE4_IMPLEMENTATION_COMMIT
+        or type(upstream) is not dict
+        or set(upstream) != {"path", "sha256", "decision"}
+        or upstream.get("path")
+        != "skill-evolver/docs/release-reports/runtime-queue.json"
+        or upstream.get("decision") != "PASS"
+        or not _is_lower_hex(upstream.get("sha256"), 64)
+        or hashlib.sha256(upstream_encoded).hexdigest()
+        != upstream.get("sha256")
+        or type(digests) is not dict
+        or set(digests)
+        != {
+            "improvement_policy_sha256",
+            "transcript_adapter_sha256",
+            "catalog_adapter_sha256",
+        }
+        or any(not _is_lower_hex(value, 64) for value in digests.values())
+        or type(production) is not dict
+        or set(production) != expected_production
+        or any(
+            not _is_lower_hex(value, 64)
+            for value in production.values()
+        )
+        or production.get(
+            "skill-evolver/skills/skill-evolver/references/"
+            "improvement-policy.md"
+        )
+        != digests.get("improvement_policy_sha256")
+        or type(checks) is not dict
+        or set(checks) != expected_checks
+        or any(value is not True for value in checks.values())
+        or type(tests) is not dict
+        or set(tests)
+        != {
+            "result",
+            "tests_run",
+            "review_tests_run",
+            "capture_tests_run",
+            "historical_skip_count",
+            "historical_skips",
+        }
+        or tests.get("result") != "PASS"
+        or any(
+            type(tests.get(name)) is not int
+            or tests[name] < 1
+            for name in (
+                "tests_run",
+                "review_tests_run",
+                "capture_tests_run",
+            )
+        )
+        or type(tests.get("historical_skip_count")) is not int
+        or tests["historical_skip_count"] < 0
+        or type(tests.get("historical_skips")) is not list
+        or len(tests["historical_skips"])
+        != tests["historical_skip_count"]
+        or any(
+            type(name) is not str or not name
+            for name in tests["historical_skips"]
+        )
+        or type(reviews) is not dict
+        or reviews
+        != {"specification": "CLEAN", "security_privacy": "CLEAN"}
+        or report.get("quality_gate_claimed") is not False
+        or report.get("next_action")
+        != "begin_phase_5_read_only_quality_sample"
+    ):
+        raise ValueError("invalid_phase4_release_report")
+    return report_digest
+
+
+def quality_contract_payload() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "version": 1,
+        "states": [
+            "collecting",
+            "sealed",
+            "passed",
+            "failed",
+            "invalid",
+            "superseded",
+        ],
+        "limits": {
+            "epochs": QUALITY_EPOCH_MAX,
+            "observations": QUALITY_OBSERVATION_MAX,
+            "sessions_minimum": 10,
+        },
+        "thresholds": {
+            "evaluation_worthy_numerator": 1,
+            "evaluation_worthy_denominator": 2,
+            "misattribution_numerator": 1,
+            "misattribution_denominator": 5,
+            "external_content_adoption_maximum": 0,
+        },
+        "retention_seconds": {
+            "collection": QUALITY_COLLECTION_TTL_SECONDS,
+            "sealed": QUALITY_SEALED_TTL_SECONDS,
+            "private": QUALITY_PRIVATE_TTL_SECONDS,
+            "observation": REVIEW_BATCH_AUDIT_TTL_SECONDS,
+        },
+        "session_hmac_domain": "quality-session-v1",
+        "terminal_report": "single-canonical-body-v1",
+    }
+
+
+def quality_contract_digest() -> str:
+    return sha256_json(quality_contract_payload())
+
+
+def load_quality_identity_key(
+    installation: Installation,
+) -> bytes:
+    if type(installation) is not Installation:
+        raise ValueError("invalid_quality_installation")
+    identity = _read_quality_source(
+        installation.identity_key,
+        32,
+        "invalid_identity_key",
+        required_mode=0o600,
+    )
+    if len(identity) != 32:
+        raise ValueError("invalid_identity_key")
+    return identity
+
+
+def current_quality_provenance(
+    installation: Installation,
+    *,
+    identity_key: Optional[bytes] = None,
+) -> dict[str, str]:
+    if type(installation) is not Installation:
+        raise ValueError("invalid_quality_installation")
+    identity = (
+        load_quality_identity_key(installation)
+        if identity_key is None
+        else identity_key
+    )
+    if type(identity) is not bytes or len(identity) != 32:
+        raise ValueError("invalid_identity_key")
+    runtime = load_review_runtime()
+    policy = load_improvement_policy(runtime)
+    script = _read_quality_source(
+        Path(__file__).resolve(),
+        QUALITY_SOURCE_MAX_BYTES,
+        "invalid_quality_runtime",
+    )
+    return {
+        "phase4_report_digest": phase4_release_report_digest(),
+        "runtime_digest": hashlib.sha256(script).hexdigest(),
+        "quality_contract_digest": quality_contract_digest(),
+        "identity_key_fingerprint": hashlib.sha256(identity).hexdigest(),
+        "policy_digest": improvement_policy_digest(policy),
+        "transcript_adapter_digest": transcript_adapter_digest(runtime),
+        "catalog_adapter_digest": catalog_adapter_digest(runtime),
+    }
+
+
+def _load_quality_metadata_json(
+    connection: sqlite3.Connection,
+    key: str,
+    maximum: int,
+    error_code: str,
+    *,
+    required: bool,
+) -> Optional[dict[str, object]]:
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key=?", (key,)
+    ).fetchone()
+    if row is None:
+        if required:
+            raise ValueError(error_code)
+        return None
+    raw = row["value"]
+    if type(raw) is not str:
+        raise ValueError(error_code)
+    try:
+        encoded = raw.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(error_code) from None
+    if len(encoded) > maximum:
+        raise ValueError(error_code)
+    try:
+        value = _load_declarative_result_json(encoded)
+    except ValueError:
+        raise ValueError(error_code) from None
+    if (
+        type(value) is not dict
+        or canonical_json_bytes(value) != encoded
+    ):
+        raise ValueError(error_code)
+    return value
+
+
+def _valid_quality_predecessor(value: object) -> bool:
+    if value is None:
+        return True
+    if (
+        type(value) is not dict
+        or set(value)
+        != {"epoch_id", "terminal_state", "terminal_report_digest"}
+        or type(value.get("epoch_id")) is not str
+        or value.get("terminal_state")
+        not in {"passed", "failed", "invalid"}
+        or not _is_lower_hex(value.get("terminal_report_digest"), 64)
+    ):
+        return False
+    try:
+        parse_quality_epoch_display_id(value["epoch_id"])
+    except ValueError:
+        return False
+    return True
+
+
+def _valid_quality_terminal(
+    value: object,
+    epoch_id: str,
+    state: str,
+) -> bool:
+    if (
+        type(value) is not dict
+        or set(value) != {"body", "report_digest"}
+        or not _is_lower_hex(value.get("report_digest"), 64)
+        or type(value.get("body")) is not dict
+    ):
+        return False
+    body = value["body"]
+    expected_decision = {
+        "passed": "PASS",
+        "failed": "FAIL",
+        "invalid": "INVALID",
+    }.get(state)
+    return (
+        expected_decision is not None
+        and body.get("schema_version") == 1
+        and body.get("epoch_id") == epoch_id
+        and body.get("decision") == expected_decision
+        and sha256_json(body) == value["report_digest"]
+    )
+
+
+def _valid_quality_lifecycle(
+    value: dict[str, object],
+    state: str,
+) -> bool:
+    sealed = value.get("sealed")
+    terminal = value.get("terminal")
+    ended_at = value.get("ended_at")
+    if sealed is not None and type(sealed) is not dict:
+        return False
+    if state == "collecting":
+        return sealed is None and terminal is None and ended_at is None
+    if state == "sealed":
+        return (
+            type(sealed) is dict
+            and terminal is None
+            and ended_at is None
+        )
+    if state in {"passed", "failed"}:
+        return (
+            type(sealed) is dict
+            and _valid_quality_terminal(
+                terminal, str(value["epoch_id"]), state
+            )
+            and _is_iso_utc_string(ended_at)
+        )
+    if state == "invalid":
+        return (
+            terminal is None and ended_at is None
+        ) or (
+            _valid_quality_terminal(
+                terminal, str(value["epoch_id"]), state
+            )
+            and _is_iso_utc_string(ended_at)
+        )
+    return False
+
+
+def load_quality_epoch(
+    connection: sqlite3.Connection,
+    epoch_id: str,
+    *,
+    required: bool = True,
+) -> Optional[dict[str, object]]:
+    epoch_number = parse_quality_epoch_display_id(epoch_id)
+    value = _load_quality_metadata_json(
+        connection,
+        quality_epoch_key(epoch_id),
+        QUALITY_EPOCH_MAX_BYTES,
+        "invalid_quality_epoch",
+        required=required,
+    )
+    if value is None:
+        return None
+    state = value.get("state")
+    invalid_reason = value.get("invalid_reason")
+    invalidated_at = value.get("invalidated_at")
+    if (
+        set(value) != QUALITY_EPOCH_KEYS
+        or value.get("schema_version") != 1
+        or value.get("epoch_id") != display_id("Q", epoch_number)
+        or state
+        not in {
+            "collecting",
+            "sealed",
+            "passed",
+            "failed",
+            "invalid",
+            "superseded",
+        }
+        or type(value.get("first_batch_id")) is not int
+        or not 1 <= value["first_batch_id"] <= SQLITE_INTEGER_MAX
+        or not _valid_quality_predecessor(value.get("predecessor"))
+        or any(
+            not _is_lower_hex(value.get(name), 64)
+            for name in QUALITY_PROVENANCE_FIELDS
+        )
+        or not _is_iso_utc_string(value.get("started_at"))
+        or not _is_iso_utc_string(value.get("collection_expires_at"))
+        or (
+            state == "invalid"
+            and (
+                type(invalid_reason) is not str
+                or invalid_reason not in QUALITY_INVALID_REASONS
+                or not _is_iso_utc_string(invalidated_at)
+            )
+        )
+        or (
+            state != "invalid"
+            and (
+                invalid_reason is not None
+                or invalidated_at is not None
+            )
+        )
+        or not _valid_quality_lifecycle(value, str(state))
+    ):
+        raise ValueError("invalid_quality_epoch")
+    return value
+
+
+def quality_epoch_inventory(
+    connection: sqlite3.Connection,
+) -> list[dict[str, object]]:
+    rows = list(
+        connection.execute(
+            """
+            SELECT key FROM metadata
+            WHERE key GLOB 'quality.epoch.*'
+              AND key NOT GLOB '*.batch.*'
+              AND key NOT GLOB '*.label.*'
+            ORDER BY key
+            LIMIT ?
+            """,
+            (QUALITY_EPOCH_MAX + 1,),
+        )
+    )
+    if len(rows) > QUALITY_EPOCH_MAX:
+        raise ValueError("quality_epoch_inventory_saturated")
+    epochs: list[dict[str, object]] = []
+    for row in rows:
+        key = row["key"]
+        if type(key) is not str or not key.startswith(
+            "quality.epoch."
+        ):
+            raise ValueError("invalid_quality_epoch")
+        epoch_id = key.removeprefix("quality.epoch.")
+        if quality_epoch_key(epoch_id) != key:
+            raise ValueError("invalid_quality_epoch")
+        epochs.append(load_quality_epoch(connection, epoch_id))
+    if [
+        parse_quality_epoch_display_id(epoch["epoch_id"])
+        for epoch in epochs
+    ] != list(range(1, len(epochs) + 1)):
+        raise ValueError("invalid_quality_epoch_sequence")
+    for index, epoch in enumerate(epochs):
+        predecessor = epoch["predecessor"]
+        if index == 0:
+            if predecessor is not None:
+                raise ValueError("invalid_quality_predecessor")
+            continue
+        prior = epochs[index - 1]
+        prior_terminal = prior["terminal"]
+        if (
+            type(predecessor) is not dict
+            or type(prior_terminal) is not dict
+            or predecessor["epoch_id"] != prior["epoch_id"]
+            or predecessor["terminal_state"] != prior["state"]
+            or predecessor["terminal_report_digest"]
+            != prior_terminal["report_digest"]
+        ):
+            raise ValueError("invalid_quality_predecessor")
+    return epochs
+
+
+def active_quality_epoch(
+    connection: sqlite3.Connection,
+) -> Optional[dict[str, object]]:
+    epochs = quality_epoch_inventory(connection)
+    active_epochs = [
+        epoch
+        for epoch in epochs
+        if epoch["terminal"] is None
+    ]
+    pointer = connection.execute(
+        "SELECT value FROM metadata WHERE key=?",
+        (QUALITY_ACTIVE_EPOCH_KEY,),
+    ).fetchone()
+    if pointer is None:
+        if active_epochs:
+            raise ValueError("invalid_quality_epoch_pointer")
+        return None
+    epoch_id = pointer["value"]
+    if (
+        type(epoch_id) is not str
+        or len(active_epochs) != 1
+        or active_epochs[0]["epoch_id"] != epoch_id
+    ):
+        raise ValueError("invalid_quality_epoch_pointer")
+    return active_epochs[0]
+
+
+def _validate_quality_decision(value: object) -> dict[str, object]:
+    if (
+        type(value) is not dict
+        or value.get("outcome") not in {"candidate", "excluded"}
+        or not _is_lower_hex(value.get("session_ref"), 64)
+    ):
+        raise ValueError("invalid_quality_observation")
+    if value["outcome"] == "candidate":
+        if (
+            set(value) != {"session_ref", "outcome", "candidate_id"}
+            or type(value.get("candidate_id")) is not int
+            or not 1 <= value["candidate_id"] <= SQLITE_INTEGER_MAX
+        ):
+            raise ValueError("invalid_quality_observation")
+    elif (
+        set(value) != {"session_ref", "outcome", "excluded_reason"}
+        or type(value.get("excluded_reason")) is not str
+        or value["excluded_reason"]
+        not in REVIEW_EXTERNAL_EXCLUSION_REASONS
+    ):
+        raise ValueError("invalid_quality_observation")
+    return value
+
+
+def load_quality_observation(
+    connection: sqlite3.Connection,
+    epoch_id: str,
+    batch_id: int,
+    *,
+    required: bool = True,
+) -> Optional[dict[str, object]]:
+    value = _load_quality_metadata_json(
+        connection,
+        quality_observation_key(epoch_id, batch_id),
+        QUALITY_OBSERVATION_MAX_BYTES,
+        "invalid_quality_observation",
+        required=required,
+    )
+    if value is None:
+        return None
+    decisions = value.get("decisions")
+    if (
+        set(value) != QUALITY_OBSERVATION_KEYS
+        or value.get("schema_version") != 1
+        or value.get("epoch_id") != epoch_id
+        or value.get("batch_id") != batch_id
+        or any(
+            not _is_lower_hex(value.get(name), 64)
+            for name in (
+                "audit_digest",
+                "policy_digest",
+                "transcript_adapter_digest",
+                "catalog_adapter_digest",
+                "catalog_snapshot_digest",
+            )
+        )
+        or type(decisions) is not list
+        or not 1 <= len(decisions) <= REVIEW_BATCH_SESSIONS_MAX
+        or not _is_iso_utc_string(value.get("finished_at"))
+    ):
+        raise ValueError("invalid_quality_observation")
+    validated = [
+        _validate_quality_decision(item) for item in decisions
+    ]
+    refs = [str(item["session_ref"]) for item in validated]
+    if refs != sorted(refs) or len(refs) != len(set(refs)):
+        raise ValueError("invalid_quality_observation")
+    return value
+
+
+def _parse_quality_predecessor(
+    connection: sqlite3.Connection,
+    predecessor: Optional[str],
+    provenance: dict[str, str],
+) -> Optional[dict[str, object]]:
+    existing = quality_epoch_inventory(connection)
+    if predecessor is None:
+        if existing:
+            raise ValueError("quality_predecessor_required")
+        return None
+    match = re.fullmatch(
+        r"(Q-(?:00[1-9]|0[1-9][0-9]|[1-9][0-9]{2,}))@([0-9a-f]{64})",
+        predecessor,
+    )
+    if match is None:
+        raise ValueError("invalid_quality_predecessor")
+    if not existing:
+        raise ValueError("invalid_quality_predecessor")
+    prior = existing[-1]
+    terminal = prior["terminal"]
+    if (
+        prior["epoch_id"] != match.group(1)
+        or prior["state"] not in {"passed", "failed", "invalid"}
+        or type(terminal) is not dict
+        or terminal.get("report_digest") != match.group(2)
+    ):
+        raise ValueError("invalid_quality_predecessor")
+    if prior["state"] in {"failed", "invalid"} and all(
+        prior[name] == provenance[name]
+        for name in QUALITY_RETRY_CHANGE_FIELDS
+    ):
+        raise ValueError("quality_predecessor_provenance_unchanged")
+    return {
+        "epoch_id": prior["epoch_id"],
+        "terminal_state": prior["state"],
+        "terminal_report_digest": match.group(2),
+    }
+
+
+def open_quality_epoch(
+    connection: sqlite3.Connection,
+    installation: Installation,
+    now: float,
+    *,
+    predecessor: Optional[str],
+) -> dict[str, object]:
+    if connection.in_transaction:
+        raise ValueError("active_transaction")
+    provenance = current_quality_provenance(installation)
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if active_quality_epoch(connection) is not None:
+            raise ValueError("quality_epoch_active")
+        prior = _parse_quality_predecessor(
+            connection, predecessor, provenance
+        )
+        next_row = connection.execute(
+            "SELECT value FROM metadata WHERE key=?",
+            (QUALITY_NEXT_EPOCH_KEY,),
+        ).fetchone()
+        if next_row is None:
+            epoch_number = 1
+        else:
+            raw_next = next_row["value"]
+            if (
+                type(raw_next) is not str
+                or re.fullmatch(r"[1-9][0-9]*", raw_next) is None
+                or len(raw_next) > 2
+            ):
+                raise ValueError("invalid_quality_epoch_sequence")
+            epoch_number = int(raw_next)
+        if (
+            type(epoch_number) is not int
+            or not 1 <= epoch_number <= QUALITY_EPOCH_MAX
+        ):
+            raise ValueError("quality_epoch_inventory_saturated")
+        epoch_id = display_id("Q", epoch_number)
+        expected_epoch_number = (
+            parse_quality_epoch_display_id(prior["epoch_id"]) + 1
+            if prior is not None
+            else 1
+        )
+        if epoch_number != expected_epoch_number:
+            raise ValueError("invalid_quality_epoch_sequence")
+        first_batch_id = next_review_batch_id(
+            connection, initialize=True
+        )
+        epoch = {
+            "schema_version": 1,
+            "epoch_id": epoch_id,
+            "state": "collecting",
+            "started_at": iso_utc(now),
+            "collection_expires_at": iso_utc(
+                now + QUALITY_COLLECTION_TTL_SECONDS
+            ),
+            "first_batch_id": first_batch_id,
+            "predecessor": prior,
+            **provenance,
+            "invalid_reason": None,
+            "invalidated_at": None,
+            "sealed": None,
+            "terminal": None,
+            "ended_at": None,
+        }
+        encoded = canonical_json_bytes(epoch)
+        if len(encoded) > QUALITY_EPOCH_MAX_BYTES:
+            raise ValueError("invalid_quality_epoch")
+        connection.execute(
+            "INSERT INTO metadata(key,value) VALUES(?,?)",
+            (quality_epoch_key(epoch_id), encoded.decode("utf-8")),
+        )
+        connection.execute(
+            "INSERT INTO metadata(key,value) VALUES(?,?)",
+            (QUALITY_ACTIVE_EPOCH_KEY, epoch_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO metadata(key,value) VALUES(?,?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (QUALITY_NEXT_EPOCH_KEY, str(epoch_number + 1)),
+        )
+        connection.commit()
+        return epoch
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def quality_session_ref(
+    installation: Installation,
+    epoch_id: str,
+    session_key_value: str,
+    *,
+    identity_key: Optional[bytes] = None,
+) -> str:
+    parse_quality_epoch_display_id(epoch_id)
+    if not _is_lower_hex(session_key_value, 64):
+        raise ValueError("invalid_quality_session")
+    identity = (
+        load_quality_identity_key(installation)
+        if identity_key is None
+        else identity_key
+    )
+    if type(identity) is not bytes or len(identity) != 32:
+        raise ValueError("invalid_identity_key")
+    return hmac.new(
+        identity,
+        (
+            b"quality-session\0"
+            + epoch_id.encode("ascii")
+            + b"\0"
+            + session_key_value.encode("ascii")
+        ),
+        "sha256",
+    ).hexdigest()
+
+
+def _invalidate_quality_epoch(
+    connection: sqlite3.Connection,
+    epoch: dict[str, object],
+    reason: str,
+    now: float,
+) -> dict[str, object]:
+    if (
+        not connection.in_transaction
+        or epoch.get("state") != "collecting"
+        or type(reason) is not str
+        or reason not in QUALITY_INVALID_REASONS
+    ):
+        raise ValueError("invalid_quality_invalidation")
+    updated = {
+        **epoch,
+        "state": "invalid",
+        "invalid_reason": reason,
+        "invalidated_at": iso_utc(now),
+    }
+    changed = connection.execute(
+        "UPDATE metadata SET value=? WHERE key=? AND value=?",
+        (
+            canonical_json_bytes(updated).decode("utf-8"),
+            quality_epoch_key(str(epoch["epoch_id"])),
+            canonical_json_bytes(epoch).decode("utf-8"),
+        ),
+    ).rowcount
+    if changed != 1:
+        raise sqlite3.IntegrityError("quality_epoch_changed")
+    return updated
+
+
+def _insert_quality_observation(
+    connection: sqlite3.Connection,
+    observation: dict[str, object],
+) -> None:
+    if not connection.in_transaction:
+        raise ValueError("active_review_transaction_required")
+    encoded = canonical_json_bytes(observation)
+    if len(encoded) > QUALITY_OBSERVATION_MAX_BYTES:
+        raise ValueError("invalid_quality_observation")
+    connection.execute(
+        "INSERT INTO metadata(key,value) VALUES(?,?)",
+        (
+            quality_observation_key(
+                str(observation["epoch_id"]),
+                int(observation["batch_id"]),
+            ),
+            encoded.decode("utf-8"),
+        ),
+    )
+
+
+def record_quality_observation(
+    connection: sqlite3.Connection,
+    installation: Installation,
+    audit: dict[str, object],
+    decisions: list[dict[str, object]],
+    now: float,
+) -> Optional[dict[str, object]]:
+    if (
+        not connection.in_transaction
+        or type(audit) is not dict
+        or type(decisions) is not list
+    ):
+        raise ValueError("invalid_quality_observation_input")
+    epoch = active_quality_epoch(connection)
+    if epoch is None:
+        return None
+    epoch_id = str(epoch["epoch_id"])
+    if epoch["state"] != "collecting":
+        return None
+    batch_id = audit.get("batch_id")
+    if (
+        type(batch_id) is not int
+        or batch_id < int(epoch["first_batch_id"])
+    ):
+        return None
+    identity = load_quality_identity_key(installation)
+    current = current_quality_provenance(
+        installation, identity_key=identity
+    )
+    if any(
+        current[name] != epoch[name]
+        for name in QUALITY_PROVENANCE_FIELDS
+    ) or any(
+        audit.get(name) != epoch[name]
+        for name in (
+            "policy_digest",
+            "transcript_adapter_digest",
+            "catalog_adapter_digest",
+        )
+    ):
+        return _invalidate_quality_epoch(
+            connection, epoch, "quality_provenance_drift", now
+        )
+    if (
+        not decisions
+        or len(decisions) > REVIEW_BATCH_SESSIONS_MAX
+    ):
+        raise ValueError("invalid_quality_observation_input")
+    normalized: list[dict[str, object]] = []
+    for decision in decisions:
+        if (
+            type(decision) is not dict
+            or type(decision.get("session_key")) is not str
+            or decision.get("outcome")
+            not in {"candidate", "excluded"}
+        ):
+            raise ValueError("invalid_quality_observation_input")
+        item: dict[str, object] = {
+            "session_ref": quality_session_ref(
+                installation,
+                epoch_id,
+                str(decision["session_key"]),
+                identity_key=identity,
+            ),
+            "outcome": decision["outcome"],
+        }
+        if decision["outcome"] == "candidate":
+            candidate_id = decision.get("candidate_id")
+            if (
+                type(candidate_id) is not int
+                or not 1 <= candidate_id <= SQLITE_INTEGER_MAX
+            ):
+                raise ValueError("invalid_quality_observation_input")
+            item["candidate_id"] = candidate_id
+        else:
+            reason = decision.get("excluded_reason")
+            if (
+                type(reason) is not str
+                or reason not in REVIEW_EXTERNAL_EXCLUSION_REASONS
+            ):
+                raise ValueError("invalid_quality_observation_input")
+            item["excluded_reason"] = reason
+        normalized.append(item)
+    normalized.sort(key=lambda item: str(item["session_ref"]))
+    refs = [str(item["session_ref"]) for item in normalized]
+    if len(refs) != len(set(refs)):
+        raise ValueError("invalid_quality_observation_input")
+    candidate_count = sum(
+        item["outcome"] == "candidate" for item in normalized
+    )
+    if (
+        len(normalized) != audit.get("generation_count")
+        or candidate_count != audit.get("candidate_count")
+        or not _is_lower_hex(audit.get("catalog_snapshot_digest"), 64)
+        or not _is_iso_utc_string(audit.get("finished_at"))
+    ):
+        raise ValueError("invalid_quality_observation_input")
+    rows = list(
+        connection.execute(
+            """
+            SELECT key FROM metadata
+            WHERE key GLOB ?
+            ORDER BY key
+            LIMIT ?
+            """,
+            (
+                f"quality.epoch.{epoch_id}.batch.*",
+                QUALITY_OBSERVATION_MAX + 1,
+            ),
+        )
+    )
+    if len(rows) > QUALITY_OBSERVATION_MAX:
+        raise ValueError("invalid_quality_observation")
+    observed_count = 0
+    for row in rows:
+        match = re.fullmatch(
+            rf"quality\.epoch\.{re.escape(epoch_id)}\.batch\.([0-9]+)",
+            str(row["key"]),
+        )
+        if match is None:
+            raise ValueError("invalid_quality_observation")
+        existing = load_quality_observation(
+            connection, epoch_id, int(match.group(1))
+        )
+        observed_count += len(existing["decisions"])
+    if observed_count > QUALITY_OBSERVATION_MAX:
+        raise ValueError("invalid_quality_observation")
+    if observed_count + len(normalized) > QUALITY_OBSERVATION_MAX:
+        return _invalidate_quality_epoch(
+            connection, epoch, "quality_observation_capacity", now
+        )
+    observation = {
+        "schema_version": 1,
+        "epoch_id": epoch_id,
+        "batch_id": batch_id,
+        "audit_digest": sha256_json(audit),
+        "policy_digest": audit["policy_digest"],
+        "transcript_adapter_digest": (
+            audit["transcript_adapter_digest"]
+        ),
+        "catalog_adapter_digest": audit["catalog_adapter_digest"],
+        "catalog_snapshot_digest": audit["catalog_snapshot_digest"],
+        "decisions": normalized,
+        "finished_at": audit["finished_at"],
+    }
+    _insert_quality_observation(connection, observation)
+    return observation
+
+
 def rotate_invalid_review_result(
     connection: sqlite3.Connection,
     installation: Installation,
@@ -4745,6 +5953,7 @@ def commit_review_result(
             new_ids: set[int] = set()
             merged_ids: set[int] = set()
             semantic_exclusions: dict[str, int] = {}
+            quality_decisions: list[dict[str, object]] = []
             candidate_count = 0
             for item in prepared:
                 result = item["result"]
@@ -4769,6 +5978,13 @@ def commit_review_result(
                         reason,
                         now,
                     )
+                    quality_decisions.append(
+                        {
+                            "session_key": row["session_key"],
+                            "outcome": "excluded",
+                            "excluded_reason": reason,
+                        }
+                    )
                     continue
                 if item["candidate_limit"]:
                     semantic_exclusions["candidate_limit"] = (
@@ -4788,6 +6004,13 @@ def commit_review_result(
                         "excluded",
                         "candidate_limit",
                         now,
+                    )
+                    quality_decisions.append(
+                        {
+                            "session_key": row["session_key"],
+                            "outcome": "excluded",
+                            "excluded_reason": "candidate_limit",
+                        }
                     )
                     continue
                 candidate_id, created = upsert_validated_candidate(
@@ -4844,6 +6067,13 @@ def commit_review_result(
                     None,
                     now,
                 )
+                quality_decisions.append(
+                    {
+                        "session_key": row["session_key"],
+                        "outcome": "candidate",
+                        "candidate_id": candidate_id,
+                    }
+                )
             merged_ids.difference_update(new_ids)
             audit = finalize_review_batch(
                 connection,
@@ -4852,6 +6082,13 @@ def commit_review_result(
                 "completed",
                 candidate_count,
                 semantic_exclusions,
+                now,
+            )
+            record_quality_observation(
+                connection,
+                installation,
+                audit,
+                quality_decisions,
                 now,
             )
             connection.commit()
@@ -9563,6 +10800,22 @@ def cmd_review_abort(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_quality_open(args: argparse.Namespace) -> int:
+    installation = load_installation(Path(args.installation))
+    connection = open_database(installation)
+    try:
+        result = open_quality_epoch(
+            connection,
+            installation,
+            time.time(),
+            predecessor=args.predecessor,
+        )
+    finally:
+        connection.close()
+    write_json_stdout(result)
+    return 0
+
+
 def cmd_catalog_inspect(args: argparse.Namespace) -> int:
     load_installation(Path(args.installation))
     runtime = load_review_runtime()
@@ -9704,6 +10957,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     review_abort.add_argument("--owner-token", required=True)
     review_abort.set_defaults(handler=cmd_review_abort)
+
+    quality_open = commands.add_parser("quality-open")
+    add_installation_argument(quality_open)
+    quality_open.add_argument("--predecessor")
+    quality_open.set_defaults(handler=cmd_quality_open)
 
     catalog_inspect = commands.add_parser("catalog-inspect")
     add_installation_argument(catalog_inspect)
