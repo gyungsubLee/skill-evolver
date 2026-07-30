@@ -31,7 +31,11 @@
 
 ## Entry Gate
 
-Test-count contract: the 253-test Runtime Queue baseline plus Plan 4A's 30 and Plan 4B's 44 new methods equals 327 tests before Plan 4C. This plan adds exactly 20 methods: 18 in `test_review.py` and 2 in `test_capture.py`, for 347 tests at exit.
+Test-count contract: the committed Plan 4B boundary is exactly 332 tests
+before Plan 4C. This plan adds exactly 20 methods: 18 in `test_review.py` and
+2 in `test_capture.py`, for exactly 352 tests at exit. The exit inventory is
+97 `test_review.py` tests and 82 `test_capture.py` tests, with the same three
+historical full-suite skips.
 
 - [ ] **Run the immutable Phase 3 gate and baseline suite (2–5 min)**
 
@@ -45,7 +49,10 @@ git diff --check
 git status --short
 ```
 
-Expected: `runtime-queue-entry-gate: PASS`; full discovery prints `Ran 327 tests` and `OK (skipped=3)`, with only the three historical `test_skeleton.py` skips; `git diff --check` exits `0`; status contains no uncommitted Plan 4A or Plan 4B implementation path.
+Expected: `runtime-queue-entry-gate: PASS`; full discovery prints `Ran 332
+tests` and `OK (skipped=3)`, with only the three historical `test_skeleton.py`
+skips; `git diff --check` exits `0`; status contains no uncommitted Plan 4A or
+Plan 4B implementation path.
 
 ## Exact Dependencies from Plan 4A
 
@@ -148,7 +155,13 @@ The audit fields are exactly `schema_version`, `batch_id`, `terminal_status`, `o
 
 Plan 4B's reusable test base is `BatchExportTestCase(unittest.TestCase)`. Its exact helpers are `fixed_review_inputs(self)` as a context manager; `insert_pending(self, connection, number, *, text="record\n", error_code: Optional[str]=None, now=2_000_000_000.0) -> sqlite3.Row`; `make_export(self, *texts, context=0) -> TranscriptExport`; `write_result_bytes(self, path: Path, value: bytes, now: float) -> None`; and `claim_ready_batch(self, connection, exports, *, now=2_000_000_000.0) -> dict[str, object]`. The claim helper patches the fixed Plan 4A inputs and private result parent, invokes `claim_review_batch`, and asserts `status == "ready"`.
 
-The result namespace constants are `REVIEW_RESULT_PARENT = Path("/private/tmp")`, `REVIEW_RESULT_PREFIX = "skill-evolver-review-results-"`, name pattern `\Aresult-[0-9a-f]{32}\.json\Z`, maximum bytes `262_144`, maximum files `200`, detection scan `201`, stale age `3_600` seconds, and terminal audit retention `90 * 86_400` seconds. `review_result_root() -> Path` resolves `Path("/private/tmp") / f"skill-evolver-review-results-{os.getuid()}"`. `cleanup_review_results(now)` returns exactly `result_scan_entries`, `result_files_deleted`, `result_files_preserved`, and `result_scan_saturated`; entry 201 raises `ValueError("review_result_namespace_saturated")` before deleting anything.
+The result namespace constants are `REVIEW_RESULT_PARENT = Path("/private/tmp")`, `REVIEW_RESULT_PREFIX = "skill-evolver-review-results-"`, name pattern `\Aresult-[0-9a-f]{32}\.json\Z`, maximum bytes `262_144`, maximum files `200`, detection scan `201`, stale age `3_600` seconds, terminal audit retention `90 * 86_400` seconds, and `REVIEW_MAINTENANCE_BATCH_MAX = 200`. `review_result_root() -> Path` resolves `Path("/private/tmp") / f"skill-evolver-review-results-{os.getuid()}"`. `cleanup_review_results(now)` returns exactly `result_scan_entries`, `result_files_deleted`, `result_files_preserved`, and `result_scan_saturated`; entry 201 raises `ValueError("review_result_namespace_saturated")` before deleting anything.
+
+Plan 4B already commits the maintenance database transaction before deleting
+captured bound result files and attempting best-effort namespace cleanup. It
+also owns the ordered, `LIMIT 200` terminal batch cohort and atomically deletes
+the exact audit keys and batch IDs selected by that cohort. Plan 4C preserves
+both behaviors unchanged.
 
 The empty claim output is exactly `{"schema_version":1,"status":"empty","batch_id":null,"owner_token":null,"claims":[],"contract":null}`. Failed claims have exactly `schema_version`, `status`, `batch_id`, and `error_code`; the configuration and zero-survivor codes are `configuration_envelope_error` and `no_exportable_sessions`. `abort_review_batch` returns the exact audit object, releases rows error-free and cursor-stable, removes contract/result metadata and writes the audit in one transaction, then identity-safely deletes the bound file.
 
@@ -1760,7 +1773,12 @@ def rotate_invalid_review_result(
 
 - [ ] **Step 6 (2–5 min): Implement the single candidate transaction**
 
-Add the following functions immediately after `rotate_invalid_review_result`:
+Add the following functions immediately after `rotate_invalid_review_result`.
+Do not call `cleanup_review_results` directly here:
+`read_bound_review_result` already authenticates the live owner, persisted
+binding, and exact allocated path before its bounded cleanup. Keeping that
+single reader-owned call prevents unauthenticated cleanup and duplicate
+namespace scans.
 
 ```python
 def commit_review_result(
@@ -1774,7 +1792,6 @@ def commit_review_result(
 ) -> dict[str, object]:
     if connection.in_transaction:
         raise ValueError("active_transaction")
-    cleanup_review_results(now)
     try:
         opened = read_bound_review_result(
             connection,
@@ -2210,7 +2227,7 @@ Expected: one commit containing only `evolver.py` and `test_review.py`.
 
 **Interfaces:**
 - Consumes: existing `run_maintenance`, Plan 4B `cleanup_review_results(now) -> dict[str, int]`, Task 2 recurrence keys, and Task 3 candidate state.
-- Produces: config values `deferred_to_stale_days=30`, `rejected_tombstone_days=90`, `terminal_candidate_retention_days=90`; aggregate metadata at `f"candidate.{candidate_id}.evidence_aggregate"`; recurrence-link deletion at the existing 180-day session boundary.
+- Produces: config values `deferred_to_stale_days=30`, `rejected_tombstone_days=90`, `terminal_candidate_retention_days=90`; aggregate metadata at `f"candidate.{candidate_id}.evidence_aggregate"`; strict `load_candidate_evidence_aggregate(connection, candidate_id) -> dict[str, object]` with a 4,096-byte bound; recurrence-link deletion at the existing 180-day session boundary.
 
 - [ ] **Step 1 (2–5 min): Add the three candidate-retention defaults to config tests**
 
@@ -2356,6 +2373,16 @@ class CandidateMaintenanceTests(CandidateBatchFixture):
                 "SELECT id FROM candidates"
             ).fetchone()["id"]
         )
+        self.assertEqual(
+            self.runtime.load_candidate_evidence_aggregate(
+                self.connection, candidate_id
+            ),
+            {
+                "schema_version": 1,
+                "counts": [],
+                "updated_at": None,
+            },
+        )
         self.connection.execute(
             """
             UPDATE candidates
@@ -2389,7 +2416,8 @@ class CandidateMaintenanceTests(CandidateBatchFixture):
         redacted = self.connection.execute(
             """
             SELECT target_path,target_locator,proposal_intent,
-              problem_summary,proposal_summary,validation_plan,risk_level
+              problem_summary,proposal_summary,validation_plan,risk_level,
+              updated_at
             FROM candidates WHERE id=?
             """,
             (candidate_id,),
@@ -2405,18 +2433,24 @@ class CandidateMaintenanceTests(CandidateBatchFixture):
                 "WHERE key LIKE 'candidate-session.%'"
             ).fetchone()[0]
         )
-        aggregate = json.loads(
-            self.connection.execute(
-                "SELECT value FROM metadata WHERE key=?",
-                (
-                    self.runtime.candidate_evidence_aggregate_key(
-                        candidate_id
-                    ),
-                ),
-            ).fetchone()["value"]
+        aggregate_key = (
+            self.runtime.candidate_evidence_aggregate_key(candidate_id)
+        )
+        aggregate_row = self.connection.execute(
+            "SELECT value FROM metadata WHERE key=?",
+            (aggregate_key,),
+        ).fetchone()
+        canonical_aggregate = aggregate_row["value"]
+        aggregate = (
+            self.runtime.load_candidate_evidence_aggregate(
+                self.connection, candidate_id
+            )
         )
         self.assertEqual(second["candidate_text_redacted"], 1)
         self.assertIsNone(redacted["target_path"])
+        self.assertEqual(
+            redacted["updated_at"], self.runtime.iso_utc(at_30)
+        )
         self.assertEqual(
             redacted["problem_summary"],
             self.runtime.redacted_marker(initial_summary),
@@ -2444,6 +2478,206 @@ class CandidateMaintenanceTests(CandidateBatchFixture):
             ],
         )
         self.assertNotIn("session", json.dumps(aggregate))
+        invalid_aggregate_values = (
+            ("oversized", "{" + "x" * 4_096),
+            ("noncanonical", json.dumps(aggregate)),
+            (
+                "duplicate-json-key",
+                canonical_aggregate.replace(
+                    '"schema_version":1',
+                    '"schema_version":1,"schema_version":1',
+                    1,
+                ),
+            ),
+            (
+                "private-field",
+                self.runtime.canonical_json_bytes(
+                    {
+                        "schema_version": 1,
+                        "counts": [
+                            {
+                                "signal_type": "explicit_correction",
+                                "source_kind": "user_direct",
+                                "count": 1,
+                                "summary": "private",
+                            }
+                        ],
+                        "updated_at": aggregate["updated_at"],
+                    }
+                ).decode("utf-8"),
+            ),
+            (
+                "top-level-extra-key",
+                self.runtime.canonical_json_bytes(
+                    {
+                        **aggregate,
+                        "session_key": "private",
+                    }
+                ).decode("utf-8"),
+            ),
+            (
+                "unsorted-pairs",
+                self.runtime.canonical_json_bytes(
+                    {
+                        "schema_version": 1,
+                        "counts": [
+                            {
+                                "signal_type": "unnecessary_rework",
+                                "source_kind": "user_direct",
+                                "count": 1,
+                            },
+                            {
+                                "signal_type": "explicit_correction",
+                                "source_kind": "user_direct",
+                                "count": 1,
+                            },
+                        ],
+                        "updated_at": aggregate["updated_at"],
+                    }
+                ).decode("utf-8"),
+            ),
+            (
+                "duplicate-pair",
+                self.runtime.canonical_json_bytes(
+                    {
+                        "schema_version": 1,
+                        "counts": [
+                            aggregate["counts"][0],
+                            aggregate["counts"][0],
+                        ],
+                        "updated_at": aggregate["updated_at"],
+                    }
+                ).decode("utf-8"),
+            ),
+            (
+                "unknown-pair",
+                self.runtime.canonical_json_bytes(
+                    {
+                        "schema_version": 1,
+                        "counts": [
+                            {
+                                "signal_type": "external_instruction",
+                                "source_kind": "web",
+                                "count": 1,
+                            }
+                        ],
+                        "updated_at": aggregate["updated_at"],
+                    }
+                ).decode("utf-8"),
+            ),
+            (
+                "aggregate-count-overflow",
+                self.runtime.canonical_json_bytes(
+                    {
+                        "schema_version": 1,
+                        "counts": [
+                            {
+                                "signal_type": "explicit_correction",
+                                "source_kind": "user_direct",
+                                "count": (
+                                    self.runtime.SQLITE_INTEGER_MAX
+                                ),
+                            },
+                            {
+                                "signal_type": "unnecessary_rework",
+                                "source_kind": "user_direct",
+                                "count": 1,
+                            },
+                        ],
+                        "updated_at": aggregate["updated_at"],
+                    }
+                ).decode("utf-8"),
+            ),
+            *(
+                (
+                    f"invalid-count-{label}",
+                    self.runtime.canonical_json_bytes(
+                        {
+                            "schema_version": 1,
+                            "counts": [
+                                {
+                                    "signal_type": (
+                                        "explicit_correction"
+                                    ),
+                                    "source_kind": "user_direct",
+                                    "count": count,
+                                }
+                            ],
+                            "updated_at": aggregate["updated_at"],
+                        }
+                    ).decode("utf-8"),
+                )
+                for label, count in (
+                    ("bool", True),
+                    ("zero", 0),
+                    (
+                        "overflow",
+                        self.runtime.SQLITE_INTEGER_MAX + 1,
+                    ),
+                )
+            ),
+            (
+                "invalid-updated-at",
+                self.runtime.canonical_json_bytes(
+                    {
+                        "schema_version": 1,
+                        "counts": aggregate["counts"],
+                        "updated_at": "2033-01-01T00:00:00.1Z",
+                    }
+                ).decode("utf-8"),
+            ),
+        )
+        for label, invalid in invalid_aggregate_values:
+            with self.subTest(invalid_aggregate=label):
+                self.connection.execute(
+                    "UPDATE metadata SET value=? WHERE key=?",
+                    (invalid, aggregate_key),
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^invalid_candidate_evidence_aggregate$",
+                ):
+                    self.runtime.load_candidate_evidence_aggregate(
+                        self.connection, candidate_id
+                    )
+        self.connection.execute(
+            "UPDATE metadata SET value=? WHERE key=?",
+            (json.dumps(aggregate), aggregate_key),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "^invalid_candidate_evidence_aggregate$"
+        ):
+            self.runtime.merge_candidate_evidence_aggregate(
+                self.connection,
+                candidate_id,
+                {("explicit_correction", "user_direct"): 1},
+                at_90_terminal + 1,
+            )
+        self.connection.execute(
+            "UPDATE metadata SET value=? WHERE key=?",
+            (canonical_aggregate, aggregate_key),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "^invalid_candidate_evidence_count$"
+        ):
+            self.runtime.merge_candidate_evidence_aggregate(
+                self.connection,
+                candidate_id,
+                {
+                    (
+                        "unnecessary_rework",
+                        "user_direct",
+                    ): self.runtime.SQLITE_INTEGER_MAX
+                },
+                at_90_terminal + 1,
+            )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (aggregate_key,),
+            ).fetchone()["value"],
+            canonical_aggregate,
+        )
 
         at_180 = now + self.config.session_dedupe_days * 86_400
         third = self.runtime.run_maintenance(
@@ -2503,13 +2737,17 @@ class CandidateMaintenanceTests(CandidateBatchFixture):
         redacted = self.connection.execute(
             """
             SELECT target_path,target_locator,proposal_intent,
-              problem_summary,proposal_summary,validation_plan,risk_level
+              problem_summary,proposal_summary,validation_plan,risk_level,
+              updated_at
             FROM candidates WHERE id=?
             """,
             (candidate_id,),
         ).fetchone()
         self.assertEqual(second["candidate_text_redacted"], 1)
         self.assertIsNone(redacted["target_path"])
+        self.assertEqual(
+            redacted["updated_at"], self.runtime.iso_utc(at_30)
+        )
         for name in (
             "target_locator",
             "proposal_intent",
@@ -2521,6 +2759,22 @@ class CandidateMaintenanceTests(CandidateBatchFixture):
             self.assertRegex(
                 redacted[name], r"^redacted:[0-9a-f]{64}$"
             )
+        aggregate = self.runtime.load_candidate_evidence_aggregate(
+            self.connection, candidate_id
+        )
+        self.assertEqual(
+            set(aggregate), {"schema_version", "counts", "updated_at"}
+        )
+        self.assertEqual(
+            aggregate["counts"],
+            [
+                {
+                    "signal_type": "explicit_correction",
+                    "source_kind": "user_direct",
+                    "count": 1,
+                }
+            ],
+        )
 
         revive_at = at_90_terminal + 1
         self.insert_pending(
@@ -2714,7 +2968,10 @@ cd /Users/igyeongseob/Documents/오픈소스
   -v
 ```
 
-Expected: candidate tests fail because the config fields, aggregate helpers, and candidate maintenance counts do not exist; both config tests fail because the three-key legacy merge contract is not implemented.
+Expected: the same two candidate methods fail because the config fields,
+strict aggregate loader/merge helpers, and candidate maintenance counts do not
+exist; both config tests fail because the three-key legacy merge contract is
+not implemented. Do not add a third `CandidateMaintenanceTests` method.
 
 - [ ] **Step 4 (2–5 min): Add config fields without changing schema version**
 
@@ -2770,7 +3027,7 @@ Replace only the key-shape check at the start of `load_config` with:
 
 Keep the existing exact type/range validation loop unchanged after this merge. Only the three new retention keys may be absent. Any missing old key and every unknown key still raises `invalid_config_keys`. Do not change `SCHEMA_VERSION`, `SCHEMA_SQL`, `PRAGMA user_version`, Stop upsert semantics, or Phase 3 generation completion semantics.
 
-- [ ] **Step 5 (2–5 min): Implement deterministic aggregate merging and redaction**
+- [ ] **Step 5 (2–5 min): Implement the strict aggregate loader, deterministic merging, and redaction**
 
 Add these helpers before `run_maintenance`:
 
@@ -2780,6 +3037,86 @@ def redacted_marker(value: object) -> str:
     return f"redacted:{hashlib.sha256(encoded).hexdigest()}"
 
 
+CANDIDATE_EVIDENCE_AGGREGATE_MAX_BYTES = 4_096
+
+
+def load_candidate_evidence_aggregate(
+    connection: sqlite3.Connection,
+    candidate_id: int,
+) -> dict[str, object]:
+    key = candidate_evidence_aggregate_key(candidate_id)
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key=?", (key,)
+    ).fetchone()
+    if row is None:
+        return {
+            "schema_version": 1,
+            "counts": [],
+            "updated_at": None,
+        }
+    raw = row["value"]
+    if type(raw) is not str:
+        raise ValueError("invalid_candidate_evidence_aggregate")
+    try:
+        encoded = raw.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(
+            "invalid_candidate_evidence_aggregate"
+        ) from None
+    if len(encoded) > CANDIDATE_EVIDENCE_AGGREGATE_MAX_BYTES:
+        raise ValueError("invalid_candidate_evidence_aggregate")
+    try:
+        current = _load_declarative_result_json(encoded)
+        canonical = canonical_json_bytes(current)
+    except (UnicodeError, ValueError):
+        raise ValueError(
+            "invalid_candidate_evidence_aggregate"
+        ) from None
+    if (
+        type(current) is not dict
+        or set(current)
+        != {"schema_version", "counts", "updated_at"}
+        or type(current.get("schema_version")) is not int
+        or current["schema_version"] != 1
+        or type(current.get("counts")) is not list
+        or not current["counts"]
+        or len(current["counts"]) > len(SIGNAL_SOURCE_PAIRS)
+        or type(current.get("updated_at")) is not str
+        or canonical != encoded
+    ):
+        raise ValueError("invalid_candidate_evidence_aggregate")
+    try:
+        parse_iso_utc(current["updated_at"])
+    except ValueError:
+        raise ValueError(
+            "invalid_candidate_evidence_aggregate"
+        ) from None
+    pairs: list[tuple[str, str]] = []
+    total = 0
+    for item in current["counts"]:
+        if (
+            type(item) is not dict
+            or set(item) != {"signal_type", "source_kind", "count"}
+            or type(item.get("signal_type")) is not str
+            or type(item.get("source_kind")) is not str
+            or type(item.get("count")) is not int
+        ):
+            raise ValueError("invalid_candidate_evidence_aggregate")
+        pair = (item["signal_type"], item["source_kind"])
+        count = item["count"]
+        if (
+            pair not in SIGNAL_SOURCE_PAIRS
+            or not 1 <= count <= SQLITE_INTEGER_MAX
+            or total > SQLITE_INTEGER_MAX - count
+        ):
+            raise ValueError("invalid_candidate_evidence_aggregate")
+        pairs.append(pair)
+        total += count
+    if pairs != sorted(pairs) or len(pairs) != len(set(pairs)):
+        raise ValueError("invalid_candidate_evidence_aggregate")
+    return current
+
+
 def merge_candidate_evidence_aggregate(
     connection: sqlite3.Connection,
     candidate_id: int,
@@ -2787,29 +3124,29 @@ def merge_candidate_evidence_aggregate(
     now: float,
 ) -> None:
     key = candidate_evidence_aggregate_key(candidate_id)
-    row = connection.execute(
-        "SELECT value FROM metadata WHERE key=?", (key,)
-    ).fetchone()
+    current = load_candidate_evidence_aggregate(
+        connection, candidate_id
+    )
     merged: dict[tuple[str, str], int] = {}
-    if row is not None:
-        current = json.loads(str(row["value"]))
-        if (
-            not isinstance(current, dict)
-            or set(current) != {"schema_version", "counts", "updated_at"}
-            or current["schema_version"] != 1
-            or not isinstance(current["counts"], list)
-        ):
-            raise ValueError("invalid_candidate_evidence_aggregate")
-        for item in current["counts"]:
-            pair = (
-                str(item["signal_type"]),
-                str(item["source_kind"]),
-            )
-            merged[pair] = merged.get(pair, 0) + int(item["count"])
+    for item in current["counts"]:
+        pair = (item["signal_type"], item["source_kind"])
+        merged[pair] = item["count"]
+    if type(counts) is not dict or not counts:
+        raise ValueError("invalid_candidate_evidence_count")
     for pair, count in counts.items():
-        if count < 1:
+        if (
+            type(pair) is not tuple
+            or len(pair) != 2
+            or any(type(value) is not str for value in pair)
+            or pair not in SIGNAL_SOURCE_PAIRS
+            or type(count) is not int
+            or not 1 <= count <= SQLITE_INTEGER_MAX
+            or merged.get(pair, 0) > SQLITE_INTEGER_MAX - count
+        ):
             raise ValueError("invalid_candidate_evidence_count")
         merged[pair] = merged.get(pair, 0) + count
+    if sum(merged.values()) > SQLITE_INTEGER_MAX:
+        raise ValueError("invalid_candidate_evidence_count")
     payload = {
         "schema_version": 1,
         "counts": [
@@ -2824,12 +3161,15 @@ def merge_candidate_evidence_aggregate(
         ],
         "updated_at": iso_utc(now),
     }
+    encoded = canonical_json_bytes(payload)
+    if len(encoded) > CANDIDATE_EVIDENCE_AGGREGATE_MAX_BYTES:
+        raise ValueError("invalid_candidate_evidence_aggregate")
     connection.execute(
         """
         INSERT INTO metadata(key,value) VALUES(?,?)
         ON CONFLICT(key) DO UPDATE SET value=excluded.value
         """,
-        (key, canonical_json_bytes(payload).decode("utf-8")),
+        (key, encoded.decode("utf-8")),
     )
 
 
@@ -2863,23 +3203,66 @@ def aggregate_candidate_evidence_rows(
     return sum(sum(counts.values()) for counts in grouped.values())
 ```
 
+The loader is the only aggregate read path used by later maintenance and
+inspection. It reads at most 4,096 UTF-8 bytes, uses the duplicate-rejecting
+strict JSON decoder, requires byte-for-byte canonical JSON, and accepts only
+the exact top-level and count-item keys shown above. Stored aggregates are
+non-empty, their UTC timestamp is canonical, their allowed signal/source pairs
+are unique and sorted, and each count and their sum fit SQLite's positive
+integer range. Because the only string values are allowlisted enums and a UTC
+timestamp, session identifiers, summaries, paths, record references, and other
+private data are structurally impossible. Only an absent metadata row returns
+the exact empty object with `updated_at: None`. Every merge calls this loader
+before combining counts and fails closed without replacing malformed metadata.
+
 - [ ] **Step 6 (2–5 min): Add the candidate transition and 90-day terminal cleanup transaction**
 
 Inside the existing `BEGIN IMMEDIATE` section of `run_maintenance`, before
-session dedupe deletion, add:
+session dedupe deletion, add the following two independently bounded cohorts.
+Both order by `updated_at,id` and limit by
+`REVIEW_MAINTENANCE_BATCH_MAX`; that inherited Phase 4B constant is exactly
+`200`. Each mutation is restricted to its selected ID set:
 
 ```python
         stale_cutoff = iso_utc(
             now - config.deferred_to_stale_days * 86_400
         )
-        candidates_staled = connection.execute(
-            """
-            UPDATE candidates
-            SET status='stale',updated_at=?
-            WHERE status='deferred' AND updated_at<=?
-            """,
-            (iso_utc(now), stale_cutoff),
-        ).rowcount
+        stale_ids = [
+            int(row["id"])
+            for row in connection.execute(
+                """
+                SELECT id FROM candidates
+                WHERE status='deferred' AND updated_at<=?
+                ORDER BY updated_at,id
+                LIMIT ?
+                """,
+                (
+                    stale_cutoff,
+                    REVIEW_MAINTENANCE_BATCH_MAX,
+                ),
+            )
+        ]
+        if stale_ids:
+            marks = ",".join("?" for _ in stale_ids)
+            candidates_staled = connection.execute(
+                f"""
+                UPDATE candidates
+                SET status='stale',updated_at=?
+                WHERE id IN ({marks})
+                  AND status='deferred' AND updated_at<=?
+                """,
+                (
+                    iso_utc(now),
+                    *stale_ids,
+                    stale_cutoff,
+                ),
+            ).rowcount
+            if candidates_staled != len(stale_ids):
+                raise sqlite3.IntegrityError(
+                    "candidate_stale_cohort_race"
+                )
+        else:
+            candidates_staled = 0
         terminal_cutoff = iso_utc(
             now - config.terminal_candidate_retention_days * 86_400
         )
@@ -2891,9 +3274,13 @@ session dedupe deletion, add:
                 WHERE status IN ('rejected','stale')
                   AND updated_at<=?
                   AND target_path IS NOT NULL
-                ORDER BY id
+                ORDER BY updated_at,id
+                LIMIT ?
                 """,
-                (terminal_cutoff,),
+                (
+                    terminal_cutoff,
+                    REVIEW_MAINTENANCE_BATCH_MAX,
+                ),
             )
         ]
         terminal_evidence_aggregated = (
@@ -2917,18 +3304,22 @@ session dedupe deletion, add:
                       problem_summary,proposal_summary,validation_plan,
                       risk_level
                     FROM candidates WHERE id IN ({marks})
+                    ORDER BY id
                     """,
                     tuple(terminal_ids),
                 )
             )
+            candidate_text_redacted = 0
             for candidate in terminal_rows:
-                connection.execute(
+                changed = connection.execute(
                     """
                     UPDATE candidates
                     SET target_path=NULL,target_locator=?,proposal_intent=?,
                         problem_summary=?,proposal_summary=?,
-                        validation_plan=?,risk_level=?,updated_at=?
-                    WHERE id=?
+                        validation_plan=?,risk_level=?
+                    WHERE id=? AND target_path IS NOT NULL
+                      AND status IN ('rejected','stale')
+                      AND updated_at<=?
                     """,
                     (
                         redacted_marker(candidate["target_locator"]),
@@ -2937,149 +3328,155 @@ session dedupe deletion, add:
                         redacted_marker(candidate["proposal_summary"]),
                         redacted_marker(candidate["validation_plan"]),
                         redacted_marker(candidate["risk_level"]),
-                        iso_utc(now),
                         int(candidate["id"]),
+                        terminal_cutoff,
                     ),
-                )
-        candidate_text_redacted = len(terminal_ids)
+                ).rowcount
+                if changed != 1:
+                    raise sqlite3.IntegrityError(
+                        "candidate_redaction_cohort_race"
+                    )
+                candidate_text_redacted += changed
+        else:
+            candidate_text_redacted = 0
 ```
 
 `target_path` is the system-owned redaction sentinel: a live candidate has its
 catalog path, while this transaction sets it to `NULL` only after hashing every
 retained free-text/classification field. Never infer redaction state from
 model-controlled text such as a `problem_summary` prefix. Do not delete
-`candidate-session.*` links in this 90-day block.
+`candidate-session.*` links in this 90-day block. Redaction deliberately does
+not update `updated_at`: it remains the status-age clock used to select the
+terminal cohort.
 
 - [ ] **Step 7 (2–5 min): Aggregate and delete recurrence at the 180-day identity boundary**
 
 Replace the current candidate-evidence/session dedupe block in
-`run_maintenance` with:
+`run_maintenance` with one `dedupe_expires_at,id` ordered cohort limited by
+the same exact 200-row `REVIEW_MAINTENANCE_BATCH_MAX`:
 
 ```python
         dedupe_cutoff = iso_utc(now)
         expiring_sessions = list(
             connection.execute(
                 """
-                SELECT session_key FROM review_items
+                SELECT id,session_key FROM review_items
                 WHERE dedupe_expires_at<=?
                   AND status NOT IN ('pending','reviewing')
-                ORDER BY id
+                ORDER BY dedupe_expires_at,id
+                LIMIT ?
                 """,
-                (dedupe_cutoff,),
+                (
+                    dedupe_cutoff,
+                    REVIEW_MAINTENANCE_BATCH_MAX,
+                ),
             )
         )
+        expiring_ids = [
+            int(row["id"]) for row in expiring_sessions
+        ]
         expiring_keys = [
             str(row["session_key"]) for row in expiring_sessions
         ]
-        evidence_rows = list(
-            connection.execute(
-                """
-                SELECT candidate_id,signal_type,source_kind,COUNT(*) AS count
-                FROM candidate_evidence
-                WHERE session_key IN (
-                  SELECT session_key FROM review_items
-                  WHERE dedupe_expires_at<=?
-                    AND status NOT IN ('pending','reviewing')
+        if expiring_ids:
+            marks = ",".join("?" for _ in expiring_ids)
+            evidence_rows = list(
+                connection.execute(
+                    f"""
+                    SELECT candidate_id,signal_type,source_kind,
+                      COUNT(*) AS count
+                    FROM candidate_evidence
+                    WHERE review_item_id IN ({marks})
+                    GROUP BY candidate_id,signal_type,source_kind
+                    """,
+                    tuple(expiring_ids),
                 )
-                GROUP BY candidate_id,signal_type,source_kind
-                """,
-                (dedupe_cutoff,),
             )
-        )
-        grouped: dict[int, dict[tuple[str, str], int]] = {}
-        for evidence in evidence_rows:
-            grouped.setdefault(int(evidence["candidate_id"]), {})[
-                (
-                    str(evidence["signal_type"]),
-                    str(evidence["source_kind"]),
+            grouped: dict[int, dict[tuple[str, str], int]] = {}
+            for evidence in evidence_rows:
+                grouped.setdefault(
+                    int(evidence["candidate_id"]), {}
+                )[
+                    (
+                        str(evidence["signal_type"]),
+                        str(evidence["source_kind"]),
+                    )
+                ] = int(evidence["count"])
+            for candidate_id, counts_by_pair in grouped.items():
+                merge_candidate_evidence_aggregate(
+                    connection, candidate_id, counts_by_pair, now
                 )
-            ] = int(evidence["count"])
-        for candidate_id, counts_by_pair in grouped.items():
-            merge_candidate_evidence_aggregate(
-                connection, candidate_id, counts_by_pair, now
-            )
-        connection.execute(
-            """
-            DELETE FROM candidate_evidence
-            WHERE session_key IN (
-              SELECT session_key FROM review_items
-              WHERE dedupe_expires_at<=?
-                AND status NOT IN ('pending','reviewing')
-            )
-            """,
-            (dedupe_cutoff,),
-        )
-        candidate_session_links_deleted = 0
-        for session_key_value in expiring_keys:
-            candidate_session_links_deleted += connection.execute(
-                "DELETE FROM metadata WHERE key=?",
-                (
-                    candidate_session_link_key(
-                        installation, session_key_value
-                    ),
-                ),
-            ).rowcount
-        dedupe_deleted = connection.execute(
-            """
-            DELETE FROM review_items
-            WHERE dedupe_expires_at<=?
-              AND status NOT IN ('pending','reviewing')
-            """,
-            (dedupe_cutoff,),
-        ).rowcount
-```
-
-- [ ] **Step 8 (2–5 min): Delete terminal batch audits after 90 days and integrate result cleanup**
-
-Call Plan 4B cleanup once at the beginning of `run_maintenance`, before
-`import_spool`:
-
-```python
-    review_result_cleanup = cleanup_review_results(now)
-```
-
-Inside the maintenance transaction, before commit, add:
-
-```python
-        batch_cutoff = iso_utc(now - 90 * 86_400)
-        terminal_batch_ids = [
-            int(row["id"])
-            for row in connection.execute(
-                """
-                SELECT id FROM review_batches
-                WHERE status IN ('completed','aborted','expired','failed')
-                  AND finished_at<=?
-                ORDER BY id
-                """,
-                (batch_cutoff,),
-            )
-        ]
-        for terminal_batch_id in terminal_batch_ids:
             connection.execute(
-                "DELETE FROM metadata WHERE key=?",
-                (review_audit_key(terminal_batch_id),),
+                f"""
+                DELETE FROM candidate_evidence
+                WHERE review_item_id IN ({marks})
+                """,
+                tuple(expiring_ids),
             )
-        terminal_batches_deleted = 0
-        if terminal_batch_ids:
-            marks = ",".join("?" for _ in terminal_batch_ids)
-            terminal_batches_deleted = connection.execute(
-                f"DELETE FROM review_batches WHERE id IN ({marks})",
-                tuple(terminal_batch_ids),
+            candidate_session_links_deleted = 0
+            for session_key_value in expiring_keys:
+                candidate_session_links_deleted += (
+                    connection.execute(
+                        "DELETE FROM metadata WHERE key=?",
+                        (
+                            candidate_session_link_key(
+                                installation, session_key_value
+                            ),
+                        ),
+                    ).rowcount
+                )
+            dedupe_deleted = connection.execute(
+                f"""
+                DELETE FROM review_items
+                WHERE id IN ({marks})
+                  AND dedupe_expires_at<=?
+                  AND status NOT IN ('pending','reviewing')
+                """,
+                (*expiring_ids, dedupe_cutoff),
             ).rowcount
+            if dedupe_deleted != len(expiring_ids):
+                raise sqlite3.IntegrityError(
+                    "review_item_dedupe_cohort_race"
+                )
+        else:
+            candidate_session_links_deleted = 0
+            dedupe_deleted = 0
 ```
 
-Extend the returned maintenance dictionary with:
+Only the selected review-item IDs and their exact evidence/link identities are
+mutated. If more than 200 rows remain eligible, the next explicit maintenance
+invocation processes the next `dedupe_expires_at,id` cohort.
+
+- [ ] **Step 8 (2–5 min): Preserve Phase 4B maintenance finalization and extend only candidate counts**
+
+Do not add a cleanup call before `import_spool`, and do not duplicate the
+terminal batch/audit purge. Preserve Phase 4B's existing sequence unchanged:
+
+1. perform the maintenance database transaction and commit it;
+2. identity-safely delete captured bound result files after commit;
+3. run bounded result cleanup as best effort and report its existing telemetry.
+
+Also preserve Phase 4B's existing terminal batch/audit cohort exactly: it
+orders eligible terminal batches, selects at most
+`REVIEW_MAINTENANCE_BATCH_MAX` (`200`), deletes each exact audit key and the
+same selected batch IDs atomically, and rolls back on an audit/batch row-count
+mismatch.
+
+Extend the existing returned maintenance dictionary with only these new
+candidate fields:
 
 ```python
-        **review_result_cleanup,
         "candidates_staled": candidates_staled,
         "terminal_evidence_aggregated": terminal_evidence_aggregated,
         "candidate_text_redacted": candidate_text_redacted,
         "candidate_session_links_deleted": (
             candidate_session_links_deleted
         ),
-        "terminal_batches_deleted": terminal_batches_deleted,
 ```
+
+The pre-existing result-cleanup keys, `terminal_batches_deleted`, and
+`result_cleanup_failed` remain where Phase 4B already returns them. Do not
+rename, recompute, or add a second copy of any of those fields.
 
 - [ ] **Step 9 (2–5 min): Run maintenance, capture, and Review tests**
 
@@ -3111,7 +3508,8 @@ Expected: candidate maintenance tests pass, including model-prefix-independent
 classification, summary, validation, and risk fields while recurrence links
 remain distinct; all RuntimeStore config tests pass; existing
 maintenance/status tests pass with the extended result keys; all Review tests
-pass.
+pass. At this completed Task 4 boundary Review discovery runs exactly 97
+tests and capture discovery runs exactly 82 tests.
 
 - [ ] **Step 10 (2–5 min): Commit candidate aging and privacy retention**
 
@@ -3159,7 +3557,8 @@ Expected: `plan-4c-cli-boundary: PASS`; the diff command exits `0`. Do not add `
 
 ```bash
 cd /Users/igyeongseob/Documents/오픈소스
-/usr/bin/python3 -m py_compile \
+env PYTHONPYCACHEPREFIX=/private/tmp/skill-evolver-pycache \
+  /usr/bin/python3 -m py_compile \
   skill-evolver/skills/skill-evolver/scripts/evolver.py
 /usr/bin/python3 -m unittest discover \
   -s skill-evolver/skills/skill-evolver/tests \
@@ -3176,7 +3575,12 @@ git diff --check
 git status --short
 ```
 
-Expected: compilation succeeds; every `test_review.py` test passes; `test_capture.py` runs all 82 tests with no skip; full discovery prints `Ran 347 tests` and `OK (skipped=3)` with exactly the three historical `test_skeleton.py` skips; `git diff --check` exits `0`; no generated result file, installed-skill write, staging write, snapshot write, schema migration, Hook edit, or CLI edit is present.
+Expected: compilation succeeds; `test_review.py` runs all 97 tests,
+`test_capture.py` runs all 82 tests with no skip, and full discovery prints
+`Ran 352 tests` and `OK (skipped=3)` with exactly the three historical
+`test_skeleton.py` skips; `git diff --check` exits `0`; no generated result
+file, installed-skill write, staging write, snapshot write, schema migration,
+Hook edit, or CLI edit is present.
 
 - [ ] **Step 3 (2–5 min): Record the Plan 4C implementation commit for Plan 4D**
 

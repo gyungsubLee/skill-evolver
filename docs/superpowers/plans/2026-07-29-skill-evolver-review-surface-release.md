@@ -14,7 +14,11 @@
 - Require Plans 4A, 4B, and 4C to be committed and green before starting.
 - Keep `SCHEMA_VERSION = 1`; do not edit `SCHEMA_SQL` or create a migration.
 - Do not add a dependency, network call, Python-side model call, Hook change, background worker, permanent writable-root grant, installed-skill mutation, staging write, or snapshot write.
-- Do not change transcript parsing, catalog discovery, batch packing, declarative validation, fingerprinting, recurrence, or retention contracts except for the explicit result-cleanup call named in Task 2.
+- Do not change transcript parsing, catalog discovery, batch packing,
+  declarative validation, fingerprinting, recurrence, or retention contracts.
+  Task 2 only verifies the existing split result-cleanup contract: claim and
+  an authenticated result read may refuse saturation, while abort and
+  maintenance commit their database work before best-effort cleanup.
 - `status`, `inspect`, and `catalog-inspect` are read-only. Only `catalog-inspect` reads one allowlisted target `SKILL.md`; `status` and `inspect` never open a transcript.
 - `review-claim`, `review-heartbeat`, `review-commit`, `review-abort`, `defer`, `resume`, and `reject` are explicit mutations requiring approval scoped to the exact command and installation data root.
 - A raw batch owner token appears only in ready claim stdout and the caller's in-memory command construction. Never write it to SQLite, metadata, docs, tests, logs, reports, or shell-history examples containing a real token.
@@ -24,13 +28,24 @@
 
 ## Entry Gate
 
-Test-count contract: 253 baseline + 30 Plan 4A + 44 Plan 4B + 20 Plan 4C = 347 tests at entry. Plan 4D adds exactly 13 `test_review.py` methods, so the frozen full suite is exactly 360 tests with the same three historical skips.
+Test-count contract: Plan 4C enters at the committed 332-test Plan 4B
+boundary and adds exactly 20 methods, producing 352 tests at the Plan 4D
+entry: exactly 97 `test_review.py` tests and 82 `test_capture.py` tests. Plan
+4D adds exactly 13 `test_review.py` methods, so the frozen full suite is
+exactly 365 tests, with exactly 110 Review tests, 82 capture tests, and the
+same three historical skips.
 
 - [ ] **Run the Plan 4C boundary and confirm no Review CLI is present yet (2–5 min)**
 
 ```bash
 cd /Users/igyeongseob/Documents/오픈소스
-/usr/bin/python3 -c 'import argparse,importlib.util,sys; from pathlib import Path; path=Path("skill-evolver/skills/skill-evolver/scripts/evolver.py"); spec=importlib.util.spec_from_file_location("evolver",path); module=importlib.util.module_from_spec(spec); sys.modules[spec.name]=module; spec.loader.exec_module(module); parser=module.build_parser(); action=next(item for item in parser._actions if isinstance(item,argparse._SubParsersAction)); assert set(action.choices) == {"init","enqueue-stop","maintain","status"}; print("plan-4d-entry-gate: PASS")'
+/usr/bin/python3 -c 'import argparse,importlib.util,sys; from pathlib import Path; path=Path("skill-evolver/skills/skill-evolver/scripts/evolver.py"); spec=importlib.util.spec_from_file_location("evolver",path); module=importlib.util.module_from_spec(spec); sys.modules[spec.name]=module; spec.loader.exec_module(module); assert callable(getattr(module,"load_candidate_evidence_aggregate",None)); parser=module.build_parser(); action=next(item for item in parser._actions if isinstance(item,argparse._SubParsersAction)); assert set(action.choices) == {"init","enqueue-stop","maintain","status"}; print("plan-4d-entry-gate: PASS")'
+/usr/bin/python3 -m unittest discover \
+  -s skill-evolver/skills/skill-evolver/tests \
+  -p 'test_review.py'
+/usr/bin/python3 -m unittest discover \
+  -s skill-evolver/skills/skill-evolver/tests \
+  -p 'test_capture.py'
 /usr/bin/python3 -m unittest discover \
   -s skill-evolver/skills/skill-evolver/tests \
   -p 'test_*.py'
@@ -38,7 +53,10 @@ git diff --check
 git status --short --untracked-files=no
 ```
 
-Expected: `plan-4d-entry-gate: PASS`; full discovery prints `Ran 347 tests` and `OK (skipped=3)`; whitespace validation exits `0`; no tracked implementation change is pending.
+Expected: `plan-4d-entry-gate: PASS`; Review discovery prints `Ran 97 tests`,
+capture discovery prints `Ran 82 tests`, full discovery prints `Ran 352 tests`
+and `OK (skipped=3)`; the strict aggregate loader is callable; whitespace
+validation exits `0`; no tracked implementation change is pending.
 
 ## Exact Dependencies from Plan 4A
 
@@ -122,7 +140,28 @@ The audit has exactly `schema_version`, `batch_id`, `terminal_status`, `owner_di
 
 The result namespace constants are exactly `REVIEW_RESULT_PARENT = Path("/private/tmp")`, `REVIEW_RESULT_PREFIX = "skill-evolver-review-results-"`, name pattern `\Aresult-[0-9a-f]{32}\.json\Z`, maximum file size `262_144`, maximum files `200`, detection scan `201`, and stale age `3_600` seconds. `review_result_root() -> Path` resolves `Path("/private/tmp") / f"skill-evolver-review-results-{os.getuid()}"` and creates or validates a current-user, no-symlink, mode-`0700` directory. `cleanup_review_results(now)` returns exactly `result_scan_entries`, `result_files_deleted`, `result_files_preserved`, and `result_scan_saturated`. Seeing entry 201 raises `ValueError("review_result_namespace_saturated")` before any deletion.
 
-The empty claim output is exactly `{"schema_version":1,"status":"empty","batch_id":null,"owner_token":null,"claims":[],"contract":null}`. Configuration and zero-survivor failures have exactly `schema_version`, `status`, `batch_id`, and `error_code`, with error code `configuration_envelope_error` or `no_exportable_sessions`. `abort_review_batch` returns the exact audit object, releases rows without cursor movement, deletes contract/result metadata and writes the audit in one transaction, then identity-safely removes the bound result.
+The empty claim output is exactly `{"schema_version":1,"status":"empty","batch_id":null,"owner_token":null,"claims":[],"contract":null}`. Configuration and zero-survivor failures have exactly `schema_version`, `status`, `batch_id`, and `error_code`, with error code `configuration_envelope_error` or `no_exportable_sessions`. `abort_review_batch` returns the exact audit object, releases rows without cursor movement, deletes contract/result metadata and writes the audit in one transaction, then identity-safely removes the bound result. Abort treats a post-commit `ValueError` from best-effort namespace cleanup as non-fatal generally, not only when its message denotes saturation. No cleanup failure can roll back the already committed audit, and abort retains its unchanged exact audit shape.
+
+Result cleanup has four deliberately different call-site semantics:
+
+- `claim_review_batch` runs bounded cleanup before preparing or mutating a
+  batch and refuses a saturated namespace.
+- `read_bound_review_result` authenticates the live owner, loads the persisted
+  binding, and validates the exact allocated absolute path before bounded
+  cleanup. Saturation then refuses the authenticated commit before reading the
+  result or starting candidate mutation.
+- `commit_review_result` contains no direct cleanup call; it relies only on
+  that authenticated reader.
+- `abort_review_batch` and `run_maintenance` complete and commit their bounded
+  database transactions first, then perform identity-safe deletion and
+  best-effort bounded cleanup. Maintenance distinguishes saturation in its
+  telemetry; abort suppresses a post-commit cleanup `ValueError` generally to
+  retain its exact audit shape. Cleanup failure never undoes committed privacy
+  or terminal-state work.
+
+The existing maintenance purge of terminal batch rows and their exact audit
+metadata remains bounded, ordered, and atomic. Plan 4D neither duplicates nor
+weakens that transaction.
 
 ## Exact Dependencies from Plan 4C
 
@@ -133,15 +172,35 @@ The empty claim output is exactly `{"schema_version":1,"status":"empty","batch_i
   candidate-side write survives.
 - `display_id(prefix: str, value: int) -> str`
 - `candidate_evidence_aggregate_key(candidate_id: int) -> str`
+- `load_candidate_evidence_aggregate(connection, candidate_id) ->
+  dict[str, object]`, the strict, UTF-8-bounded, canonical Phase 4C metadata
+  loader. Missing metadata returns the exact empty aggregate; malformed,
+  non-canonical, oversized, duplicate, or invalid scalar/count state raises
+  `invalid_candidate_evidence_aggregate`.
 - Candidate statuses remain `proposed`, `prepared`, `deferred`, `rejected`, and `stale`.
 - The 90-day terminal-redaction invariant is system-owned: `target_path` is
   `NULL` only after target locator, proposal intent, problem/proposal
   summaries, validation plan, and risk level are hashed. Model-controlled
-  `redacted:` prefixes never exempt a live candidate. A new distinct-session
-  recurrence fully restores those fields from the live catalog entry and
-  validated result when a stale or expired-tombstone candidate revives.
+  `redacted:` prefixes never exempt a live candidate. Before setting
+  `target_path` to `NULL`, maintenance merges individual evidence through the
+  strict aggregate loader and deletes every `candidate_evidence` row for that
+  candidate. A new distinct-session recurrence fully restores those fields
+  from the live catalog entry and validated result when a stale or
+  expired-tombstone candidate revives.
 - Candidate inspection may expose sanitized candidate and evidence summaries, but never `fingerprint`, `target_path`, `target_skill`, `conflict_group`, `review_item_id`, `session_key`, `generation`, transcript data, record refs, result paths, owner data, or batch contracts.
 - Manual transitions are exactly `proposed -> deferred`, `deferred -> proposed`, and `proposed|deferred|prepared -> rejected`. `stale` and `rejected` are never manually resumed.
+- `updated_at` is the status-transition age clock. Recurrence and evidence
+  aggregation do not refresh it; a successful manual transition does. Only a
+  rejected candidate has a non-null, canonical `tombstone_until`; a new
+  rejection sets it in the future, but a retained rejected row may outlive it.
+  `proposed`, `prepared`, `deferred`, and `stale` candidates require a null
+  tombstone. Transition compare-and-swap predicates preserve these invariants.
+
+`load_candidate_evidence_aggregate` and the redaction helpers are outputs of
+Plan 4C Task 4. They need not exist before that task, but Plan 4C Task 4 must
+be committed and green before the Plan 4D entry gate runs. Task 1 consumes
+that completed interface; it must not add a second aggregate decoder or
+redaction format.
 
 ## Exact CLI and JSON Contracts
 
@@ -249,6 +308,14 @@ class CandidateInboxTests(CandidateBatchFixture):
             set(inspected["evidence"][0]),
             {"signal_type", "source_kind", "summary", "created_at"},
         )
+        self.assertEqual(
+            inspected["evidence_aggregate"],
+            {
+                "schema_version": 1,
+                "counts": [],
+                "updated_at": None,
+            },
+        )
         encoded = json.dumps(inspected)
         for forbidden in (
             "fingerprint",
@@ -264,6 +331,261 @@ class CandidateInboxTests(CandidateBatchFixture):
             "owner_digest",
         ):
             self.assertNotIn(forbidden, encoded)
+        aggregate_key = (
+            self.runtime.candidate_evidence_aggregate_key(candidate_id)
+        )
+        self.connection.execute(
+            "INSERT INTO metadata(key,value) VALUES(?,?)",
+            (
+                aggregate_key,
+                '{ "counts":[],"schema_version":1,"updated_at":null}',
+            ),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "invalid_candidate_evidence_aggregate"
+        ):
+            self.runtime.inspect_candidate(
+                self.connection,
+                self.runtime.display_id("C", candidate_id),
+            )
+        self.connection.execute(
+            "DELETE FROM metadata WHERE key=?", (aggregate_key,)
+        )
+        private_fields = (
+            "target_locator",
+            "proposal_intent",
+            "problem_summary",
+            "proposal_summary",
+            "validation_plan",
+            "risk_level",
+        )
+        live_row = self.connection.execute(
+            """
+            SELECT target_identity,target_path,target_locator,
+              proposal_intent,problem_summary,proposal_summary,
+              validation_plan,risk_level
+            FROM candidates WHERE id=?
+            """,
+            (candidate_id,),
+        ).fetchone()
+        self.connection.execute(
+            "UPDATE candidates SET target_identity=? WHERE id=?",
+            (sqlite3.Binary(b"not-text"), candidate_id),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "candidate_state_corrupt"
+        ):
+            self.runtime.inspect_candidate(
+                self.connection,
+                self.runtime.display_id("C", candidate_id),
+            )
+        self.connection.execute(
+            "UPDATE candidates SET target_identity=? WHERE id=?",
+            (live_row["target_identity"], candidate_id),
+        )
+        valid_273_byte_path = "/" + "a" * 272
+        self.assertEqual(
+            len(valid_273_byte_path.encode("utf-8")), 273
+        )
+        self.connection.execute(
+            "UPDATE candidates SET target_path=? WHERE id=?",
+            (valid_273_byte_path, candidate_id),
+        )
+        accepted = self.runtime.inspect_candidate(
+            self.connection,
+            self.runtime.display_id("C", candidate_id),
+        )
+        self.assertEqual(accepted["candidate_id"], inspected["candidate_id"])
+        self.connection.execute(
+            "UPDATE candidates SET target_path=? WHERE id=?",
+            (live_row["target_path"], candidate_id),
+        )
+        oversized_path = "/" + "a" * 4_096
+        self.assertGreater(
+            len(oversized_path.encode("utf-8")), 4_096
+        )
+        self.connection.execute(
+            "UPDATE candidates SET target_path=? WHERE id=?",
+            (oversized_path, candidate_id),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "candidate_state_corrupt"
+        ):
+            self.runtime.inspect_candidate(
+                self.connection,
+                self.runtime.display_id("C", candidate_id),
+            )
+        self.connection.execute(
+            "UPDATE candidates SET target_path=? WHERE id=?",
+            (live_row["target_path"], candidate_id),
+        )
+        for column, invalid in (
+            (
+                "risk_level",
+                self.runtime.redacted_marker(live_row["risk_level"]),
+            ),
+            ("target_path", "relative/not-canonical"),
+            (
+                "problem_summary",
+                f" {live_row['problem_summary']} ",
+            ),
+        ):
+            with self.subTest(invalid_live_scalar=column):
+                self.connection.execute(
+                    f"UPDATE candidates SET {column}=? WHERE id=?",
+                    (invalid, candidate_id),
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "candidate_state_corrupt"
+                ):
+                    self.runtime.inspect_candidate(
+                        self.connection,
+                        self.runtime.display_id("C", candidate_id),
+                    )
+                self.connection.execute(
+                    f"UPDATE candidates SET {column}=? WHERE id=?",
+                    (live_row[column], candidate_id),
+                )
+
+        markers = {
+            key: self.runtime.redacted_marker(live_row[key])
+            for key in private_fields
+        }
+        evidence_row = self.connection.execute(
+            """
+            SELECT candidate_id,review_item_id,session_key,generation,
+              signal_type,source_kind,summary,created_at
+            FROM candidate_evidence WHERE candidate_id=?
+            """,
+            (candidate_id,),
+        ).fetchone()
+        self.assertIsNotNone(evidence_row)
+        self.assertEqual(
+            self.runtime.aggregate_candidate_evidence_rows(
+                self.connection,
+                [candidate_id],
+                2_000_000_010.0,
+            ),
+            1,
+        )
+        self.connection.execute(
+            "DELETE FROM candidate_evidence WHERE candidate_id=?",
+            (candidate_id,),
+        )
+        self.assertEqual(
+            self.runtime.load_candidate_evidence_aggregate(
+                self.connection, candidate_id
+            )["counts"],
+            [
+                {
+                    "signal_type": "explicit_correction",
+                    "source_kind": "user_direct",
+                    "count": 1,
+                }
+            ],
+        )
+        assignments = ",".join(f"{key}=?" for key in private_fields)
+        self.connection.execute(
+            f"""
+            UPDATE candidates
+            SET status='stale',target_path=NULL,tombstone_until=NULL,
+                {assignments}
+            WHERE id=?
+            """,
+            (*markers.values(), candidate_id),
+        )
+        redacted = self.runtime.inspect_candidate(
+            self.connection,
+            self.runtime.display_id("C", candidate_id),
+        )
+        self.assertEqual(redacted["status"], "stale")
+        self.assertEqual(
+            redacted["target_identity"], inspected["target_identity"]
+        )
+        self.assertEqual(
+            redacted["classification"]["problem_category"],
+            inspected["classification"]["problem_category"],
+        )
+        self.assertIsNone(redacted["tombstone_until"])
+        self.assertEqual(
+            {
+                "target_locator": redacted["classification"][
+                    "target_locator"
+                ],
+                "proposal_intent": redacted["classification"][
+                    "proposal_intent"
+                ],
+                "problem_summary": redacted["problem_summary"],
+                "proposal_summary": redacted["proposal_summary"],
+                "validation_plan": redacted["validation_plan"],
+                "risk_level": redacted["risk_level"],
+            },
+            markers,
+        )
+        for column in private_fields:
+            with self.subTest(invalid_redacted_marker=column):
+                self.connection.execute(
+                    f"UPDATE candidates SET {column}=? WHERE id=?",
+                    ("redacted:not-a-digest", candidate_id),
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "candidate_state_corrupt"
+                ):
+                    self.runtime.inspect_candidate(
+                        self.connection,
+                        self.runtime.display_id("C", candidate_id),
+                    )
+                self.connection.execute(
+                    f"UPDATE candidates SET {column}=? WHERE id=?",
+                    (markers[column], candidate_id),
+                )
+        self.connection.execute(
+            """
+            INSERT INTO candidate_evidence(
+              candidate_id,review_item_id,session_key,generation,
+              signal_type,source_kind,summary,created_at
+            ) VALUES(?,?,?,?,?,?,?,?)
+            """,
+            tuple(evidence_row),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "candidate_state_corrupt"
+        ):
+            self.runtime.inspect_candidate(
+                self.connection,
+                self.runtime.display_id("C", candidate_id),
+            )
+        self.connection.execute(
+            "DELETE FROM candidate_evidence WHERE candidate_id=?",
+            (candidate_id,),
+        )
+        self.connection.execute(
+            "UPDATE candidates SET status='proposed' WHERE id=?",
+            (candidate_id,),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "candidate_state_corrupt"
+        ):
+            self.runtime.inspect_candidate(
+                self.connection,
+                self.runtime.display_id("C", candidate_id),
+            )
+        rejected_until = self.runtime.iso_utc(2_000_000_100.0)
+        self.connection.execute(
+            """
+            UPDATE candidates
+            SET status='rejected',tombstone_until=?
+            WHERE id=?
+            """,
+            (rejected_until, candidate_id),
+        )
+        self.assertEqual(
+            self.runtime.inspect_candidate(
+                self.connection,
+                self.runtime.display_id("C", candidate_id),
+            )["tombstone_until"],
+            rejected_until,
+        )
 
     def test_defer_resume_reject_are_exact_compare_and_swap(self) -> None:
         now = 2_000_000_000.0
@@ -273,14 +595,25 @@ class CandidateInboxTests(CandidateBatchFixture):
             self.connection, identity, "defer", self.config, now + 2
         )
         self.assertEqual(deferred["status"], "deferred")
+        self.assertEqual(
+            deferred["updated_at"], self.runtime.iso_utc(now + 2)
+        )
+        self.assertIsNone(deferred["tombstone_until"])
         resumed = self.runtime.transition_candidate(
             self.connection, identity, "resume", self.config, now + 3
         )
         self.assertEqual(resumed["status"], "proposed")
+        self.assertEqual(
+            resumed["updated_at"], self.runtime.iso_utc(now + 3)
+        )
+        self.assertIsNone(resumed["tombstone_until"])
         rejected = self.runtime.transition_candidate(
             self.connection, identity, "reject", self.config, now + 4
         )
         self.assertEqual(rejected["status"], "rejected")
+        self.assertEqual(
+            rejected["updated_at"], self.runtime.iso_utc(now + 4)
+        )
         self.assertEqual(
             rejected["tombstone_until"],
             self.runtime.iso_utc(
@@ -304,6 +637,20 @@ class CandidateInboxTests(CandidateBatchFixture):
             (candidate_id,),
         ).fetchone()
         self.assertEqual(row["status"], "rejected")
+        self.connection.execute(
+            "UPDATE candidates SET status='proposed' WHERE id=?",
+            (candidate_id,),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "candidate_transition_conflict"
+        ):
+            self.runtime.transition_candidate(
+                self.connection,
+                identity,
+                "defer",
+                self.config,
+                now + 6,
+            )
 
     def test_stale_cannot_be_resumed_and_unknown_id_is_rejected(self) -> None:
         now = 2_000_000_000.0
@@ -331,6 +678,28 @@ class CandidateInboxTests(CandidateBatchFixture):
             self.runtime.inspect_candidate(
                 self.connection, "candidate-one"
             )
+        for malformed in (
+            "C-1",
+            "C-01",
+            "C-0001",
+            "C-000",
+            "C-+001",
+            f"C-{self.runtime.SQLITE_INTEGER_MAX + 1}",
+        ):
+            with self.subTest(malformed=malformed), self.assertRaisesRegex(
+                ValueError, "invalid_candidate_id"
+            ):
+                self.runtime.inspect_candidate(
+                    self.connection, malformed
+                )
+        class CandidateIdSubclass(str):
+            pass
+        with self.assertRaisesRegex(
+            ValueError, "invalid_candidate_id"
+        ):
+            self.runtime.inspect_candidate(
+                self.connection, CandidateIdSubclass(identity)
+            )
 ```
 
 - [ ] **Step 2 (2–5 min): Run the inbox tests and verify RED**
@@ -344,18 +713,90 @@ cd /Users/igyeongseob/Documents/오픈소스
   -v
 ```
 
-Expected: three tests error because `inspect_candidate` and `transition_candidate` do not exist.
+Expected: exactly three tests error because `inspect_candidate` and
+`transition_candidate` do not exist. Do not add a fourth test method: Plan 4D
+must add exactly 13 methods overall.
 
 - [ ] **Step 3 (2–5 min): Add exact display-ID parsing and sanitized inspection**
 
-Add these functions after `display_id` in `evolver.py`:
+Add these functions after `display_id` in `evolver.py`. Inspection must reuse
+Plan 4C's bounded canonical aggregate loader; do not decode metadata with a new
+`json.loads` path. Branch only on the system-owned `target_path` sentinel:
+a non-null path is a live row whose public text, risk, timestamps, counts, and
+path scalars must remain canonical; a null path is valid only for `stale` or
+`rejected` and requires exact `redacted:<64 lowercase hex>` markers for
+`target_locator`, `proposal_intent`, `problem_summary`, `proposal_summary`,
+`validation_plan`, and `risk_level`, plus zero remaining individual
+`candidate_evidence` rows. The 90-day writer must merge those rows into the
+strict aggregate and delete them before setting the sentinel. Never infer
+redaction from a model-controlled prefix. The filesystem path uses its own
+compiled 4,096-byte cap; do not reuse the 272-byte catalog identity cap because
+a valid maximum-length skill name can produce a 273-byte absolute path:
 
 ```python
-def parse_candidate_display_id(value: str) -> int:
-    match = re.fullmatch(r"C-(0*[1-9][0-9]*)", value)
-    if match is None:
+CANDIDATE_TARGET_PATH_MAX_BYTES = 4_096
+
+
+def parse_candidate_display_id(value: object) -> int:
+    if type(value) is not str:
         raise ValueError("invalid_candidate_id")
-    return int(match.group(1))
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError:
+        raise ValueError("invalid_candidate_id") from None
+    match = re.fullmatch(
+        r"C-(?:00[1-9]|0[1-9][0-9]|[1-9][0-9]{2,})", value
+    )
+    if match is None or len(encoded) > 32:
+        raise ValueError("invalid_candidate_id")
+    candidate_id = int(value[2:])
+    if (
+        candidate_id > SQLITE_INTEGER_MAX
+        or display_id("C", candidate_id) != value
+    ):
+        raise ValueError("invalid_candidate_id")
+    return candidate_id
+
+
+def _live_candidate_text(
+    row: sqlite3.Row,
+    key: str,
+    maximum: int,
+) -> str:
+    value = row[key]
+    if type(value) is not str:
+        raise ValueError("candidate_state_corrupt")
+    try:
+        normalized = normalize_candidate_text(value, maximum)
+    except ValueError:
+        raise ValueError("candidate_state_corrupt") from None
+    if normalized != value:
+        raise ValueError("candidate_state_corrupt")
+    return value
+
+
+def _redacted_candidate_marker(
+    row: sqlite3.Row,
+    key: str,
+) -> str:
+    value = row[key]
+    if (
+        type(value) is not str
+        or re.fullmatch(r"redacted:[0-9a-f]{64}", value) is None
+    ):
+        raise ValueError("candidate_state_corrupt")
+    return value
+
+
+def _candidate_timestamp(row: sqlite3.Row, key: str) -> str:
+    value = row[key]
+    if type(value) is not str:
+        raise ValueError("candidate_state_corrupt")
+    try:
+        parse_iso_utc(value)
+    except ValueError:
+        raise ValueError("candidate_state_corrupt") from None
+    return value
 
 
 def inspect_candidate(
@@ -368,14 +809,105 @@ def inspect_candidate(
     ).fetchone()
     if row is None:
         raise ValueError("candidate_not_found")
-    evidence = [
-        {
-            "signal_type": str(item["signal_type"]),
-            "source_kind": str(item["source_kind"]),
-            "summary": str(item["summary"]),
-            "created_at": str(item["created_at"]),
+    status = row["status"]
+    category = row["problem_category"]
+    occurrence = row["occurrence_count"]
+    target_identity = row["target_identity"]
+    target_path = row["target_path"]
+    tombstone = row["tombstone_until"]
+    if type(target_identity) is not str or not target_identity:
+        raise ValueError("candidate_state_corrupt")
+    try:
+        target_identity_size = len(target_identity.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise ValueError("candidate_state_corrupt") from None
+    if (
+        type(status) is not str
+        or status
+        not in {"proposed", "prepared", "deferred", "rejected", "stale"}
+        or type(category) is not str
+        or category not in PROBLEM_CATEGORIES
+        or type(occurrence) is not int
+        or not 1 <= occurrence <= SQLITE_INTEGER_MAX
+        or target_identity_size > CATALOG_IDENTITY_MAX_BYTES
+    ):
+        raise ValueError("candidate_state_corrupt")
+    if status == "rejected":
+        if type(tombstone) is not str:
+            raise ValueError("candidate_state_corrupt")
+        try:
+            parse_iso_utc(tombstone)
+        except ValueError:
+            raise ValueError("candidate_state_corrupt") from None
+    elif tombstone is not None:
+        raise ValueError("candidate_state_corrupt")
+    first_seen = _candidate_timestamp(row, "first_seen_at")
+    last_seen = _candidate_timestamp(row, "last_seen_at")
+    updated = _candidate_timestamp(row, "updated_at")
+    if parse_iso_utc(first_seen) > parse_iso_utc(last_seen):
+        raise ValueError("candidate_state_corrupt")
+    if target_path is None:
+        if (
+            status not in {"stale", "rejected"}
+            or connection.execute(
+                """
+                SELECT 1 FROM candidate_evidence
+                WHERE candidate_id=? LIMIT 1
+                """,
+                (candidate_id,),
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("candidate_state_corrupt")
+        private = {
+            key: _redacted_candidate_marker(row, key)
+            for key in (
+                "target_locator",
+                "proposal_intent",
+                "problem_summary",
+                "proposal_summary",
+                "validation_plan",
+                "risk_level",
+            )
         }
-        for item in connection.execute(
+    else:
+        if type(target_path) is not str:
+            raise ValueError("candidate_state_corrupt")
+        try:
+            target_path_size = len(target_path.encode("utf-8"))
+            parsed_target_path = Path(target_path)
+        except (UnicodeEncodeError, ValueError):
+            raise ValueError("candidate_state_corrupt") from None
+        if (
+            not 1 <= target_path_size <= CANDIDATE_TARGET_PATH_MAX_BYTES
+            or "\x00" in target_path
+            or not parsed_target_path.is_absolute()
+            or ".." in parsed_target_path.parts
+            or str(parsed_target_path) != target_path
+            or type(row["risk_level"]) is not str
+            or row["risk_level"] not in RISK_LEVELS
+        ):
+            raise ValueError("candidate_state_corrupt")
+        private = {
+            "target_locator": _live_candidate_text(
+                row, "target_locator", 160
+            ),
+            "proposal_intent": _live_candidate_text(
+                row, "proposal_intent", 160
+            ),
+            "problem_summary": _live_candidate_text(
+                row, "problem_summary", 280
+            ),
+            "proposal_summary": _live_candidate_text(
+                row, "proposal_summary", 280
+            ),
+            "validation_plan": _live_candidate_text(
+                row, "validation_plan", 500
+            ),
+            "risk_level": row["risk_level"],
+        }
+    evidence = []
+    for item in connection.execute(
             """
             SELECT signal_type,source_kind,summary,created_at
             FROM candidate_evidence
@@ -383,40 +915,56 @@ def inspect_candidate(
             ORDER BY created_at,signal_type,source_kind
             """,
             (candidate_id,),
+        ):
+        signal_type = item["signal_type"]
+        source_kind = item["source_kind"]
+        summary = item["summary"]
+        created_at = item["created_at"]
+        if (
+            type(signal_type) is not str
+            or type(source_kind) is not str
+            or (signal_type, source_kind) not in SIGNAL_SOURCE_PAIRS
+            or type(summary) is not str
+            or type(created_at) is not str
+        ):
+            raise ValueError("candidate_state_corrupt")
+        try:
+            normalized_summary = normalize_candidate_text(summary, 280)
+            parse_iso_utc(created_at)
+        except ValueError:
+            raise ValueError("candidate_state_corrupt") from None
+        if normalized_summary != summary:
+            raise ValueError("candidate_state_corrupt")
+        evidence.append(
+            {
+                "signal_type": signal_type,
+                "source_kind": source_kind,
+                "summary": summary,
+                "created_at": created_at,
+            }
         )
-    ]
-    aggregate_row = connection.execute(
-        "SELECT value FROM metadata WHERE key=?",
-        (candidate_evidence_aggregate_key(candidate_id),),
-    ).fetchone()
-    aggregate = (
-        json.loads(str(aggregate_row["value"]))
-        if aggregate_row is not None
-        else {"schema_version": 1, "counts": [], "updated_at": None}
+    aggregate = load_candidate_evidence_aggregate(
+        connection, candidate_id
     )
     return {
         "schema_version": 1,
         "candidate_id": display_id("C", candidate_id),
-        "status": str(row["status"]),
-        "target_identity": str(row["target_identity"]),
+        "status": status,
+        "target_identity": target_identity,
         "classification": {
-            "problem_category": str(row["problem_category"]),
-            "target_locator": str(row["target_locator"]),
-            "proposal_intent": str(row["proposal_intent"]),
+            "problem_category": category,
+            "target_locator": private["target_locator"],
+            "proposal_intent": private["proposal_intent"],
         },
-        "problem_summary": str(row["problem_summary"]),
-        "proposal_summary": str(row["proposal_summary"]),
-        "validation_plan": str(row["validation_plan"]),
-        "risk_level": str(row["risk_level"]),
-        "occurrence_count": int(row["occurrence_count"]),
-        "first_seen_at": str(row["first_seen_at"]),
-        "last_seen_at": str(row["last_seen_at"]),
-        "updated_at": str(row["updated_at"]),
-        "tombstone_until": (
-            str(row["tombstone_until"])
-            if row["tombstone_until"] is not None
-            else None
-        ),
+        "problem_summary": private["problem_summary"],
+        "proposal_summary": private["proposal_summary"],
+        "validation_plan": private["validation_plan"],
+        "risk_level": private["risk_level"],
+        "occurrence_count": occurrence,
+        "first_seen_at": first_seen,
+        "last_seen_at": last_seen,
+        "updated_at": updated,
+        "tombstone_until": tombstone,
         "evidence": evidence,
         "evidence_aggregate": aggregate,
     }
@@ -424,7 +972,9 @@ def inspect_candidate(
 
 - [ ] **Step 4 (2–5 min): Implement the three compare-and-swap transitions**
 
-Add this function immediately after `inspect_candidate`:
+Add this function immediately after `inspect_candidate`. The source-state
+predicate includes the tombstone invariant: non-rejected states cannot carry a
+rejected-candidate tombstone.
 
 ```python
 def transition_candidate(
@@ -460,6 +1010,7 @@ def transition_candidate(
                   ELSE tombstone_until
                 END
             WHERE id=? AND status IN ({marks})
+              AND tombstone_until IS NULL
             """,
             (
                 target,
@@ -506,7 +1057,9 @@ git diff --cached --check
 git commit -m "feat(skill-evolver): expose candidate inbox state"
 ```
 
-Expected: all three tests pass; the commit contains only `evolver.py` and `test_review.py`.
+Expected: all three tests pass; Review discovery now prints `Ran 100 tests`
+and full discovery would run 355 tests. The commit contains only `evolver.py`
+and `test_review.py`.
 
 ---
 
@@ -694,17 +1247,17 @@ class ReviewSurfaceTests(CandidateBatchFixture):
         self.assertNotIn("owner_token", aborted)
 ```
 
-- [ ] **Step 2 (2–5 min): Add one 201-entry saturation test covering claim, abort, commit, and maintenance**
+- [ ] **Step 2 (2–5 min): Add four split-semantics cleanup tests**
 
 Add this class after `ReviewSurfaceTests`:
 
 ```python
 class ReviewResultCleanupSurfaceTests(CandidateBatchFixture):
-    def saturate_result_root(self) -> Path:
+    def saturate_result_root(self, minimum: int = 201) -> Path:
         root = self.runtime.review_result_root()
         present = len(list(root.iterdir()))
         number = 0
-        while present < 201:
+        while present < minimum:
             path = root / f"result-{number:032x}.json"
             number += 1
             if path.exists():
@@ -718,7 +1271,7 @@ class ReviewResultCleanupSurfaceTests(CandidateBatchFixture):
             )
             self.runtime.os.close(descriptor)
             present += 1
-        self.assertEqual(len(list(root.iterdir())), 201)
+        self.assertEqual(len(list(root.iterdir())), minimum)
         return root
 
     def assert_saturation_preserves_every_file(
@@ -752,30 +1305,67 @@ class ReviewResultCleanupSurfaceTests(CandidateBatchFixture):
             0,
         )
 
-    def test_abort_saturation_preserves_ready_batch(self) -> None:
+    def test_abort_commits_before_best_effort_saturated_cleanup(
+        self,
+    ) -> None:
         now = 2_000_000_000.0
         claim = self.claim(1, now)
-        self.assert_saturation_preserves_every_file(
-            lambda: self.runtime.abort_review_batch(
-                self.connection,
-                self.installation,
-                int(claim["batch_id"]),
-                str(claim["owner_token"]),
-                now + 1,
-            )
+        result_path = Path(str(claim["result_path"]))
+        root = self.saturate_result_root(202)
+        preserved = sorted(
+            path.name for path in root.iterdir()
+            if path != result_path
+        )
+        audit = self.runtime.abort_review_batch(
+            self.connection,
+            self.installation,
+            int(claim["batch_id"]),
+            str(claim["owner_token"]),
+            now + 1,
+        )
+        self.assertEqual(audit["terminal_status"], "aborted")
+        self.assertFalse(result_path.exists())
+        self.assertEqual(
+            sorted(path.name for path in root.iterdir()), preserved
         )
         status = self.connection.execute(
             "SELECT status FROM review_batches WHERE id=?",
             (int(claim["batch_id"]),),
         ).fetchone()["status"]
-        self.assertEqual(status, "ready")
+        self.assertEqual(status, "aborted")
+        self.assertIsNotNone(
+            self.connection.execute(
+                "SELECT 1 FROM metadata WHERE key=?",
+                (
+                    self.runtime.review_audit_key(
+                        int(claim["batch_id"])
+                    ),
+                ),
+            ).fetchone()
+        )
 
-    def test_commit_saturation_precedes_result_or_db_mutation(
+    def test_authenticated_commit_saturation_precedes_result_or_db_mutation(
         self,
     ) -> None:
         now = 2_000_000_000.0
         claim = self.claim(1, now)
         path = self.write_result(claim, self.result_payload(claim))
+        with mock.patch.object(
+            self.runtime,
+            "cleanup_review_results",
+            side_effect=AssertionError("cleanup before authentication"),
+        ), self.assertRaisesRegex(
+            ValueError, "review_batch_owner_mismatch"
+        ):
+            self.runtime.commit_review_result(
+                self.connection,
+                self.installation,
+                self.config,
+                int(claim["batch_id"]),
+                "00" * 32,
+                path,
+                now + 1,
+            )
         self.assert_saturation_preserves_every_file(
             lambda: self.runtime.commit_review_result(
                 self.connection,
@@ -794,29 +1384,71 @@ class ReviewResultCleanupSurfaceTests(CandidateBatchFixture):
             0,
         )
         self.assertTrue(path.exists())
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT status FROM review_batches WHERE id=?",
+                (int(claim["batch_id"]),),
+            ).fetchone()["status"],
+            "ready",
+        )
 
-    def test_maintenance_saturation_precedes_maintenance_mutation(
+    def test_maintenance_commits_before_best_effort_saturated_cleanup(
         self,
     ) -> None:
         now = 2_000_000_000.0
-        before = self.connection.execute(
-            "SELECT value FROM metadata WHERE key='last_maintenance_at'"
-        ).fetchone()
-        self.assert_saturation_preserves_every_file(
-            lambda: self.runtime.run_maintenance(
-                self.connection,
-                self.installation,
-                self.config,
-                now,
-            )
+        terminal_at = (
+            now - self.runtime.REVIEW_BATCH_AUDIT_TTL_SECONDS - 1
         )
-        after = self.connection.execute(
+        claim = self.claim(1, terminal_at - 1)
+        batch_id = int(claim["batch_id"])
+        self.runtime.abort_review_batch(
+            self.connection,
+            self.installation,
+            batch_id,
+            str(claim["owner_token"]),
+            terminal_at,
+        )
+        root = self.saturate_result_root()
+        names = sorted(path.name for path in root.iterdir())
+        result = self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            now,
+        )
+        self.assertEqual(result["result_scan_saturated"], 1)
+        self.assertEqual(result["result_cleanup_failed"], 0)
+        self.assertEqual(result["terminal_batches_deleted"], 1)
+        self.assertEqual(
+            sorted(path.name for path in root.iterdir()), names
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM review_batches WHERE id=?",
+                (batch_id,),
+            ).fetchone()[0],
+            0,
+        )
+        self.assertIsNone(
+            self.connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (self.runtime.review_audit_key(batch_id),),
+            ).fetchone()
+        )
+        maintained = self.connection.execute(
             "SELECT value FROM metadata WHERE key='last_maintenance_at'"
         ).fetchone()
-        self.assertEqual(after, before)
+        self.assertEqual(maintained["value"], self.runtime.iso_utc(now))
 ```
 
-This fixture relies on Plan 4B's patched private result root. Each test begins with exactly 201 entries. The required behavior is refusal before deletion or database mutation; it is not a best-effort partial cleanup.
+This fixture relies on Plan 4B's patched private result root. Claim and the
+authenticated commit see exactly 201 entries and refuse before their database
+mutation. Abort starts with 202 entries because identity-safe deletion of its
+one bound result must leave exactly 201 for the post-commit cleanup probe;
+that saturation cannot undo the aborted batch. Maintenance starts with 201,
+commits its bounded terminal batch/audit purge and maintenance timestamp, then
+reports saturation without deleting an arbitrary file. These are deliberately
+split semantics, not four copies of one assertion.
 
 - [ ] **Step 3 (2–5 min): Run the new surface tests and verify RED**
 
@@ -834,18 +1466,49 @@ cd /Users/igyeongseob/Documents/오픈소스
   -v
 ```
 
-Expected: surface tests fail because handlers and parsers do not exist; all four cleanup saturation tests already pass because Plans 4B and 4C integrated cleanup into claim, abort, commit, and maintenance.
+Expected: surface tests fail because handlers and parsers do not exist; all
+four cleanup tests already pass because Plans 4B and 4C implement the split
+claim/reader refusal and post-commit abort/maintenance cleanup semantics.
 
-- [ ] **Step 4 (2–5 min): Verify cleanup remains at the commit trust boundary**
+- [ ] **Step 4 (2–5 min): Verify cleanup remains at the authenticated reader boundary**
 
 Inspect the exact Plan 4C ordering:
 
 ```bash
 cd /Users/igyeongseob/Documents/오픈소스
-/usr/bin/python3 -c 'from pathlib import Path; text=Path("skill-evolver/skills/skill-evolver/scripts/evolver.py").read_text(encoding="utf-8"); start=text.index("def commit_review_result("); end=text.index("\ndef ",start+1); body=text[start:end]; assert body.index("cleanup_review_results(now)") < body.index("read_bound_review_result(") < body.index("BEGIN IMMEDIATE"); assert body.count("cleanup_review_results(now)") == 1; print("commit-result-cleanup-order: PASS")'
+/usr/bin/python3 - <<'PY'
+from pathlib import Path
+
+text = Path(
+    "skill-evolver/skills/skill-evolver/scripts/evolver.py"
+).read_text(encoding="utf-8")
+commit_start = text.index("def commit_review_result(")
+commit_end = text.index("\ndef ", commit_start + 1)
+commit = text[commit_start:commit_end]
+reader_start = text.index("def read_bound_review_result(")
+reader_end = text.index("\ndef ", reader_start + 1)
+reader = text[reader_start:reader_end]
+assert commit.count("cleanup_review_results(now)") == 0
+assert commit.index("read_bound_review_result(") < commit.index(
+    "BEGIN IMMEDIATE"
+)
+assert (
+    reader.index("require_live_review_batch(")
+    < reader.index("load_review_result_binding(")
+    < reader.index("review_result_path_unallocated")
+    < reader.index("cleanup_review_results(now)")
+    < reader.index("os.lstat(result_path)")
+)
+assert reader.count("cleanup_review_results(now)") == 1
+print("authenticated-result-cleanup-order: PASS")
+PY
 ```
 
-Expected: `commit-result-cleanup-order: PASS`. Do not move or duplicate this call and do not catch `review_result_namespace_saturated`; the exception must leave the database and every namespace entry unchanged.
+Expected: `authenticated-result-cleanup-order: PASS`.
+`commit_review_result` has zero direct cleanup calls. The one reader call
+occurs only after live-owner, binding, and exact allocated-path checks; a
+saturation exception then preserves the ready batch, candidate database, and
+bound result. Do not move cleanup ahead of those checks.
 
 - [ ] **Step 5 (2–5 min): Add exact handlers**
 
@@ -1061,7 +1724,12 @@ cd /Users/igyeongseob/Documents/오픈소스
   -v
 ```
 
-Expected: four surface tests and four saturation tests pass; all Review tests pass; status and inspect leave the database byte-for-byte unchanged and never call the transcript adapter; entry 201 blocks claim, abort, commit, and maintenance before any deletion or database mutation.
+Expected: four surface tests and four cleanup-boundary tests pass; Review
+discovery prints `Ran 108 tests`. Status and inspect leave the database
+byte-for-byte unchanged and never call the transcript adapter. Entry 201
+blocks claim and an authenticated commit before mutation; abort and
+maintenance complete their database work before best-effort cleanup, with
+maintenance reporting saturation. Full discovery would run 363 tests.
 
 - [ ] **Step 8 (2–5 min): Commit the exact CLI surface**
 
@@ -1335,7 +2003,9 @@ git diff --exit-code -- \
   .agents/plugins/marketplace.json
 ```
 
-Expected: both documentation tests pass; Hook and both manifests are byte-for-byte unchanged.
+Expected: both documentation tests pass; Review discovery now contains
+exactly 110 tests and full discovery would run 365 tests. Hook and both
+manifests are byte-for-byte unchanged.
 
 - [ ] **Step 6 (2–5 min): Commit the explicit orchestration docs**
 
@@ -1404,6 +2074,17 @@ from pathlib import Path
 tests = Path(
     "skill-evolver/skills/skill-evolver/tests"
 ).resolve()
+review_count = unittest.defaultTestLoader.discover(
+    str(tests), pattern="test_review.py"
+).countTestCases()
+capture_count = unittest.defaultTestLoader.discover(
+    str(tests), pattern="test_capture.py"
+).countTestCases()
+if (review_count, capture_count) != (110, 82):
+    raise SystemExit(
+        "suite-count-contract-failed "
+        f"review={review_count} capture={capture_count}"
+    )
 suite = unittest.defaultTestLoader.discover(
     str(tests), pattern="test_*.py"
 )
@@ -1421,22 +2102,28 @@ expected = sorted(
 )
 if (
     not result.wasSuccessful()
-    or result.testsRun != 360
+    or result.testsRun != 365
     or skipped != expected
 ):
     raise SystemExit(
         f"full-suite-failed tests={result.testsRun} skips={skipped}"
     )
 print(
-    f"review-full-suite: PASS tests={result.testsRun} skipped=3"
+    "review-full-suite: PASS "
+    f"tests={result.testsRun} review={review_count} "
+    f"capture={capture_count} skipped=3"
 )
 PY
-/usr/bin/python3 -m py_compile \
+env PYTHONPYCACHEPREFIX=/private/tmp/skill-evolver-pycache \
+  /usr/bin/python3 -m py_compile \
   skill-evolver/skills/skill-evolver/scripts/evolver.py
 git diff --check
 ```
 
-Expected: the final line is `review-full-suite: PASS tests=360 skipped=3`; the skipped method names are exactly the three asserted names; compilation and whitespace validation exit `0`.
+Expected: the final line reports `review-full-suite: PASS`, `tests=365`,
+`review=110`, `capture=82`, and `skipped=3`; the skipped method names are
+exactly the three asserted names; compilation and whitespace validation exit
+`0`.
 
 - [ ] **Step 4 (2–5 min): Prove command access and zero-write boundaries**
 
@@ -1459,7 +2146,11 @@ git diff --exit-code -- \
   .agents/plugins/marketplace.json
 ```
 
-Expected: `review-command-contract: PASS`; read-only/no-transcript and cleanup-cap tests pass; Hook and manifests remain unchanged. The test suite, not a live user skill root, is the evidence for zero installed-skill, staging, and snapshot writes.
+Expected: `review-command-contract: PASS`; read-only/no-transcript and
+split cleanup-boundary tests pass; Hook and manifests remain unchanged. Claim
+and authenticated commit refuse saturation, while abort and maintenance prove
+post-commit best-effort cleanup. The test suite, not a live user skill root, is
+the evidence for zero installed-skill, staging, and snapshot writes.
 
 - [ ] **Step 5 (2–5 min): Run an independent specification review**
 
@@ -1476,7 +2167,7 @@ do
 done
 SPEC_REVIEW="$(
   codex exec --sandbox read-only \
-    'Review the committed Phase 4 Skill Evolver implementation against skill-evolver/docs/superpowers/specs/2026-07-29-skill-evolver-session-review-inbox-design.md and skill-evolver/docs/superpowers/plans/2026-07-29-skill-evolver-review-contract-adapters.md, skill-evolver/docs/superpowers/plans/2026-07-29-skill-evolver-review-batch-export.md, skill-evolver/docs/superpowers/plans/2026-07-29-skill-evolver-review-candidate-inbox.md, and skill-evolver/docs/superpowers/plans/2026-07-29-skill-evolver-review-surface-release.md. Inspect skill-evolver/skills/skill-evolver/scripts/evolver.py, skill-evolver/skills/skill-evolver/tests/test_capture.py, skill-evolver/skills/skill-evolver/tests/test_review.py, skill-evolver/skills/skill-evolver/SKILL.md, and skill-evolver/README.md. Check exact schema, frozen generation and fresh in-transaction runtime/catalog digest revalidation, live-snapshot target resolution, post-read result-binding revalidation inside the candidate transaction, persisted export-exclusion and capacity merging, remaining-member finalization, atomicity, one candidate per session, three-new-fingerprint cap, result cleanup, model-prefix-independent redaction, complete stale/expired revival, read-only commands, transition CAS, retention, and forbidden writes. Do not edit. End with exactly CLEAN if there is no actionable finding; otherwise end with FINDINGS.' \
+    'Review the committed Phase 4 Skill Evolver implementation against skill-evolver/docs/superpowers/specs/2026-07-29-skill-evolver-session-review-inbox-design.md and skill-evolver/docs/superpowers/plans/2026-07-29-skill-evolver-review-contract-adapters.md, skill-evolver/docs/superpowers/plans/2026-07-29-skill-evolver-review-batch-export.md, skill-evolver/docs/superpowers/plans/2026-07-29-skill-evolver-review-candidate-inbox.md, and skill-evolver/docs/superpowers/plans/2026-07-29-skill-evolver-review-surface-release.md. Inspect skill-evolver/skills/skill-evolver/scripts/evolver.py, skill-evolver/skills/skill-evolver/tests/test_capture.py, skill-evolver/skills/skill-evolver/tests/test_review.py, skill-evolver/skills/skill-evolver/SKILL.md, and skill-evolver/README.md. Check exact schema, frozen generation and fresh in-transaction runtime/catalog digest revalidation, live-snapshot target resolution, post-read result-binding revalidation inside the candidate transaction, persisted export-exclusion and capacity merging, remaining-member finalization, atomicity, one candidate per session, three-new-fingerprint cap, authenticated result cleanup with zero direct commit cleanup, claim/authenticated-commit saturation refusal, post-commit best-effort abort/maintenance cleanup, bounded atomic terminal batch/audit purge, strict aggregate inspection, exact display/scalar validation, system-owned target_path live/redacted branching, exact redacted markers including risk_level, model-prefix-independent redaction, complete stale/expired revival, read-only commands, transition updated_at/tombstone invariants, retention, and forbidden writes. Do not edit. End with exactly CLEAN if there is no actionable finding; otherwise end with FINDINGS.' \
   | tail -n 1
 )"
 test "$SPEC_REVIEW" = "CLEAN"
@@ -1493,7 +2184,7 @@ correction, rerun Steps 3 through 5, and obtain `CLEAN`.
 cd /Users/igyeongseob/Documents/오픈소스
 SECURITY_REVIEW="$(
   codex exec --sandbox read-only \
-    'Security-review the committed Phase 4 Skill Evolver implementation against skill-evolver/docs/superpowers/specs/2026-07-29-skill-evolver-session-review-inbox-design.md and the authoritative child plans skill-evolver/docs/superpowers/plans/2026-07-29-skill-evolver-review-contract-adapters.md, skill-evolver/docs/superpowers/plans/2026-07-29-skill-evolver-review-batch-export.md, skill-evolver/docs/superpowers/plans/2026-07-29-skill-evolver-review-candidate-inbox.md, and skill-evolver/docs/superpowers/plans/2026-07-29-skill-evolver-review-surface-release.md. Inspect skill-evolver/skills/skill-evolver/scripts/evolver.py, skill-evolver/skills/skill-evolver/tests/test_capture.py, skill-evolver/skills/skill-evolver/tests/test_review.py, skill-evolver/skills/skill-evolver/SKILL.md, and skill-evolver/README.md for no-follow and inode binding, fail-closed post-read result-binding rotation, owner-token persistence, transcript and record-ref leakage, Unicode secret redaction, model-prefix-independent terminal redaction, complete stale/expired revival, residual-secret rollback, foreign result preservation, persisted exclusion/capacity merging, remaining-member finalization, 201-entry namespace refusal, catalog allowlisting, fresh in-transaction runtime/catalog digest revalidation, live-snapshot target resolution, read-only status and inspect, scoped mutations, and 30/90/180 deletion. Confirm Python has no model or network call and no installed-skill, staging, snapshot, Hook, or schema mutation. Do not edit. End with exactly CLEAN if there is no actionable finding; otherwise end with FINDINGS.' \
+    'Security-review the committed Phase 4 Skill Evolver implementation against skill-evolver/docs/superpowers/specs/2026-07-29-skill-evolver-session-review-inbox-design.md and the authoritative child plans skill-evolver/docs/superpowers/plans/2026-07-29-skill-evolver-review-contract-adapters.md, skill-evolver/docs/superpowers/plans/2026-07-29-skill-evolver-review-batch-export.md, skill-evolver/docs/superpowers/plans/2026-07-29-skill-evolver-review-candidate-inbox.md, and skill-evolver/docs/superpowers/plans/2026-07-29-skill-evolver-review-surface-release.md. Inspect skill-evolver/skills/skill-evolver/scripts/evolver.py, skill-evolver/skills/skill-evolver/tests/test_capture.py, skill-evolver/skills/skill-evolver/tests/test_review.py, skill-evolver/skills/skill-evolver/SKILL.md, and skill-evolver/README.md for no-follow and inode binding, fail-closed post-read result-binding rotation, owner-token persistence, transcript and record-ref leakage, Unicode secret redaction, model-prefix-independent terminal redaction, complete stale/expired revival, residual-secret rollback, foreign result preservation, persisted exclusion/capacity merging, remaining-member finalization, owner/binding/path authentication before result cleanup, zero direct commit cleanup, claim/authenticated-commit saturation refusal, post-commit best-effort abort/maintenance cleanup, bounded atomic terminal batch/audit purge, strict bounded canonical aggregate inspection, exact display/scalar validation, system-owned target_path live/redacted branching, exact redacted markers including risk_level, transition updated_at/tombstone invariants, catalog allowlisting, fresh in-transaction runtime/catalog digest revalidation, live-snapshot target resolution, read-only status and inspect, scoped mutations, and 30/90/180 deletion. Confirm Python has no model or network call and no installed-skill, staging, snapshot, Hook, or schema mutation. Do not edit. End with exactly CLEAN if there is no actionable finding; otherwise end with FINDINGS.' \
   | tail -n 1
 )"
 test "$SECURITY_REVIEW" = "CLEAN"
@@ -1614,7 +2305,7 @@ report = {
         "candidate_transaction_atomic": True,
         "one_candidate_per_session": True,
         "three_new_fingerprints_per_batch": True,
-        "result_namespace_bounded": True,
+        "split_result_cleanup_boundaries": True,
         "status_and_inspect_read_only": True,
         "retention_30_90_180": True,
         "installed_skill_writes_zero": True,
@@ -1623,7 +2314,9 @@ report = {
     },
     "tests": {
         "result": "PASS",
-        "tests_run": 360,
+        "tests_run": 365,
+        "review_tests_run": 110,
+        "capture_tests_run": 82,
         "historical_skip_count": 3,
         "historical_skips": [
             "test_manifest_and_hook_are_discoverable",
@@ -1715,16 +2408,34 @@ assert report["digests"] == {
         module.catalog_adapter_digest(runtime)
     ),
 }
-assert len(report["checks"]) == 13
+assert set(report["checks"]) == {
+    "explicit_review_only",
+    "exact_session_result_coverage",
+    "frozen_generation_revalidated",
+    "static_and_dynamic_digests_revalidated",
+    "candidate_transaction_atomic",
+    "one_candidate_per_session",
+    "three_new_fingerprints_per_batch",
+    "split_result_cleanup_boundaries",
+    "status_and_inspect_read_only",
+    "retention_30_90_180",
+    "installed_skill_writes_zero",
+    "staging_writes_zero",
+    "snapshot_writes_zero",
+}
 assert all(report["checks"].values())
 assert set(report["tests"]) == {
     "result",
     "tests_run",
+    "review_tests_run",
+    "capture_tests_run",
     "historical_skip_count",
     "historical_skips",
 }
 assert report["tests"]["result"] == "PASS"
-assert report["tests"]["tests_run"] == 360
+assert report["tests"]["tests_run"] == 365
+assert report["tests"]["review_tests_run"] == 110
+assert report["tests"]["capture_tests_run"] == 82
 assert report["tests"]["historical_skip_count"] == 3
 assert sorted(report["tests"]["historical_skips"]) == sorted(
     [
@@ -1790,9 +2501,17 @@ Expected: one report-only commit. The report's `implementation_commit` remains i
 
 Use GSD only as the project-management layer. Do not invoke GSD discuss, plan, or execute workflows; the four Superpowers plans are the implementation authority.
 
+For both patches below, determine the current local calendar date at execution
+time (`YYYY-MM-DD`). Replace every `<CURRENT_DATE>` placeholder in added lines
+with that one date inside the `apply_patch` input. Do not copy the `2026-07-29`
+document-name date into completion metadata, do not leave a placeholder in a
+created file, and do not rewrite historical removed/context lines merely to
+change their date.
+
 - [ ] **Step 1 (2–5 min): Create the Phase 4 plan, summary, and verification record with `apply_patch`**
 
-Call `functions.apply_patch` once with this exact patch:
+Call `functions.apply_patch` once with this patch after substituting the current
+date as directed above:
 
 ```diff
 *** Begin Patch
@@ -1914,7 +2633,7 @@ Call `functions.apply_patch` once with this exact patch:
 +  - "Three new fingerprints per batch is transactional; overflow rolls back."
 +  - "Phase 4 proves mechanics and safety, not candidate quality."
 +duration: not-recorded
-+completed: 2026-07-29
++completed: <CURRENT_DATE>
 +status: complete
 +---
 +
@@ -1959,7 +2678,7 @@ Call `functions.apply_patch` once with this exact patch:
 *** Add File: skill-evolver/.planning/phases/04-review-and-inbox/04-VERIFICATION.md
 +---
 +phase: 04-review-and-inbox
-+verified: 2026-07-29
++verified: <CURRENT_DATE>
 +status: passed
 +score: 4/4 must-haves verified
 +behavior_unverified: 0
@@ -2010,7 +2729,8 @@ Expected: the three Phase 4 files are created; they record `REVIEW-01` only, exp
 
 - [ ] **Step 2 (2–5 min): Advance ROADMAP, STATE, and REQUIREMENTS to Phase 5**
 
-Use `apply_patch` for these exact semantic changes:
+Use `apply_patch` for these exact semantic changes, substituting the same
+current date:
 
 Call `functions.apply_patch` once with this exact patch:
 
@@ -2030,11 +2750,11 @@ Call `functions.apply_patch` once with this exact patch:
 -Plans:
 -- [ ] 04-01: Transcript adapter, bounded review와 candidate inbox
 +Plans:
-+- [x] 04-01: Transcript adapter, bounded review와 candidate inbox — completed 2026-07-29
++- [x] 04-01: Transcript adapter, bounded review와 candidate inbox — completed <CURRENT_DATE>
 @@
 -| 4. Review and Inbox | 0/1 | Not started (current) | - |
 -| 5. Read-only Quality Gate | 0/1 | Not started | - |
-+| 4. Review and Inbox | 1/1 | Complete (gate PASS) | 2026-07-29 |
++| 4. Review and Inbox | 1/1 | Complete (gate PASS) | <CURRENT_DATE> |
 +| 5. Read-only Quality Gate | 0/1 | Not started (current) | - |
 *** Update File: skill-evolver/.planning/REQUIREMENTS.md
 @@
@@ -2065,7 +2785,7 @@ Call `functions.apply_patch` once with this exact patch:
 +Phase: 5 of 11 (Read-only Quality Gate)
 +Plan: 0 of 1 in current phase
 +Status: Ready to design the read-only sample and human-label gate
-+Last activity: 2026-07-29 — Phase 4 Review and Inbox gate recorded PASS;
++Last activity: <CURRENT_DATE> — Phase 4 Review and Inbox gate recorded PASS;
 +`REVIEW-01` complete; canonical report committed
 @@
 -Progress: [███░░░░░░░] 27%
@@ -2113,18 +2833,21 @@ Call `functions.apply_patch` once with this exact patch:
 @@
 -Last session: 2026-07-29
 -Stopped at: Phase 3 complete and verified; Phase 4 Review plan rewrite is current
-+Last session: 2026-07-29
++Last session: <CURRENT_DATE>
 +Stopped at: Phase 4 complete and verified; Phase 5 read-only quality planning is current
 *** End Patch
 ```
 
-Apply this patch literally. Do not mark `QUALITY-01` complete and do not record a Phase 5 decision.
+Apart from the required `<CURRENT_DATE>` substitutions, apply this patch
+literally. Do not mark `QUALITY-01` complete and do not record a Phase 5
+decision.
 
 - [ ] **Step 3 (2–5 min): Validate the exact management state**
 
 ```bash
 cd /Users/igyeongseob/Documents/오픈소스
 /usr/bin/python3 - <<'PY'
+import time
 from pathlib import Path
 
 roadmap = Path("skill-evolver/.planning/ROADMAP.md").read_text(
@@ -2138,6 +2861,7 @@ requirements = Path(
 ).read_text(
     encoding="utf-8"
 )
+current_date = time.strftime("%Y-%m-%d", time.localtime())
 assert "[x] **Phase 4: Review and Inbox**" in roadmap
 assert "| 4. Review and Inbox | 1/1 | Complete (gate PASS)" in roadmap
 assert "Phase 5: Read-only Quality Gate**" in roadmap
@@ -2148,6 +2872,10 @@ assert "completed_phases: 4" in state
 assert "completed_plans: 4" in state
 assert "percent: 36" in state
 assert "Phase 5 — Read-only Quality Gate" in state
+assert f"completed {current_date}" in roadmap
+assert f"| Complete (gate PASS) | {current_date} |" in roadmap
+assert f"Last activity: {current_date}" in state
+assert f"Last session: {current_date}" in state
 assert "[x] **REVIEW-01**" in requirements
 assert "| REVIEW-01 | Phase 4 | Complete |" in requirements
 assert "[ ] **QUALITY-01**" in requirements
@@ -2159,6 +2887,17 @@ for path in (
     text = Path(path).read_text(encoding="utf-8")
     assert "QUALITY-01" in text
     assert "quality" in text.casefold()
+    assert "<CURRENT_DATE>" not in text
+summary = Path(
+    "skill-evolver/.planning/phases/"
+    "04-review-and-inbox/04-01-SUMMARY.md"
+).read_text(encoding="utf-8")
+verification = Path(
+    "skill-evolver/.planning/phases/"
+    "04-review-and-inbox/04-VERIFICATION.md"
+).read_text(encoding="utf-8")
+assert f"completed: {current_date}" in summary
+assert f"verified: {current_date}" in verification
 print("phase-4-gsd-handoff: PASS")
 PY
 git diff --check
@@ -2192,11 +2931,25 @@ Expected: one planning-only commit. Phase 5 remains unimplemented, `QUALITY-01` 
 Phase 4 is complete only after all of the following are true:
 
 - exact Review, catalog, inspect, defer, resume, and reject commands are committed;
-- claim, abort, commit, and maintenance refuse a 201-entry result namespace before mutation;
+- candidate inspection reuses the strict bounded canonical aggregate loader,
+  rejects non-exact display/scalar state, branches only on the system-owned
+  `target_path` sentinel, validates all six redacted markers including
+  `risk_level`, rejects redacted rows with remaining individual evidence, and
+  exposes no private identifiers;
+- manual transitions preserve the `updated_at` status clock and rejected-only
+  tombstone invariant;
+- claim and an authenticated commit refuse a saturated result namespace before
+  their mutations; commit has no direct cleanup call and reader cleanup follows
+  live-owner, binding, and exact-path authentication;
+- abort and maintenance commit first, then perform best-effort cleanup without
+  allowing saturation to undo terminal/privacy work; the existing bounded
+  atomic terminal batch/audit purge remains unchanged;
 - status and inspect are read-only and transcript-free;
 - SKILL orchestration is explicit-only and retains no owner token;
-- the full suite passes with only the three exact historical skips;
+- the full suite runs exactly 365 tests (110 Review, 82 capture) and passes
+  with only the three exact historical skips;
 - two independent reviews return `CLEAN`;
 - the implementation is frozen before report creation;
 - `docs/release-reports/review-inbox.json` is committed with decision `PASS`, thirteen true checks, and `quality_gate_claimed: false`;
-- GSD records Phase 4 as `1/1` complete and routes only to the Phase 5 read-only quality sample.
+- GSD records Phase 4 as `1/1` complete using the execution date and routes
+  only to the Phase 5 read-only quality sample.
