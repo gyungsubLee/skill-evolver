@@ -9137,6 +9137,143 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_review_claim(args: argparse.Namespace) -> int:
+    installation = load_installation(Path(args.installation))
+    config = load_config(installation)
+    connection = open_database(installation)
+    try:
+        result = claim_review_batch(
+            connection, installation, config, time.time()
+        )
+    finally:
+        connection.close()
+    write_json_stdout(result)
+    return 0
+
+
+def cmd_review_heartbeat(args: argparse.Namespace) -> int:
+    installation = load_installation(Path(args.installation))
+    config = load_config(installation)
+    connection = open_database(installation)
+    try:
+        extended = heartbeat_review_batch(
+            connection,
+            installation,
+            int(args.batch_id),
+            str(args.owner_token),
+            time.time(),
+            config,
+        )
+    finally:
+        connection.close()
+    if not extended:
+        raise ValueError("review_lease_unavailable")
+    write_json_stdout(
+        {
+            "schema_version": 1,
+            "status": "ready",
+            "batch_id": int(args.batch_id),
+            "lease_extended": True,
+        }
+    )
+    return 0
+
+
+def cmd_review_commit(args: argparse.Namespace) -> int:
+    installation = load_installation(Path(args.installation))
+    config = load_config(installation)
+    connection = open_database(installation)
+    try:
+        result = commit_review_result(
+            connection,
+            installation,
+            config,
+            int(args.batch_id),
+            str(args.owner_token),
+            Path(args.result),
+            time.time(),
+        )
+    finally:
+        connection.close()
+    write_json_stdout(result)
+    return 0
+
+
+def cmd_review_abort(args: argparse.Namespace) -> int:
+    installation = load_installation(Path(args.installation))
+    connection = open_database(installation)
+    try:
+        result = abort_review_batch(
+            connection,
+            installation,
+            int(args.batch_id),
+            str(args.owner_token),
+            time.time(),
+        )
+    finally:
+        connection.close()
+    write_json_stdout(result)
+    return 0
+
+
+def cmd_catalog_inspect(args: argparse.Namespace) -> int:
+    load_installation(Path(args.installation))
+    runtime = load_review_runtime()
+    snapshot = build_catalog_snapshot(runtime)
+    entry = resolve_catalog_target(
+        snapshot, str(args.target_identity)
+    )
+    content = inspect_catalog_target(
+        runtime, snapshot, entry.identity
+    )
+    write_json_stdout(
+        {
+            "schema_version": 1,
+            "target_identity": entry.identity,
+            "skill_sha256": entry.skill_sha256,
+            "content": content.decode("utf-8"),
+        }
+    )
+    return 0
+
+
+def cmd_inspect(args: argparse.Namespace) -> int:
+    installation = load_installation(Path(args.installation))
+    connection = open_database(installation, read_only=True)
+    try:
+        result = inspect_candidate(
+            connection, str(args.candidate_id)
+        )
+    finally:
+        connection.close()
+    write_json_stdout(result)
+    return 0
+
+
+def cmd_candidate_transition(args: argparse.Namespace) -> int:
+    installation = load_installation(Path(args.installation))
+    config = load_config(installation)
+    connection = open_database(installation)
+    try:
+        result = transition_candidate(
+            connection,
+            str(args.candidate_id),
+            str(args.command),
+            config,
+            time.time(),
+        )
+    finally:
+        connection.close()
+    write_json_stdout(result)
+    return 0
+
+
+def add_installation_argument(
+    parser: argparse.ArgumentParser,
+) -> None:
+    parser.add_argument("--installation", required=True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="evolver.py")
     parser.add_argument("--version", action="version", version=VERSION)
@@ -9147,14 +9284,61 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--config", required=True)
     init.set_defaults(handler=cmd_init)
     enqueue = commands.add_parser("enqueue-stop")
-    enqueue.add_argument("--installation", required=True)
+    add_installation_argument(enqueue)
     enqueue.set_defaults(handler=cmd_enqueue_stop)
     maintain = commands.add_parser("maintain")
-    maintain.add_argument("--installation", required=True)
+    add_installation_argument(maintain)
     maintain.set_defaults(handler=cmd_maintain)
     status = commands.add_parser("status")
-    status.add_argument("--installation", required=True)
+    add_installation_argument(status)
     status.set_defaults(handler=cmd_status)
+
+    review_claim = commands.add_parser("review-claim")
+    add_installation_argument(review_claim)
+    review_claim.set_defaults(handler=cmd_review_claim)
+
+    review_heartbeat = commands.add_parser("review-heartbeat")
+    add_installation_argument(review_heartbeat)
+    review_heartbeat.add_argument(
+        "--batch-id", type=int, required=True
+    )
+    review_heartbeat.add_argument("--owner-token", required=True)
+    review_heartbeat.set_defaults(handler=cmd_review_heartbeat)
+
+    review_commit = commands.add_parser("review-commit")
+    add_installation_argument(review_commit)
+    review_commit.add_argument(
+        "--batch-id", type=int, required=True
+    )
+    review_commit.add_argument("--owner-token", required=True)
+    review_commit.add_argument("--result", required=True)
+    review_commit.set_defaults(handler=cmd_review_commit)
+
+    review_abort = commands.add_parser("review-abort")
+    add_installation_argument(review_abort)
+    review_abort.add_argument(
+        "--batch-id", type=int, required=True
+    )
+    review_abort.add_argument("--owner-token", required=True)
+    review_abort.set_defaults(handler=cmd_review_abort)
+
+    catalog_inspect = commands.add_parser("catalog-inspect")
+    add_installation_argument(catalog_inspect)
+    catalog_inspect.add_argument(
+        "--target-identity", required=True
+    )
+    catalog_inspect.set_defaults(handler=cmd_catalog_inspect)
+
+    inspect = commands.add_parser("inspect")
+    add_installation_argument(inspect)
+    inspect.add_argument("candidate_id")
+    inspect.set_defaults(handler=cmd_inspect)
+
+    for name in ("defer", "resume", "reject"):
+        transition = commands.add_parser(name)
+        add_installation_argument(transition)
+        transition.add_argument("candidate_id")
+        transition.set_defaults(handler=cmd_candidate_transition)
     return parser
 
 

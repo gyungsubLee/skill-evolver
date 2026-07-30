@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import argparse
 import copy
 import errno
 import hashlib
 import hmac
 import inspect
+import io
 import json
 import os
 import secrets
@@ -12842,3 +12844,388 @@ class CandidateInboxTests(CandidateBatchFixture):
             self.runtime.inspect_candidate(
                 self.connection, CandidateIdSubclass(identity)
             )
+
+
+class ReviewSurfaceTests(CandidateBatchFixture):
+    def capture_handler(
+        self,
+        handler: object,
+        namespace: argparse.Namespace,
+    ) -> dict[str, object]:
+        stream = io.BytesIO()
+        stdout = mock.Mock()
+        stdout.buffer = stream
+        with mock.patch.object(self.runtime.sys, "stdout", stdout):
+            self.assertEqual(handler(namespace), 0)
+        return json.loads(stream.getvalue())
+
+    def test_parser_has_only_the_exact_review_and_inbox_commands(
+        self,
+    ) -> None:
+        parser = self.runtime.build_parser()
+        action = next(
+            item
+            for item in parser._actions
+            if isinstance(item, argparse._SubParsersAction)
+        )
+        self.assertEqual(
+            set(action.choices),
+            {
+                "init",
+                "enqueue-stop",
+                "maintain",
+                "status",
+                "review-claim",
+                "review-heartbeat",
+                "review-commit",
+                "review-abort",
+                "catalog-inspect",
+                "inspect",
+                "defer",
+                "resume",
+                "reject",
+            },
+        )
+
+    def test_status_and_inspect_are_read_only_and_transcript_free(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        candidate_id = CandidateInboxTests.committed_candidate(
+            self, now
+        )
+        database_before = self.installation.database.read_bytes()
+        with mock.patch.object(
+            self.runtime,
+            "read_frozen_transcript",
+            side_effect=AssertionError("transcript opened"),
+        ), mock.patch.object(
+            self.runtime.time, "time", return_value=now + 2
+        ):
+            status = self.capture_handler(
+                self.runtime.cmd_status,
+                argparse.Namespace(
+                    installation=str(
+                        self.installation.data_root
+                        / "installation.json"
+                    )
+                ),
+            )
+            inspected = self.capture_handler(
+                self.runtime.cmd_inspect,
+                argparse.Namespace(
+                    installation=str(
+                        self.installation.data_root
+                        / "installation.json"
+                    ),
+                    candidate_id=self.runtime.display_id(
+                        "C", candidate_id
+                    ),
+                ),
+            )
+        self.assertEqual(status["schema_version"], 1)
+        self.assertEqual(
+            inspected["candidate_id"],
+            self.runtime.display_id("C", candidate_id),
+        )
+        self.assertEqual(
+            self.installation.database.read_bytes(), database_before
+        )
+
+    def test_catalog_inspect_returns_one_bound_target(self) -> None:
+        payload = self.capture_handler(
+            self.runtime.cmd_catalog_inspect,
+            argparse.Namespace(
+                installation=str(
+                    self.installation.data_root / "installation.json"
+                ),
+                target_identity=self.catalog_entry.identity,
+            ),
+        )
+        self.assertEqual(
+            set(payload),
+            {
+                "schema_version",
+                "target_identity",
+                "skill_sha256",
+                "content",
+            },
+        )
+        self.assertEqual(
+            payload["target_identity"],
+            self.catalog_entry.identity,
+        )
+        self.assertRegex(
+            payload["skill_sha256"], r"^[0-9a-f]{64}$"
+        )
+        self.assertIsInstance(payload["content"], str)
+
+    def test_review_handlers_preserve_underlying_output_contracts(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        self.insert_pending(self.connection, 30, now=now)
+        with mock.patch.object(
+            self.runtime,
+            "read_frozen_transcript",
+            return_value=self.make_export("record"),
+        ), mock.patch.object(
+            self.runtime.time, "time", return_value=now
+        ):
+            claimed = self.capture_handler(
+                self.runtime.cmd_review_claim,
+                argparse.Namespace(
+                    installation=str(
+                        self.installation.data_root
+                        / "installation.json"
+                    )
+                ),
+            )
+        self.assertEqual(
+            set(claimed),
+            {
+                "schema_version",
+                "status",
+                "batch_id",
+                "owner_token",
+                "contract_digest",
+                "lease_expires_at",
+                "result_path",
+                "envelope",
+            },
+        )
+        with mock.patch.object(
+            self.runtime.time, "time", return_value=now + 1
+        ):
+            heartbeat = self.capture_handler(
+                self.runtime.cmd_review_heartbeat,
+                argparse.Namespace(
+                    installation=str(
+                        self.installation.data_root
+                        / "installation.json"
+                    ),
+                    batch_id=int(claimed["batch_id"]),
+                    owner_token=str(claimed["owner_token"]),
+                ),
+            )
+        self.assertEqual(
+            heartbeat,
+            {
+                "schema_version": 1,
+                "status": "ready",
+                "batch_id": int(claimed["batch_id"]),
+                "lease_extended": True,
+            },
+        )
+        with mock.patch.object(
+            self.runtime.time, "time", return_value=now + 2
+        ):
+            aborted = self.capture_handler(
+                self.runtime.cmd_review_abort,
+                argparse.Namespace(
+                    installation=str(
+                        self.installation.data_root
+                        / "installation.json"
+                    ),
+                    batch_id=int(claimed["batch_id"]),
+                    owner_token=str(claimed["owner_token"]),
+                ),
+            )
+        self.assertEqual(aborted["terminal_status"], "aborted")
+        self.assertNotIn("owner_token", aborted)
+
+
+class ReviewResultCleanupSurfaceTests(CandidateBatchFixture):
+    def saturate_result_root(self, minimum: int = 201) -> Path:
+        root = self.runtime.review_result_root()
+        present = len(list(root.iterdir()))
+        number = 0
+        while present < minimum:
+            path = root / f"result-{number:032x}.json"
+            number += 1
+            if path.exists():
+                continue
+            descriptor = self.runtime.os.open(
+                path,
+                self.runtime.os.O_WRONLY
+                | self.runtime.os.O_CREAT
+                | self.runtime.os.O_EXCL,
+                0o600,
+            )
+            self.runtime.os.close(descriptor)
+            present += 1
+        self.assertEqual(len(list(root.iterdir())), minimum)
+        return root
+
+    def assert_saturation_preserves_every_file(
+        self, operation: object
+    ) -> None:
+        root = self.saturate_result_root()
+        names = sorted(path.name for path in root.iterdir())
+        with self.assertRaisesRegex(
+            ValueError, "review_result_namespace_saturated"
+        ):
+            operation()
+        self.assertEqual(
+            sorted(path.name for path in root.iterdir()), names
+        )
+
+    def test_claim_saturation_precedes_batch_mutation(self) -> None:
+        now = 2_000_000_000.0
+        self.insert_pending(self.connection, 40, now=now)
+        self.assert_saturation_preserves_every_file(
+            lambda: self.runtime.claim_review_batch(
+                self.connection,
+                self.installation,
+                self.config,
+                now,
+            )
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM review_batches"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_abort_commits_before_best_effort_saturated_cleanup(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        claim = self.claim(1, now)
+        result_path = Path(str(claim["result_path"]))
+        root = self.saturate_result_root(202)
+        preserved = sorted(
+            path.name for path in root.iterdir()
+            if path != result_path
+        )
+        audit = self.runtime.abort_review_batch(
+            self.connection,
+            self.installation,
+            int(claim["batch_id"]),
+            str(claim["owner_token"]),
+            now + 1,
+        )
+        self.assertEqual(audit["terminal_status"], "aborted")
+        self.assertFalse(result_path.exists())
+        self.assertEqual(
+            sorted(path.name for path in root.iterdir()), preserved
+        )
+        status = self.connection.execute(
+            "SELECT status FROM review_batches WHERE id=?",
+            (int(claim["batch_id"]),),
+        ).fetchone()["status"]
+        self.assertEqual(status, "aborted")
+        self.assertIsNotNone(
+            self.connection.execute(
+                "SELECT 1 FROM metadata WHERE key=?",
+                (
+                    self.runtime.review_audit_key(
+                        int(claim["batch_id"])
+                    ),
+                ),
+            ).fetchone()
+        )
+
+    def test_authenticated_commit_saturation_precedes_result_or_db_mutation(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        claim = self.claim(1, now)
+        path = self.write_result(claim, self.result_payload(claim))
+        with mock.patch.object(
+            self.runtime,
+            "cleanup_review_results",
+            side_effect=AssertionError(
+                "cleanup before authentication"
+            ),
+        ), self.assertRaisesRegex(
+            ValueError, "review_batch_owner_mismatch"
+        ):
+            self.runtime.commit_review_result(
+                self.connection,
+                self.installation,
+                self.config,
+                int(claim["batch_id"]),
+                "00" * 32,
+                path,
+                now + 1,
+            )
+        self.assert_saturation_preserves_every_file(
+            lambda: self.runtime.commit_review_result(
+                self.connection,
+                self.installation,
+                self.config,
+                int(claim["batch_id"]),
+                str(claim["owner_token"]),
+                path,
+                now + 1,
+            )
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM candidates"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertTrue(path.exists())
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT status FROM review_batches WHERE id=?",
+                (int(claim["batch_id"]),),
+            ).fetchone()["status"],
+            "ready",
+        )
+
+    def test_maintenance_commits_before_best_effort_saturated_cleanup(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        terminal_at = (
+            now - self.runtime.REVIEW_BATCH_AUDIT_TTL_SECONDS - 1
+        )
+        claim = self.claim(1, terminal_at - 1)
+        batch_id = int(claim["batch_id"])
+        self.runtime.abort_review_batch(
+            self.connection,
+            self.installation,
+            batch_id,
+            str(claim["owner_token"]),
+            terminal_at,
+        )
+        root = self.saturate_result_root()
+        names = sorted(path.name for path in root.iterdir())
+        result = self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            now,
+        )
+        self.assertEqual(result["result_scan_saturated"], 1)
+        self.assertEqual(result["result_cleanup_failed"], 0)
+        self.assertEqual(result["terminal_batches_deleted"], 1)
+        self.assertEqual(
+            sorted(path.name for path in root.iterdir()), names
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM review_batches WHERE id=?",
+                (batch_id,),
+            ).fetchone()[0],
+            0,
+        )
+        self.assertIsNone(
+            self.connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (self.runtime.review_audit_key(batch_id),),
+            ).fetchone()
+        )
+        maintained = self.connection.execute(
+            """
+            SELECT value FROM metadata
+            WHERE key='last_maintenance_at'
+            """
+        ).fetchone()
+        self.assertEqual(
+            maintained["value"], self.runtime.iso_utc(now)
+        )
