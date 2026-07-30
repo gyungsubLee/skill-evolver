@@ -13,7 +13,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
@@ -5479,3 +5479,1079 @@ class ReviewEnvelopeFailureTests(BatchExportTestCase):
         self.assertEqual(tuple(row), ("reviewing", batch_id))
         self.assertEqual(batch["status"], "ready")
         self.assertEqual(metadata_count, 2)
+
+
+class BoundResultReadTests(BatchExportTestCase):
+    def ready_one(
+        self,
+        number: int = 1,
+        now: float = 2_000_000_000.0,
+    ) -> tuple[sqlite3.Connection, dict[str, object]]:
+        connection = self.runtime.open_database(self.installation)
+        self.insert_pending(connection, number, now=now)
+        return connection, self.claim_ready_batch(
+            connection,
+            [self.make_export(f"delta-{number}")],
+            now=now,
+        )
+
+    def test_valid_bound_result_is_read_once_with_exact_identity(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection, claimed = self.ready_one(now=now)
+        path = Path(str(claimed["result_path"]))
+        self.write_result_bytes(
+            path, b'{"schema_version":1}\n', now + 1
+        )
+        opened = self.runtime.read_bound_review_result(
+            connection,
+            self.installation,
+            int(claimed["batch_id"]),
+            str(claimed["owner_token"]),
+            path,
+            now + 1,
+        )
+        self.write_result_bytes(
+            path, b"x" * self.runtime.REVIEW_RESULT_MAX_BYTES, now + 1
+        )
+        real_open = os.open
+        result_open_flags: list[int] = []
+
+        def record_result_open(
+            value: object,
+            flags: int,
+            *args: object,
+            **kwargs: object,
+        ) -> int:
+            if Path(value) == path:
+                result_open_flags.append(flags)
+            return real_open(value, flags, *args, **kwargs)
+
+        with mock.patch.object(
+            self.runtime.os,
+            "open",
+            side_effect=record_result_open,
+        ):
+            exact_cap = self.runtime.read_bound_review_result(
+                connection,
+                self.installation,
+                int(claimed["batch_id"]),
+                str(claimed["owner_token"]),
+                path,
+                now + 1,
+            )
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            with mock.patch.object(
+                self.runtime,
+                "cleanup_review_results",
+                side_effect=AssertionError(
+                    "active transaction reached cleanup"
+                ),
+            ), self.assertRaisesRegex(
+                ValueError, "active_transaction"
+            ):
+                self.runtime.read_bound_review_result(
+                    connection,
+                    self.installation,
+                    int(claimed["batch_id"]),
+                    str(claimed["owner_token"]),
+                    path,
+                    now + 1,
+                )
+        finally:
+            connection.rollback()
+        info = path.stat()
+        connection.close()
+        self.assertEqual(opened.batch_id, claimed["batch_id"])
+        self.assertEqual(opened.path, path)
+        self.assertEqual(opened.basename, path.name)
+        self.assertEqual(
+            (opened.device, opened.inode),
+            (info.st_dev, info.st_ino),
+        )
+        self.assertEqual(opened.encoded, b'{"schema_version":1}\n')
+        self.assertEqual(
+            len(exact_cap.encoded),
+            self.runtime.REVIEW_RESULT_MAX_BYTES,
+        )
+        self.assertEqual(len(result_open_flags), 1)
+        self.assertEqual(
+            result_open_flags[0] & os.O_CLOEXEC,
+            os.O_CLOEXEC,
+        )
+
+    def test_wrong_owner_cannot_read_the_allocated_result(self) -> None:
+        now = 2_000_000_000.0
+        connection, claimed = self.ready_one(now=now)
+        path = Path(str(claimed["result_path"]))
+        self.write_result_bytes(
+            path, b"private model output", now + 1
+        )
+        with mock.patch.object(
+            self.runtime,
+            "cleanup_review_results",
+            side_effect=AssertionError("wrong owner reached cleanup"),
+        ), self.assertRaisesRegex(
+            ValueError, "review_batch_owner_mismatch"
+        ):
+            self.runtime.read_bound_review_result(
+                connection,
+                self.installation,
+                int(claimed["batch_id"]),
+                "0" * 64,
+                path,
+                now + 1,
+            )
+        connection.close()
+        self.assertEqual(path.read_bytes(), b"private model output")
+
+
+class BoundResultSecurityTests(BatchExportTestCase):
+    def test_cross_batch_and_unallocated_paths_are_preserved_unopened(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        self.insert_pending(connection, 1, now=now)
+        first = self.claim_ready_batch(
+            connection, [self.make_export("first")], now=now
+        )
+        self.insert_pending(connection, 2, now=now + 1)
+        second = self.claim_ready_batch(
+            connection,
+            [self.make_export("second")],
+            now=now + 1,
+        )
+        second_path = Path(str(second["result_path"]))
+        self.write_result_bytes(
+            second_path, b"second private result", now + 2
+        )
+        unallocated = second_path.parent / f"result-{'f' * 32}.json"
+        self.write_result_bytes(
+            unallocated, b"foreign unallocated", now + 2
+        )
+        real_open = os.open
+
+        def reject_foreign_open(
+            path: object,
+            flags: int,
+            *args: object,
+            **kwargs: object,
+        ) -> int:
+            if Path(path) in {second_path, unallocated}:
+                raise AssertionError("foreign result opened")
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(
+            self.runtime.os,
+            "open",
+            side_effect=reject_foreign_open,
+        ):
+            for path in (second_path, unallocated):
+                with self.subTest(path=path.name), self.assertRaisesRegex(
+                    self.runtime.ReviewResultError,
+                    "review_result_path_unallocated",
+                ):
+                    self.runtime.read_bound_review_result(
+                        connection,
+                        self.installation,
+                        int(first["batch_id"]),
+                        str(first["owner_token"]),
+                        path,
+                        now + 2,
+                    )
+        connection.close()
+        self.assertEqual(
+            second_path.read_bytes(), b"second private result"
+        )
+        self.assertEqual(
+            unallocated.read_bytes(), b"foreign unallocated"
+        )
+
+    def test_symlink_hardlink_and_fifo_replacements_fail_without_touching_target(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        replacement_kinds = ("symlink", "hardlink", "fifo")
+        for offset, kind in enumerate(replacement_kinds, start=1):
+            with self.subTest(kind=kind):
+                isolated = type(self)(
+                    methodName=(
+                        "test_symlink_hardlink_and_fifo_replacements_fail_"
+                        "without_touching_target"
+                    )
+                )
+                isolated.setUp()
+                try:
+                    connection = isolated.runtime.open_database(
+                        isolated.installation
+                    )
+                    isolated.insert_pending(
+                        connection, offset, now=now
+                    )
+                    claimed = isolated.claim_ready_batch(
+                        connection,
+                        [isolated.make_export("delta")],
+                        now=now,
+                    )
+                    path = Path(str(claimed["result_path"]))
+                    path.unlink()
+                    outside = isolated.base / f"outside-{kind}"
+                    outside.write_bytes(b"outside preserved")
+                    outside.chmod(0o600)
+                    if kind == "symlink":
+                        path.symlink_to(outside)
+                    elif kind == "hardlink":
+                        os.link(outside, path)
+                    else:
+                        os.mkfifo(path, 0o600)
+                    started = time.monotonic()
+                    with self.assertRaisesRegex(
+                        isolated.runtime.ReviewResultError,
+                        "review_result_binding_mismatch",
+                    ):
+                        isolated.runtime.read_bound_review_result(
+                            connection,
+                            isolated.installation,
+                            int(claimed["batch_id"]),
+                            str(claimed["owner_token"]),
+                            path,
+                            now + 1,
+                        )
+                    self.assertLess(
+                        time.monotonic() - started, 1.0
+                    )
+                    connection.close()
+                    self.assertEqual(
+                        outside.read_bytes(), b"outside preserved"
+                    )
+                finally:
+                    isolated.doCleanups()
+
+        isolated = type(self)(
+            methodName=(
+                "test_symlink_hardlink_and_fifo_replacements_fail_"
+                "without_touching_target"
+            )
+        )
+        isolated.setUp()
+        try:
+            connection = isolated.runtime.open_database(
+                isolated.installation
+            )
+            isolated.insert_pending(connection, 4, now=now)
+            claimed = isolated.claim_ready_batch(
+                connection,
+                [isolated.make_export("delta")],
+                now=now,
+            )
+            path = Path(str(claimed["result_path"]))
+            isolated.write_result_bytes(path, b"bound", now + 1)
+            outside = isolated.base / "bound-inode-hardlink"
+            os.link(path, outside)
+            with self.assertRaises(
+                isolated.runtime.ReviewResultError
+            ) as raised:
+                isolated.runtime.read_bound_review_result(
+                    connection,
+                    isolated.installation,
+                    int(claimed["batch_id"]),
+                    str(claimed["owner_token"]),
+                    path,
+                    now + 1,
+                )
+            connection.close()
+            self.assertEqual(
+                raised.exception.code,
+                "review_result_binding_mismatch",
+            )
+            self.assertIsNone(raised.exception.opened)
+            self.assertEqual(path.read_bytes(), b"bound")
+            self.assertEqual(outside.read_bytes(), b"bound")
+        finally:
+            isolated.doCleanups()
+
+    def test_outer_oversize_error_carries_only_the_bound_identity(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        self.insert_pending(connection, 1, now=now)
+        claimed = self.claim_ready_batch(
+            connection, [self.make_export("delta")], now=now
+        )
+        path = Path(str(claimed["result_path"]))
+        self.write_result_bytes(
+            path,
+            b"x" * (self.runtime.REVIEW_RESULT_MAX_BYTES + 1),
+            now + 1,
+        )
+        with self.assertRaises(
+            self.runtime.ReviewResultError
+        ) as raised:
+            self.runtime.read_bound_review_result(
+                connection,
+                self.installation,
+                int(claimed["batch_id"]),
+                str(claimed["owner_token"]),
+                path,
+                now + 1,
+            )
+        connection.close()
+        self.assertEqual(
+            raised.exception.code, "review_result_too_large"
+        )
+        self.assertIsNotNone(raised.exception.opened)
+        self.assertEqual(
+            raised.exception.opened.encoded, b""
+        )
+        self.assertTrue(path.exists())
+
+        class StatView:
+            def __init__(
+                self,
+                original: os.stat_result,
+                **changes: int,
+            ) -> None:
+                self.original = original
+                self.changes = changes
+
+            def __getattr__(self, name: str) -> object:
+                if name in self.changes:
+                    return self.changes[name]
+                return getattr(self.original, name)
+
+        def ready_isolated() -> tuple[
+            BoundResultSecurityTests,
+            sqlite3.Connection,
+            dict[str, object],
+            Path,
+        ]:
+            isolated = type(self)(
+                methodName=(
+                    "test_outer_oversize_error_carries_only_the_bound_identity"
+                )
+            )
+            isolated.setUp()
+            isolated_connection = isolated.runtime.open_database(
+                isolated.installation
+            )
+            isolated.insert_pending(
+                isolated_connection, 2, now=now
+            )
+            isolated_claimed = isolated.claim_ready_batch(
+                isolated_connection,
+                [isolated.make_export("delta")],
+                now=now,
+            )
+            isolated_path = Path(
+                str(isolated_claimed["result_path"])
+            )
+            isolated.write_result_bytes(
+                isolated_path, b'{"schema_version":1}', now + 1
+            )
+            return (
+                isolated,
+                isolated_connection,
+                isolated_claimed,
+                isolated_path,
+            )
+
+        def assert_descriptor_closed(descriptor: int) -> None:
+            with self.assertRaises(OSError) as caught:
+                os.fstat(descriptor)
+            self.assertEqual(caught.exception.errno, errno.EBADF)
+
+        isolated, isolated_connection, isolated_claimed, isolated_path = (
+            ready_isolated()
+        )
+        try:
+            real_fstat = os.fstat
+            target_inode = isolated_path.stat().st_ino
+            captured: list[int] = []
+
+            def oversized_after_open(descriptor: int):
+                info = real_fstat(descriptor)
+                if (
+                    stat.S_ISREG(info.st_mode)
+                    and info.st_ino == target_inode
+                ):
+                    captured.append(descriptor)
+                    return StatView(
+                        info,
+                        st_size=(
+                            isolated.runtime.REVIEW_RESULT_MAX_BYTES + 1
+                        ),
+                    )
+                return info
+
+            with mock.patch.object(
+                isolated.runtime.os,
+                "fstat",
+                side_effect=oversized_after_open,
+            ), self.assertRaises(
+                isolated.runtime.ReviewResultError
+            ) as post_open:
+                isolated.runtime.read_bound_review_result(
+                    isolated_connection,
+                    isolated.installation,
+                    int(isolated_claimed["batch_id"]),
+                    str(isolated_claimed["owner_token"]),
+                    isolated_path,
+                    now + 1,
+                )
+            self.assertEqual(
+                post_open.exception.code,
+                "review_result_too_large",
+            )
+            self.assertIsNotNone(post_open.exception.opened)
+            self.assertEqual(len(captured), 1)
+            assert_descriptor_closed(captured[0])
+            isolated_connection.close()
+        finally:
+            isolated.doCleanups()
+
+        final_changes = (
+            ("mode", lambda info: {"st_mode": info.st_mode | 0o040}),
+            ("uid", lambda info: {"st_uid": info.st_uid + 1}),
+            ("nlink", lambda _info: {"st_nlink": 2}),
+            ("size", lambda info: {"st_size": info.st_size + 1}),
+            (
+                "mtime",
+                lambda info: {"st_mtime_ns": info.st_mtime_ns + 1},
+            ),
+        )
+        for field, change in final_changes:
+            with self.subTest(final_stat_change=field):
+                (
+                    isolated,
+                    isolated_connection,
+                    isolated_claimed,
+                    isolated_path,
+                ) = ready_isolated()
+                try:
+                    real_fstat = os.fstat
+                    target_inode = isolated_path.stat().st_ino
+                    result_calls = 0
+                    captured = []
+
+                    def changed_final_fstat(descriptor: int):
+                        nonlocal result_calls
+                        info = real_fstat(descriptor)
+                        if (
+                            stat.S_ISREG(info.st_mode)
+                            and info.st_ino == target_inode
+                        ):
+                            result_calls += 1
+                            captured.append(descriptor)
+                            if result_calls == 2:
+                                return StatView(info, **change(info))
+                        return info
+
+                    with mock.patch.object(
+                        isolated.runtime.os,
+                        "fstat",
+                        side_effect=changed_final_fstat,
+                    ), self.assertRaises(
+                        isolated.runtime.ReviewResultError
+                    ) as changed:
+                        isolated.runtime.read_bound_review_result(
+                            isolated_connection,
+                            isolated.installation,
+                            int(isolated_claimed["batch_id"]),
+                            str(isolated_claimed["owner_token"]),
+                            isolated_path,
+                            now + 1,
+                        )
+                    self.assertEqual(
+                        changed.exception.code,
+                        "review_result_changed",
+                    )
+                    self.assertIsNotNone(changed.exception.opened)
+                    self.assertEqual(result_calls, 2)
+                    assert_descriptor_closed(captured[-1])
+                    isolated_connection.close()
+                finally:
+                    isolated.doCleanups()
+
+        for operation in ("fstat", "read", "close"):
+            for error_type in (OSError, RuntimeError):
+                with self.subTest(
+                    descriptor_operation=operation,
+                    error=error_type.__name__,
+                ):
+                    (
+                        isolated,
+                        isolated_connection,
+                        isolated_claimed,
+                        isolated_path,
+                    ) = ready_isolated()
+                    try:
+                        real_fstat = os.fstat
+                        real_read = os.read
+                        real_close = os.close
+                        target_inode = isolated_path.stat().st_ino
+                        captured = []
+
+                        def is_target(descriptor: int) -> bool:
+                            try:
+                                info = real_fstat(descriptor)
+                            except OSError:
+                                return False
+                            return (
+                                stat.S_ISREG(info.st_mode)
+                                and info.st_ino == target_inode
+                            )
+
+                        def failed_fstat(descriptor: int):
+                            if is_target(descriptor):
+                                captured.append(descriptor)
+                                raise error_type(
+                                    "synthetic result fstat failure"
+                                )
+                            return real_fstat(descriptor)
+
+                        def failed_read(
+                            descriptor: int, maximum: int
+                        ) -> bytes:
+                            if is_target(descriptor):
+                                captured.append(descriptor)
+                                raise error_type(
+                                    "synthetic result read failure"
+                                )
+                            return real_read(descriptor, maximum)
+
+                        def failed_close(descriptor: int) -> None:
+                            if is_target(descriptor):
+                                captured.append(descriptor)
+                                raise error_type(
+                                    "synthetic result close failure"
+                                )
+                            real_close(descriptor)
+
+                        patches = {
+                            "fstat": mock.patch.object(
+                                isolated.runtime.os,
+                                "fstat",
+                                side_effect=failed_fstat,
+                            ),
+                            "read": mock.patch.object(
+                                isolated.runtime.os,
+                                "read",
+                                side_effect=failed_read,
+                            ),
+                            "close": mock.patch.object(
+                                isolated.runtime.os,
+                                "close",
+                                side_effect=failed_close,
+                            ),
+                        }
+                        with patches[operation], self.assertRaises(
+                            isolated.runtime.ReviewResultError
+                        ) as failed:
+                            isolated.runtime.read_bound_review_result(
+                                isolated_connection,
+                                isolated.installation,
+                                int(isolated_claimed["batch_id"]),
+                                str(isolated_claimed["owner_token"]),
+                                isolated_path,
+                                now + 1,
+                            )
+                        self.assertEqual(
+                            failed.exception.code,
+                            "review_result_changed",
+                        )
+                        self.assertIsNotNone(failed.exception.opened)
+                        self.assertEqual(len(captured), 1)
+                        assert_descriptor_closed(captured[0])
+                        isolated_connection.close()
+                    finally:
+                        isolated.doCleanups()
+
+        for interrupt_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(
+                body_and_close_interrupt=interrupt_type.__name__
+            ):
+                (
+                    isolated,
+                    isolated_connection,
+                    isolated_claimed,
+                    isolated_path,
+                ) = ready_isolated()
+                try:
+                    real_fstat = os.fstat
+                    real_read = os.read
+                    real_close = os.close
+                    target_inode = isolated_path.stat().st_ino
+                    captured = []
+                    body_interrupt = interrupt_type("body")
+
+                    def is_target(descriptor: int) -> bool:
+                        try:
+                            info = real_fstat(descriptor)
+                        except OSError:
+                            return False
+                        return (
+                            stat.S_ISREG(info.st_mode)
+                            and info.st_ino == target_inode
+                        )
+
+                    def interrupt_read(
+                        descriptor: int, _maximum: int
+                    ) -> bytes:
+                        if is_target(descriptor):
+                            captured.append(descriptor)
+                            raise body_interrupt
+                        return real_read(descriptor, _maximum)
+
+                    def interrupt_close(descriptor: int) -> None:
+                        if is_target(descriptor):
+                            raise interrupt_type("close")
+                        real_close(descriptor)
+
+                    with mock.patch.object(
+                        isolated.runtime.os,
+                        "read",
+                        side_effect=interrupt_read,
+                    ), mock.patch.object(
+                        isolated.runtime.os,
+                        "close",
+                        side_effect=interrupt_close,
+                    ), self.assertRaises(interrupt_type) as interrupted:
+                        isolated.runtime.read_bound_review_result(
+                            isolated_connection,
+                            isolated.installation,
+                            int(isolated_claimed["batch_id"]),
+                            str(isolated_claimed["owner_token"]),
+                            isolated_path,
+                            now + 1,
+                        )
+                    self.assertIs(
+                        interrupted.exception, body_interrupt
+                    )
+                    self.assertEqual(len(captured), 1)
+                    assert_descriptor_closed(captured[0])
+                    isolated_connection.close()
+                finally:
+                    isolated.doCleanups()
+
+            with self.subTest(
+                close_interrupt=interrupt_type.__name__
+            ):
+                (
+                    isolated,
+                    isolated_connection,
+                    isolated_claimed,
+                    isolated_path,
+                ) = ready_isolated()
+                try:
+                    real_fstat = os.fstat
+                    real_close = os.close
+                    target_inode = isolated_path.stat().st_ino
+                    captured = []
+                    close_interrupt = interrupt_type("close")
+
+                    def interrupt_close(descriptor: int) -> None:
+                        try:
+                            info = real_fstat(descriptor)
+                        except OSError:
+                            info = None
+                        if (
+                            info is not None
+                            and stat.S_ISREG(info.st_mode)
+                            and info.st_ino == target_inode
+                        ):
+                            captured.append(descriptor)
+                            raise close_interrupt
+                        real_close(descriptor)
+
+                    with mock.patch.object(
+                        isolated.runtime.os,
+                        "close",
+                        side_effect=interrupt_close,
+                    ), self.assertRaises(interrupt_type) as interrupted:
+                        isolated.runtime.read_bound_review_result(
+                            isolated_connection,
+                            isolated.installation,
+                            int(isolated_claimed["batch_id"]),
+                            str(isolated_claimed["owner_token"]),
+                            isolated_path,
+                            now + 1,
+                        )
+                    self.assertIs(
+                        interrupted.exception, close_interrupt
+                    )
+                    self.assertEqual(len(captured), 1)
+                    assert_descriptor_closed(captured[0])
+                    isolated_connection.close()
+                finally:
+                    isolated.doCleanups()
+
+    def test_invalid_result_rotation_keeps_lease_and_contract_exact(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        self.insert_pending(connection, 1, now=now)
+        claimed = self.claim_ready_batch(
+            connection, [self.make_export("delta")], now=now
+        )
+        batch_id = int(claimed["batch_id"])
+        old_path = Path(str(claimed["result_path"]))
+        self.write_result_bytes(
+            old_path, b"{invalid json", now + 1
+        )
+        opened = self.runtime.read_bound_review_result(
+            connection,
+            self.installation,
+            batch_id,
+            str(claimed["owner_token"]),
+            old_path,
+            now + 1,
+        )
+        contract_before = self.runtime.load_review_contract(
+            connection, batch_id, "final"
+        )
+        row_before = connection.execute(
+            """
+            SELECT status,batch_id,lease_owner,lease_expires_at,
+              generation,frozen_epoch,frozen_from,frozen_to,
+              frozen_locator_json,reviewed_boundary
+            FROM review_items WHERE batch_id=?
+            """,
+            (batch_id,),
+        ).fetchone()
+        new_path = self.runtime.replace_invalid_review_result(
+            connection,
+            self.installation,
+            batch_id,
+            str(claimed["owner_token"]),
+            opened,
+            now + 2,
+        )
+        contract_after = self.runtime.load_review_contract(
+            connection, batch_id, "final"
+        )
+        row_after = connection.execute(
+            """
+            SELECT status,batch_id,lease_owner,lease_expires_at,
+              generation,frozen_epoch,frozen_from,frozen_to,
+              frozen_locator_json,reviewed_boundary
+            FROM review_items WHERE batch_id=?
+            """,
+            (batch_id,),
+        ).fetchone()
+        binding = self.runtime.load_review_result_binding(
+            connection, batch_id
+        )
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            with mock.patch.object(
+                self.runtime,
+                "_allocate_review_result_file",
+                side_effect=AssertionError(
+                    "active transaction reached allocation"
+                ),
+            ), self.assertRaisesRegex(
+                ValueError, "active_transaction"
+            ):
+                self.runtime.replace_invalid_review_result(
+                    connection,
+                    self.installation,
+                    batch_id,
+                    str(claimed["owner_token"]),
+                    opened,
+                    now + 2,
+                )
+        finally:
+            connection.rollback()
+        self.write_result_bytes(new_path, b"invalid again", now + 2)
+        current_opened = self.runtime.read_bound_review_result(
+            connection,
+            self.installation,
+            batch_id,
+            str(claimed["owner_token"]),
+            new_path,
+            now + 2,
+        )
+        with mock.patch.object(
+            self.runtime,
+            "_allocate_review_result_file",
+            side_effect=AssertionError(
+                "wrong owner reached allocation"
+            ),
+        ), self.assertRaisesRegex(
+            ValueError, "review_batch_owner_mismatch"
+        ):
+            self.runtime.replace_invalid_review_result(
+                connection,
+                self.installation,
+                batch_id,
+                "0" * 64,
+                current_opened,
+                now + 2,
+            )
+        connection.close()
+        self.assertNotEqual(new_path, old_path)
+        self.assertFalse(old_path.exists())
+        self.assertTrue(new_path.exists())
+        self.assertEqual(stat.S_IMODE(new_path.stat().st_mode), 0o600)
+        self.assertEqual(binding["basename"], new_path.name)
+        self.assertEqual(contract_after, contract_before)
+        self.assertEqual(tuple(row_after), tuple(row_before))
+
+        class FailureConnection:
+            def __init__(
+                self,
+                inner: sqlite3.Connection,
+                stage: str,
+            ) -> None:
+                self.inner = inner
+                self.stage = stage
+                self.commit_calls = 0
+
+            @property
+            def in_transaction(self) -> bool:
+                return self.inner.in_transaction
+
+            def execute(
+                self,
+                statement: str,
+                parameters: object = (),
+            ):
+                if (
+                    self.stage == "begin"
+                    and statement.strip() == "BEGIN IMMEDIATE"
+                ):
+                    raise sqlite3.OperationalError("begin failure")
+                return self.inner.execute(statement, parameters)
+
+            def commit(self) -> None:
+                self.commit_calls += 1
+                if (
+                    self.stage == "commit"
+                    and self.commit_calls == 2
+                ):
+                    raise RuntimeError("commit failure")
+                self.inner.commit()
+
+            def rollback(self) -> None:
+                if self.stage == "rollback":
+                    raise RuntimeError("rollback failure")
+                self.inner.rollback()
+
+        failure_cases = (
+            ("begin", sqlite3.OperationalError, None),
+            ("store", RuntimeError, "store failure"),
+            ("commit", RuntimeError, None),
+            ("rollback", RuntimeError, "store failure"),
+        )
+        for stage, error_type, store_error in failure_cases:
+            with self.subTest(rotation_failure=stage):
+                isolated = type(self)(
+                    methodName=(
+                        "test_invalid_result_rotation_keeps_lease_and_contract_exact"
+                    )
+                )
+                isolated.setUp()
+                try:
+                    failed_connection = isolated.runtime.open_database(
+                        isolated.installation
+                    )
+                    isolated.insert_pending(
+                        failed_connection, 2, now=now
+                    )
+                    failed_claimed = isolated.claim_ready_batch(
+                        failed_connection,
+                        [isolated.make_export("delta")],
+                        now=now,
+                    )
+                    failed_batch_id = int(
+                        failed_claimed["batch_id"]
+                    )
+                    failed_path = Path(
+                        str(failed_claimed["result_path"])
+                    )
+                    isolated.write_result_bytes(
+                        failed_path, b"invalid", now + 1
+                    )
+                    failed_opened = (
+                        isolated.runtime.read_bound_review_result(
+                            failed_connection,
+                            isolated.installation,
+                            failed_batch_id,
+                            str(failed_claimed["owner_token"]),
+                            failed_path,
+                            now + 1,
+                        )
+                    )
+                    old_binding = (
+                        isolated.runtime.load_review_result_binding(
+                            failed_connection, failed_batch_id
+                        )
+                    )
+                    proxy = FailureConnection(
+                        failed_connection, stage
+                    )
+                    patch_store = (
+                        mock.patch.object(
+                            isolated.runtime,
+                            "_store_review_result_binding",
+                            side_effect=RuntimeError(store_error),
+                        )
+                        if store_error is not None
+                        else nullcontext()
+                    )
+                    expected = (
+                        f"{stage} failure"
+                        if stage != "rollback"
+                        else "rollback failure"
+                    )
+                    with patch_store, self.assertRaisesRegex(
+                        error_type, expected
+                    ):
+                        isolated.runtime.replace_invalid_review_result(
+                            proxy,
+                            isolated.installation,
+                            failed_batch_id,
+                            str(failed_claimed["owner_token"]),
+                            failed_opened,
+                            now + 2,
+                        )
+                    root_entries = list(
+                        isolated.runtime.review_result_root().iterdir()
+                    )
+                    current_binding = (
+                        isolated.runtime.load_review_result_binding(
+                            failed_connection, failed_batch_id
+                        )
+                    )
+                    self.assertEqual(root_entries, [failed_path])
+                    self.assertEqual(current_binding, old_binding)
+                    if failed_connection.in_transaction:
+                        failed_connection.rollback()
+                    failed_connection.close()
+                finally:
+                    isolated.doCleanups()
+
+    def test_rotation_preserves_a_foreign_swap_at_the_old_basename(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        self.insert_pending(connection, 1, now=now)
+        claimed = self.claim_ready_batch(
+            connection, [self.make_export("delta")], now=now
+        )
+        old_path = Path(str(claimed["result_path"]))
+        self.write_result_bytes(old_path, b"invalid", now + 1)
+        opened = self.runtime.read_bound_review_result(
+            connection,
+            self.installation,
+            int(claimed["batch_id"]),
+            str(claimed["owner_token"]),
+            old_path,
+            now + 1,
+        )
+        old_path.unlink()
+        old_path.write_bytes(b"foreign swap")
+        old_path.chmod(0o600)
+        new_path = self.runtime.replace_invalid_review_result(
+            connection,
+            self.installation,
+            int(claimed["batch_id"]),
+            str(claimed["owner_token"]),
+            opened,
+            now + 2,
+        )
+        connection.close()
+        self.assertEqual(old_path.read_bytes(), b"foreign swap")
+        self.assertTrue(new_path.exists())
+
+    def test_candidate_transaction_rejects_a_result_rotated_after_read(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        self.insert_pending(connection, 1, now=now)
+        claimed = self.claim_ready_batch(
+            connection, [self.make_export("delta")], now=now
+        )
+        batch_id = int(claimed["batch_id"])
+        owner_token = str(claimed["owner_token"])
+        old_path = Path(str(claimed["result_path"]))
+        self.write_result_bytes(
+            old_path, b'{"schema_version":1}', now + 1
+        )
+        opened = self.runtime.read_bound_review_result(
+            connection,
+            self.installation,
+            batch_id,
+            owner_token,
+            old_path,
+            now + 1,
+        )
+        new_path = self.runtime.replace_invalid_review_result(
+            connection,
+            self.installation,
+            batch_id,
+            owner_token,
+            opened,
+            now + 2,
+        )
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            self.runtime.require_live_review_batch(
+                connection,
+                self.installation,
+                batch_id,
+                owner_token,
+                now + 2,
+            )
+            with self.assertRaisesRegex(
+                ValueError, "review_result_binding_mismatch"
+            ):
+                self.runtime.require_bound_review_result_binding(
+                    connection,
+                    batch_id,
+                    opened,
+                )
+            forged = self.runtime.BoundReviewResult(
+                batch_id=batch_id,
+                path=self.base / opened.basename,
+                basename=opened.basename,
+                device=opened.device,
+                inode=opened.inode,
+                encoded=opened.encoded,
+            )
+            with self.assertRaisesRegex(
+                ValueError, "review_result_binding_mismatch"
+            ):
+                self.runtime.require_bound_review_result_binding(
+                    connection,
+                    batch_id,
+                    forged,
+                )
+        finally:
+            connection.rollback()
+        binding = self.runtime.load_review_result_binding(
+            connection, batch_id
+        )
+        row = connection.execute(
+            """
+            SELECT status,batch_id FROM review_items
+            WHERE batch_id=?
+            """,
+            (batch_id,),
+        ).fetchone()
+        batch = connection.execute(
+            "SELECT status FROM review_batches WHERE id=?",
+            (batch_id,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(binding["basename"], new_path.name)
+        self.assertEqual(tuple(row), ("reviewing", batch_id))
+        self.assertEqual(batch["status"], "ready")
+        self.assertTrue(new_path.exists())

@@ -71,6 +71,18 @@ class BoundReviewResult:
     encoded: bytes
 
 
+class ReviewResultError(ValueError):
+    def __init__(
+        self,
+        code: str,
+        *,
+        opened: Optional[BoundReviewResult],
+    ):
+        self.code = code
+        self.opened = opened
+        super().__init__(code)
+
+
 def review_contract_key(batch_id: int) -> str:
     if type(batch_id) is not int or batch_id < 1:
         raise ValueError("invalid_review_batch_id")
@@ -582,6 +594,259 @@ def load_review_result_binding(
     return _validate_review_result_binding(binding, batch_id)
 
 
+def require_bound_review_result_binding(
+    connection: sqlite3.Connection,
+    batch_id: int,
+    opened: BoundReviewResult,
+) -> dict[str, object]:
+    if not connection.in_transaction:
+        raise ValueError("active_review_transaction_required")
+    try:
+        root = review_result_root()
+    except ValueError:
+        raise ValueError("review_result_binding_mismatch") from None
+    if (
+        type(batch_id) is not int
+        or batch_id < 1
+        or type(opened) is not BoundReviewResult
+        or type(opened.batch_id) is not int
+        or opened.batch_id != batch_id
+        or not isinstance(opened.path, Path)
+        or not opened.path.is_absolute()
+        or opened.path.parent != root
+        or type(opened.basename) is not str
+        or opened.path.name != opened.basename
+        or REVIEW_RESULT_NAME.fullmatch(opened.basename) is None
+        or type(opened.device) is not int
+        or opened.device < 0
+        or type(opened.inode) is not int
+        or opened.inode < 0
+        or type(opened.encoded) is not bytes
+        or len(opened.encoded) > REVIEW_RESULT_MAX_BYTES
+    ):
+        raise ValueError("review_result_binding_mismatch")
+    binding = load_review_result_binding(connection, batch_id)
+    if (
+        binding["basename"] != opened.basename
+        or int(binding["device"]) != opened.device
+        or int(binding["inode"]) != opened.inode
+    ):
+        raise ValueError("review_result_binding_mismatch")
+    return binding
+
+
+def require_live_review_batch(
+    connection: sqlite3.Connection,
+    installation: Installation,
+    batch_id: int,
+    owner_token: str,
+    now: float,
+) -> tuple[sqlite3.Row, dict[str, object], str]:
+    owner_digest = review_owner_digest(installation, owner_token)
+    batch = connection.execute(
+        "SELECT * FROM review_batches WHERE id=? AND status='ready'",
+        (batch_id,),
+    ).fetchone()
+    if batch is None:
+        raise ValueError("review_batch_not_live")
+    contract = load_review_contract(connection, batch_id, "final")
+    if not hmac.compare_digest(
+        str(contract["owner_digest"]), owner_digest
+    ):
+        raise ValueError("review_batch_owner_mismatch")
+    rows = connection.execute(
+        """
+        SELECT * FROM review_items
+        WHERE batch_id=? ORDER BY id
+        """,
+        (batch_id,),
+    ).fetchall()
+    contract_ids = {
+        int(session["review_item_id"])
+        for session in contract["sessions"]
+    }
+    if (
+        len(rows) != int(batch["generation_count"])
+        or {int(row["id"]) for row in rows} != contract_ids
+    ):
+        raise ValueError("review_batch_membership_changed")
+    sessions = {
+        int(session["review_item_id"]): session
+        for session in contract["sessions"]
+    }
+    for row in rows:
+        session = sessions[int(row["id"])]
+        _require_batch_review_generation_row(
+            connection,
+            int(row["id"]),
+            batch_id,
+            owner_digest,
+            int(session["expected_generation"]),
+            int(session["frozen_epoch"]),
+            int(session["frozen_from"]),
+            int(session["frozen_to"]),
+            str(session["frozen_locator_digest"]),
+            now,
+        )
+    return batch, contract, owner_digest
+
+
+def read_bound_review_result(
+    connection: sqlite3.Connection,
+    installation: Installation,
+    batch_id: int,
+    owner_token: str,
+    result_path: Path,
+    now: float,
+) -> BoundReviewResult:
+    if connection.in_transaction:
+        raise ValueError("active_transaction")
+    require_live_review_batch(
+        connection, installation, batch_id, owner_token, now
+    )
+    binding = load_review_result_binding(connection, batch_id)
+    root = review_result_root()
+    expected = root / str(binding["basename"])
+    if (
+        not isinstance(result_path, Path)
+        or not result_path.is_absolute()
+        or result_path != expected
+    ):
+        raise ReviewResultError(
+            "review_result_path_unallocated", opened=None
+        )
+    cleanup_review_results(now)
+    try:
+        before = os.lstat(result_path)
+    except (OSError, RuntimeError):
+        raise ReviewResultError(
+            "review_result_binding_mismatch", opened=None
+        ) from None
+    if (
+        (before.st_dev, before.st_ino)
+        != (int(binding["device"]), int(binding["inode"]))
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.getuid()
+        or stat.S_IMODE(before.st_mode) != 0o600
+        or before.st_nlink != 1
+    ):
+        raise ReviewResultError(
+            "review_result_binding_mismatch", opened=None
+        )
+    identity = BoundReviewResult(
+        batch_id=batch_id,
+        path=result_path,
+        basename=result_path.name,
+        device=before.st_dev,
+        inode=before.st_ino,
+        encoded=b"",
+    )
+    if before.st_size > REVIEW_RESULT_MAX_BYTES:
+        raise ReviewResultError(
+            "review_result_too_large", opened=identity
+        )
+    try:
+        descriptor = os.open(
+            str(result_path),
+            os.O_RDONLY
+            | os.O_NONBLOCK
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+    except (OSError, RuntimeError):
+        raise ReviewResultError(
+            "review_result_binding_mismatch", opened=None
+        ) from None
+    try:
+        try:
+            opened_info = os.fstat(descriptor)
+        except (OSError, RuntimeError):
+            raise ReviewResultError(
+                "review_result_changed", opened=identity
+            ) from None
+        if (
+            (opened_info.st_dev, opened_info.st_ino)
+            != (identity.device, identity.inode)
+            or not stat.S_ISREG(opened_info.st_mode)
+            or opened_info.st_uid != os.getuid()
+            or stat.S_IMODE(opened_info.st_mode) != 0o600
+            or opened_info.st_nlink != 1
+        ):
+            raise ReviewResultError(
+                "review_result_changed", opened=identity
+            )
+        if opened_info.st_size > REVIEW_RESULT_MAX_BYTES:
+            raise ReviewResultError(
+                "review_result_too_large", opened=identity
+            )
+        if (
+            opened_info.st_size != before.st_size
+            or opened_info.st_mtime_ns != before.st_mtime_ns
+        ):
+            raise ReviewResultError(
+                "review_result_changed", opened=identity
+            )
+        chunks: list[bytes] = []
+        remaining = REVIEW_RESULT_MAX_BYTES + 1
+        while remaining:
+            try:
+                chunk = os.read(
+                    descriptor, min(65_536, remaining)
+                )
+            except (OSError, RuntimeError):
+                raise ReviewResultError(
+                    "review_result_changed", opened=identity
+                ) from None
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        encoded = b"".join(chunks)
+        try:
+            final_info = os.fstat(descriptor)
+        except (OSError, RuntimeError):
+            raise ReviewResultError(
+                "review_result_changed", opened=identity
+            ) from None
+        if len(encoded) > REVIEW_RESULT_MAX_BYTES:
+            raise ReviewResultError(
+                "review_result_too_large", opened=identity
+            )
+        if (
+            (final_info.st_dev, final_info.st_ino)
+            != (identity.device, identity.inode)
+            or not stat.S_ISREG(final_info.st_mode)
+            or final_info.st_uid != os.getuid()
+            or stat.S_IMODE(final_info.st_mode) != 0o600
+            or final_info.st_nlink != 1
+            or final_info.st_size != len(encoded)
+            or final_info.st_mtime_ns != opened_info.st_mtime_ns
+        ):
+            raise ReviewResultError(
+                "review_result_changed", opened=identity
+            )
+    except BaseException:
+        try:
+            _close_review_descriptor(descriptor)
+        except BaseException:
+            pass
+        raise
+    try:
+        _close_review_descriptor(descriptor)
+    except (OSError, RuntimeError):
+        raise ReviewResultError(
+            "review_result_changed", opened=identity
+        ) from None
+    return BoundReviewResult(
+        batch_id=batch_id,
+        path=result_path,
+        basename=result_path.name,
+        device=identity.device,
+        inode=identity.inode,
+        encoded=encoded,
+    )
+
+
 def _store_review_result_binding(
     connection: sqlite3.Connection,
     batch_id: int,
@@ -696,8 +961,9 @@ def _locked_review_result_root():
             or stat.S_IMODE(info.st_mode) != 0o700
         ):
             raise ValueError("review_result_root_invalid")
-        # ponytail: cooperative same-UID and write-before-delete are the ceiling;
-        # upgrade to descriptor-relative/quarantine deletion for hostile races.
+        # ponytail: cooperative same-UID path access and write-before-delete
+        # are the ceiling; upgrade to descriptor-relative reads and
+        # quarantine deletion for hostile same-UID races.
         fcntl.flock(descriptor, fcntl.LOCK_EX)
     except ValueError:
         if descriptor is not None:
@@ -960,6 +1226,71 @@ def _allocate_review_result_file_unlocked(
             encoded=b"",
         )
     raise ValueError("review_result_allocation_collision")
+
+
+def replace_invalid_review_result(
+    connection: sqlite3.Connection,
+    installation: Installation,
+    batch_id: int,
+    owner_token: str,
+    opened: BoundReviewResult,
+    now: float,
+) -> Path:
+    if connection.in_transaction:
+        raise ValueError("active_transaction")
+    connection.execute("BEGIN")
+    try:
+        require_live_review_batch(
+            connection,
+            installation,
+            batch_id,
+            owner_token,
+            now,
+        )
+        require_bound_review_result_binding(
+            connection,
+            batch_id,
+            opened,
+        )
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    created = _allocate_review_result_file(now)
+    replacement = BoundReviewResult(
+        batch_id=batch_id,
+        path=created.path,
+        basename=created.basename,
+        device=created.device,
+        inode=created.inode,
+        encoded=b"",
+    )
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        require_live_review_batch(
+            connection,
+            installation,
+            batch_id,
+            owner_token,
+            now,
+        )
+        require_bound_review_result_binding(
+            connection,
+            batch_id,
+            opened,
+        )
+        _store_review_result_binding(
+            connection, batch_id, replacement, now
+        )
+        connection.commit()
+    except BaseException:
+        try:
+            connection.rollback()
+        finally:
+            delete_bound_review_result(replacement)
+        raise
+    delete_bound_review_result(opened)
+    return replacement.path
 
 
 REVIEW_RUNTIME_FIXED = {
@@ -4610,7 +4941,7 @@ RETRYABLE_TRANSCRIPT_ERRORS = frozenset(
 )
 
 
-def _load_batch_review_generation(
+def _require_batch_review_generation_row(
     connection: sqlite3.Connection,
     review_item_id: int,
     batch_id: int,
@@ -4622,8 +4953,6 @@ def _load_batch_review_generation(
     expected_locator_digest: str,
     now: float,
 ) -> sqlite3.Row:
-    if not connection.in_transaction:
-        raise ValueError("active_review_transaction_required")
     if (
         any(
             type(value) is not int or value < 0
@@ -4684,6 +5013,34 @@ def _load_batch_review_generation(
     ):
         raise ValueError("review_generation_contract_mismatch")
     return row
+
+
+def _load_batch_review_generation(
+    connection: sqlite3.Connection,
+    review_item_id: int,
+    batch_id: int,
+    owner_digest: str,
+    expected_generation: int,
+    expected_epoch: int,
+    expected_from: int,
+    expected_to: int,
+    expected_locator_digest: str,
+    now: float,
+) -> sqlite3.Row:
+    if not connection.in_transaction:
+        raise ValueError("active_review_transaction_required")
+    return _require_batch_review_generation_row(
+        connection,
+        review_item_id,
+        batch_id,
+        owner_digest,
+        expected_generation,
+        expected_epoch,
+        expected_from,
+        expected_to,
+        expected_locator_digest,
+        now,
+    )
 
 
 def fail_review_generation(
