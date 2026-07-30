@@ -249,6 +249,43 @@ class ReviewConfigLimitTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid_config_keys"):
             self.runtime.load_config(self.installation)
 
+        lease_cases = (
+            (
+                "lease_seconds",
+                self.runtime.REVIEW_RESULT_TTL_SECONDS,
+                "invalid_config_lease_seconds",
+            ),
+            (
+                "lease_heartbeat_seconds",
+                int(current["lease_seconds"]),
+                "invalid_config_lease_heartbeat_seconds",
+            ),
+        )
+        for key, value, error_code in lease_cases:
+            with self.subTest(key=key, surface="load"):
+                self.installation.config_path.write_text(
+                    json.dumps({**current, key: value}),
+                    encoding="utf-8",
+                )
+                self.installation.config_path.chmod(0o600)
+                with self.assertRaisesRegex(
+                    ValueError, error_code
+                ):
+                    self.runtime.load_config(self.installation)
+            with self.subTest(key=key, surface="initialize"):
+                with self.assertRaisesRegex(
+                    ValueError, error_code
+                ):
+                    self.runtime.initialize_runtime(
+                        self.base / f"invalid-{key}",
+                        (self.sessions,),
+                        {
+                            "capture_paused": False,
+                            "exclude_roots": [],
+                            key: value,
+                        },
+                    )
+
 
 class FrontmatterScalarTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -6555,3 +6592,1177 @@ class BoundResultSecurityTests(BatchExportTestCase):
         self.assertEqual(tuple(row), ("reviewing", batch_id))
         self.assertEqual(batch["status"], "ready")
         self.assertTrue(new_path.exists())
+
+
+class ReviewBatchMutationTests(BatchExportTestCase):
+    def test_heartbeat_is_exact_owner_all_rows_monotonic_and_digest_stable(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        self.insert_pending(connection, 1, now=now)
+        self.insert_pending(connection, 2, now=now)
+        claimed = self.claim_ready_batch(
+            connection,
+            [self.make_export("one"), self.make_export("two")],
+            now=now,
+        )
+        batch_id = int(claimed["batch_id"])
+        contract_before = self.runtime.load_review_contract(
+            connection, batch_id, "final"
+        )
+        result_path = Path(str(claimed["result_path"]))
+        result_bytes = b"private heartbeat output"
+        self.write_result_bytes(
+            result_path,
+            result_bytes,
+            now - self.runtime.REVIEW_RESULT_TTL_SECONDS - 1,
+        )
+        stale_mtime_ns = result_path.stat().st_mtime_ns
+        self.assertFalse(
+            self.runtime.heartbeat_review_batch(
+                connection,
+                self.installation,
+                batch_id,
+                "0" * 64,
+                now + 10,
+                self.config,
+            )
+        )
+        self.assertEqual(
+            result_path.stat().st_mtime_ns,
+            stale_mtime_ns,
+        )
+        self.assertTrue(
+            self.runtime.heartbeat_review_batch(
+                connection,
+                self.installation,
+                batch_id,
+                str(claimed["owner_token"]),
+                now + 10,
+                self.config,
+            )
+        )
+        refreshed_mtime_ns = result_path.stat().st_mtime_ns
+        self.assertTrue(
+            self.runtime.heartbeat_review_batch(
+                connection,
+                self.installation,
+                batch_id,
+                str(claimed["owner_token"]),
+                now + 5,
+                self.config,
+            )
+        )
+        self.assertEqual(
+            result_path.stat().st_mtime_ns,
+            refreshed_mtime_ns,
+        )
+        expiries = {
+            row["lease_expires_at"]
+            for row in connection.execute(
+                """
+                SELECT lease_expires_at FROM review_items
+                WHERE batch_id=?
+                """,
+                (batch_id,),
+            )
+        }
+        connection.execute(
+            """
+            CREATE TRIGGER reject_batch_heartbeat
+            BEFORE UPDATE OF lease_expires_at ON review_items
+            BEGIN
+              SELECT RAISE(ABORT,'heartbeat rejected');
+            END
+            """
+        )
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError, "heartbeat rejected"
+        ):
+            self.runtime.heartbeat_review_batch(
+                connection,
+                self.installation,
+                batch_id,
+                str(claimed["owner_token"]),
+                now + 20,
+                self.config,
+            )
+        connection.execute("DROP TRIGGER reject_batch_heartbeat")
+        expiries_after_rollback = {
+            row["lease_expires_at"]
+            for row in connection.execute(
+                """
+                SELECT lease_expires_at FROM review_items
+                WHERE batch_id=?
+                """,
+                (batch_id,),
+            )
+        }
+        contract_after = self.runtime.load_review_contract(
+            connection, batch_id, "final"
+        )
+        cleanup = self.runtime.cleanup_review_results(now + 20)
+        result_after = result_path.read_bytes()
+        connection.close()
+        self.assertEqual(
+            expiries,
+            {
+                self.runtime.iso_utc(
+                    now + 10 + self.config.lease_seconds
+                )
+            },
+        )
+        self.assertEqual(expiries_after_rollback, expiries)
+        self.assertEqual(cleanup["result_files_deleted"], 0)
+        self.assertEqual(result_after, result_bytes)
+        self.assertEqual(contract_after, contract_before)
+        self.assertEqual(
+            self.runtime.sha256_json(contract_after),
+            claimed["contract_digest"],
+        )
+
+    def test_abort_releases_rows_closes_contract_and_removes_exact_result(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        first = self.insert_pending(connection, 1, now=now)
+        second = self.insert_pending(connection, 2, now=now)
+        claimed = self.claim_ready_batch(
+            connection,
+            [self.make_export("one"), self.make_export("two")],
+            now=now,
+        )
+        batch_id = int(claimed["batch_id"])
+        result_path = Path(str(claimed["result_path"]))
+        self.write_result_bytes(
+            result_path,
+            b"unvalidated private output",
+            now,
+        )
+        before_wrong_owner = (
+            result_path.stat().st_mtime_ns,
+            result_path.read_bytes(),
+        )
+        with mock.patch.object(
+            self.runtime,
+            "cleanup_review_results",
+        ) as cleanup:
+            with self.assertRaisesRegex(
+                ValueError, "review_batch_owner_mismatch"
+            ):
+                self.runtime.abort_review_batch(
+                    connection,
+                    self.installation,
+                    batch_id,
+                    "0" * 64,
+                    now + 1,
+                )
+            cleanup.assert_not_called()
+        self.assertEqual(
+            (
+                result_path.stat().st_mtime_ns,
+                result_path.read_bytes(),
+            ),
+            before_wrong_owner,
+        )
+        audit = self.runtime.abort_review_batch(
+            connection,
+            self.installation,
+            batch_id,
+            str(claimed["owner_token"]),
+            now + 1,
+        )
+        rows = connection.execute(
+            """
+            SELECT id,status,reviewed_boundary,error_code,batch_id,
+              frozen_to,lease_owner
+            FROM review_items ORDER BY id
+            """
+        ).fetchall()
+        batch = connection.execute(
+            "SELECT status,finished_at FROM review_batches WHERE id=?",
+            (batch_id,),
+        ).fetchone()
+        metadata = connection.execute(
+            """
+            SELECT key,value FROM metadata
+            WHERE key LIKE ?
+            """,
+            (f"review.batch.{batch_id}.%",),
+        ).fetchall()
+        rollback_claimed = self.claim_ready_batch(
+            connection,
+            [self.make_export("one"), self.make_export("two")],
+            now=now + 2,
+        )
+        rollback_batch_id = int(rollback_claimed["batch_id"])
+        rollback_path = Path(
+            str(rollback_claimed["result_path"])
+        )
+        self.write_result_bytes(
+            rollback_path,
+            b"must survive rollback",
+            now + 2,
+        )
+        result_key = self.runtime.review_result_key(
+            rollback_batch_id
+        )
+        binding_value = connection.execute(
+            "SELECT value FROM metadata WHERE key=?",
+            (result_key,),
+        ).fetchone()["value"]
+        connection.execute(
+            "UPDATE metadata SET value=? WHERE key=?",
+            (
+                "x"
+                * (
+                    self.runtime.REVIEW_RESULT_BINDING_MAX_BYTES
+                    + 1
+                ),
+                result_key,
+            ),
+        )
+        with mock.patch.object(
+            self.runtime,
+            "cleanup_review_results",
+        ) as cleanup:
+            with self.assertRaisesRegex(
+                ValueError, "review_result_binding_invalid"
+            ):
+                self.runtime.abort_review_batch(
+                    connection,
+                    self.installation,
+                    rollback_batch_id,
+                    str(rollback_claimed["owner_token"]),
+                    now + 3,
+                )
+            cleanup.assert_not_called()
+        self.assertTrue(rollback_path.exists())
+        connection.execute(
+            "UPDATE metadata SET value=? WHERE key=?",
+            (binding_value, result_key),
+        )
+        with mock.patch.object(
+            self.runtime,
+            "finalize_review_batch",
+            side_effect=sqlite3.IntegrityError("audit rejected"),
+        ), mock.patch.object(
+            self.runtime,
+            "cleanup_review_results",
+        ) as cleanup:
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError, "audit rejected"
+            ):
+                self.runtime.abort_review_batch(
+                    connection,
+                    self.installation,
+                    rollback_batch_id,
+                    str(rollback_claimed["owner_token"]),
+                    now + 3,
+                )
+            cleanup.assert_not_called()
+        rollback_state = connection.execute(
+            """
+            SELECT status,COUNT(*) FROM review_items
+            WHERE batch_id=? GROUP BY status
+            """,
+            (rollback_batch_id,),
+        ).fetchone()
+        rollback_batch = connection.execute(
+            "SELECT status FROM review_batches WHERE id=?",
+            (rollback_batch_id,),
+        ).fetchone()
+        rollback_metadata = connection.execute(
+            """
+            SELECT COUNT(*) FROM metadata WHERE key IN (?,?)
+            """,
+            (
+                self.runtime.review_contract_key(rollback_batch_id),
+                self.runtime.review_result_key(rollback_batch_id),
+            ),
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [
+                (int(first["id"]), "pending", 0, None, None, None, None),
+                (int(second["id"]), "pending", 0, None, None, None, None),
+            ],
+        )
+        self.assertEqual(batch["status"], "aborted")
+        self.assertFalse(result_path.exists())
+        self.assertEqual([row["key"] for row in metadata], [
+            self.runtime.review_audit_key(batch_id)
+        ])
+        self.assertEqual(audit["terminal_status"], "aborted")
+        self.assertNotIn(
+            str(claimed["owner_token"]),
+            json.dumps(audit, sort_keys=True),
+        )
+        self.assertEqual(tuple(rollback_state), ("reviewing", 2))
+        self.assertEqual(rollback_batch["status"], "ready")
+        self.assertEqual(rollback_metadata, 2)
+        self.assertTrue(rollback_path.exists())
+        self.assertEqual(
+            rollback_path.read_bytes(),
+            b"must survive rollback",
+        )
+
+    def test_aborted_partial_export_retains_export_exclusions(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        self.insert_pending(connection, 1, now=now)
+        self.insert_pending(connection, 2, now=now)
+        terminal = self.runtime.TranscriptAdapterError(
+            "unsupported_transcript",
+            retryable=False,
+        )
+        with self.fixed_review_inputs(), mock.patch.object(
+            self.runtime,
+            "read_frozen_transcript",
+            side_effect=[self.make_export("survivor"), terminal],
+        ):
+            claimed = self.runtime.claim_review_batch(
+                connection,
+                self.installation,
+                self.config,
+                now,
+            )
+        audit = self.runtime.abort_review_batch(
+            connection,
+            self.installation,
+            int(claimed["batch_id"]),
+            str(claimed["owner_token"]),
+            now + 1,
+        )
+        connection.close()
+        self.assertEqual(
+            audit["exclusion_counts"],
+            {"unsupported_transcript": 1},
+        )
+        self.assertEqual(audit["batch_capacity_released"], 0)
+
+
+class ReviewBatchMaintenanceTests(BatchExportTestCase):
+    def test_expired_member_closes_whole_batch_without_cursor_advance(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        first = self.insert_pending(connection, 1, now=now)
+        second = self.insert_pending(connection, 2, now=now)
+        claimed = self.claim_ready_batch(
+            connection,
+            [self.make_export("one"), self.make_export("two")],
+            now=now,
+        )
+        batch_id = int(claimed["batch_id"])
+        result_path = Path(str(claimed["result_path"]))
+        connection.execute("BEGIN IMMEDIATE")
+        with self.assertRaisesRegex(
+            ValueError, "active_transaction"
+        ):
+            self.runtime.recover_expired_review_leases(
+                connection, now
+            )
+        connection.rollback()
+        connection.execute(
+            """
+            UPDATE review_items SET lease_expires_at=?
+            WHERE id=?
+            """,
+            (
+                self.runtime.iso_utc(now - 1),
+                int(first["id"]),
+            ),
+        )
+        contract = self.runtime.load_review_contract(
+            connection, batch_id, "final"
+        )
+        expected_second = next(
+            session
+            for session in contract["sessions"]
+            if int(session["review_item_id"]) == int(second["id"])
+        )
+        connection.execute(
+            "UPDATE review_items SET frozen_to=? WHERE id=?",
+            (
+                int(expected_second["frozen_to"]) + 1,
+                int(second["id"]),
+            ),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "review_generation_contract_mismatch"
+        ):
+            self.runtime.recover_expired_review_leases(
+                connection, now
+            )
+        self.assertTrue(result_path.exists())
+        self.assertEqual(
+            connection.execute(
+                "SELECT status FROM review_batches WHERE id=?",
+                (batch_id,),
+            ).fetchone()["status"],
+            "ready",
+        )
+        connection.execute(
+            "UPDATE review_items SET frozen_to=? WHERE id=?",
+            (
+                int(expected_second["frozen_to"]),
+                int(second["id"]),
+            ),
+        )
+        recovered = self.runtime.recover_expired_review_leases(
+            connection, now
+        )
+        rows = connection.execute(
+            """
+            SELECT id,status,reviewed_boundary,error_code,batch_id,
+              frozen_to,lease_owner
+            FROM review_items ORDER BY id
+            """
+        ).fetchall()
+        batch = connection.execute(
+            "SELECT status FROM review_batches WHERE id=?",
+            (batch_id,),
+        ).fetchone()
+        audit = json.loads(
+            connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (self.runtime.review_audit_key(batch_id),),
+            ).fetchone()["value"]
+        )
+        prepare_old = self.claim_ready_batch(
+            connection,
+            [self.make_export("one"), self.make_export("two")],
+            now=now + 10,
+        )
+        prepare_old_batch_id = int(prepare_old["batch_id"])
+        prepare_old_path = Path(str(prepare_old["result_path"]))
+        connection.execute(
+            """
+            UPDATE review_items SET lease_expires_at=?
+            WHERE id=?
+            """,
+            (
+                self.runtime.iso_utc(now + 19),
+                int(first["id"]),
+            ),
+        )
+        prepare_replacement = self.claim_ready_batch(
+            connection,
+            [self.make_export("one"), self.make_export("two")],
+            now=now + 20,
+        )
+        prepare_old_status = connection.execute(
+            "SELECT status FROM review_batches WHERE id=?",
+            (prepare_old_batch_id,),
+        ).fetchone()["status"]
+        replacement_batch_id = int(
+            prepare_replacement["batch_id"]
+        )
+        replacement_path = Path(
+            str(prepare_replacement["result_path"])
+        )
+        third = self.insert_pending(
+            connection, 3, now=now + 20
+        )
+        connection.execute(
+            """
+            UPDATE review_items SET lease_expires_at=?
+            WHERE id=?
+            """,
+            (
+                self.runtime.iso_utc(now + 29),
+                int(first["id"]),
+            ),
+        )
+        connection.execute("BEGIN IMMEDIATE")
+        with self.assertRaisesRegex(
+            ValueError, "active_transaction"
+        ):
+            self.runtime.claim_review_generation(
+                connection,
+                str(third["session_key"]),
+                "legacy-owner",
+                now + 30,
+                self.config,
+            )
+        connection.rollback()
+        self.runtime.claim_review_generation(
+            connection,
+            str(third["session_key"]),
+            "legacy-owner",
+            now + 30,
+            self.config,
+        )
+        replacement_status = connection.execute(
+            "SELECT status FROM review_batches WHERE id=?",
+            (replacement_batch_id,),
+        ).fetchone()["status"]
+        legacy_state = connection.execute(
+            """
+            SELECT status,batch_id FROM review_items WHERE id=?
+            """,
+            (int(third["id"]),),
+        ).fetchone()
+        connection.execute(
+            "UPDATE review_items SET lease_expires_at=? WHERE id=?",
+            (
+                self.runtime.iso_utc(now + 39),
+                int(third["id"]),
+            ),
+        )
+        connection.execute("BEGIN IMMEDIATE")
+        with self.assertRaisesRegex(
+            ValueError, "review_result_destination_required"
+        ):
+            self.runtime._recover_expired_review_leases(
+                connection,
+                now + 40,
+                None,
+            )
+        destination_guard_state = connection.execute(
+            "SELECT status FROM review_items WHERE id=?",
+            (int(third["id"]),),
+        ).fetchone()["status"]
+        connection.rollback()
+        destination_cleanup = (
+            self.runtime.recover_expired_review_leases(
+                connection, now + 40
+            )
+        )
+        standalone_ids = [
+            int(
+                self.insert_pending(
+                    connection,
+                    number,
+                    now=now + 40,
+                )["id"]
+            )
+            for number in range(4, 205)
+        ]
+        connection.executemany(
+            """
+            UPDATE review_items
+            SET status='reviewing',lease_owner=?,
+                lease_expires_at=?
+            WHERE id=?
+            """,
+            [
+                (
+                    "bounded-owner",
+                    self.runtime.iso_utc(now + 49),
+                    review_item_id,
+                )
+                for review_item_id in standalone_ids
+            ],
+        )
+        priority_target = connection.execute(
+            """
+            SELECT session_key FROM review_items WHERE id=?
+            """,
+            (standalone_ids[-1],),
+        ).fetchone()["session_key"]
+        priority_claim = self.runtime.claim_review_generation(
+            connection,
+            str(priority_target),
+            "priority-owner",
+            now + 50,
+            self.config,
+        )
+        bounded_remaining = connection.execute(
+            """
+            SELECT COUNT(*) FROM review_items
+            WHERE status='reviewing' AND batch_id IS NULL
+              AND lease_owner='bounded-owner'
+            """
+        ).fetchone()[0]
+        bounded_pending = connection.execute(
+            """
+            SELECT COUNT(*) FROM review_items
+            WHERE id>=? AND id<=? AND status='pending'
+            """,
+            (standalone_ids[0], standalone_ids[-1]),
+        ).fetchone()[0]
+        priority_state = connection.execute(
+            """
+            SELECT status,lease_owner FROM review_items WHERE id=?
+            """,
+            (standalone_ids[-1],),
+        ).fetchone()
+        bounded_cleanup = (
+            self.runtime.recover_expired_review_leases(
+                connection, now + 51
+            )
+        )
+        connection.close()
+        self.assertEqual(recovered, 2)
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [
+                (int(first["id"]), "pending", 0, None, None, None, None),
+                (int(second["id"]), "pending", 0, None, None, None, None),
+            ],
+        )
+        self.assertEqual(batch["status"], "expired")
+        self.assertEqual(audit["terminal_status"], "expired")
+        self.assertFalse(result_path.exists())
+        self.assertEqual(prepare_old_status, "expired")
+        self.assertFalse(prepare_old_path.exists())
+        self.assertEqual(replacement_status, "expired")
+        self.assertFalse(replacement_path.exists())
+        self.assertEqual(tuple(legacy_state), ("reviewing", None))
+        self.assertEqual(destination_guard_state, "reviewing")
+        self.assertEqual(destination_cleanup, 1)
+        self.assertEqual(bounded_remaining, 1)
+        self.assertEqual(
+            bounded_pending,
+            self.runtime.REVIEW_MAINTENANCE_BATCH_MAX - 1,
+        )
+        self.assertEqual(
+            tuple(priority_state),
+            ("reviewing", "priority-owner"),
+        )
+        self.assertEqual(
+            priority_claim["session_key"],
+            priority_target,
+        )
+        self.assertEqual(bounded_cleanup, 1)
+
+    def test_raw_ttl_captures_batch_before_clearing_ids_and_closes_atomically(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        cleanup_at = now + 100
+        connection = self.runtime.open_database(self.installation)
+        first = self.insert_pending(connection, 1, now=now)
+        second = self.insert_pending(connection, 2, now=now)
+        claimed = self.claim_ready_batch(
+            connection,
+            [self.make_export("one"), self.make_export("two")],
+            now=now,
+        )
+        third = self.insert_pending(
+            connection, 3, now=now - 100
+        )
+        batch_id = int(claimed["batch_id"])
+        result_path = Path(str(claimed["result_path"]))
+        recent_ns = int(cleanup_at * 1_000_000_000)
+        os.utime(result_path, ns=(recent_ns, recent_ns))
+        connection.execute(
+            """
+            UPDATE review_items
+            SET raw_metadata_expires_at=CASE
+                  WHEN id=? THEN ? ELSE ?
+                END,
+                lease_expires_at=?
+            WHERE batch_id=?
+            """,
+            (
+                int(first["id"]),
+                self.runtime.iso_utc(cleanup_at),
+                self.runtime.iso_utc(cleanup_at + 10_000),
+                self.runtime.iso_utc(cleanup_at + 10_000),
+                batch_id,
+            ),
+        )
+        contract = self.runtime.load_review_contract(
+            connection, batch_id, "final"
+        )
+        expected_second = next(
+            session
+            for session in contract["sessions"]
+            if int(session["review_item_id"]) == int(second["id"])
+        )
+        connection.execute(
+            "UPDATE review_items SET frozen_to=? WHERE id=?",
+            (
+                int(expected_second["frozen_to"]) + 1,
+                int(second["id"]),
+            ),
+        )
+        with mock.patch.object(
+            self.runtime,
+            "cleanup_review_results",
+        ) as cleanup:
+            with self.assertRaisesRegex(
+                ValueError, "review_generation_contract_mismatch"
+            ):
+                self.runtime.run_maintenance(
+                    connection,
+                    self.installation,
+                    self.config,
+                    cleanup_at,
+                )
+            cleanup.assert_not_called()
+        self.assertTrue(result_path.exists())
+        self.assertEqual(
+            connection.execute(
+                "SELECT status FROM review_batches WHERE id=?",
+                (batch_id,),
+            ).fetchone()["status"],
+            "ready",
+        )
+        connection.execute(
+            "UPDATE review_items SET frozen_to=? WHERE id=?",
+            (
+                int(expected_second["frozen_to"]),
+                int(second["id"]),
+            ),
+        )
+        with mock.patch.object(
+            self.runtime,
+            "cleanup_review_results",
+            side_effect=ValueError(
+                "review_result_namespace_saturated"
+            ),
+        ):
+            result = self.runtime.run_maintenance(
+                connection,
+                self.installation,
+                replace(
+                    self.config,
+                    pending_limit_sessions=1,
+                ),
+                cleanup_at,
+            )
+        legacy = self.insert_pending(
+            connection, 4, now=cleanup_at
+        )
+        legacy_batch_id = int(
+            connection.execute(
+                """
+                INSERT INTO review_batches(status,started_at)
+                VALUES('preparing',?)
+                """,
+                (self.runtime.iso_utc(cleanup_at),),
+            ).lastrowid
+        )
+        connection.execute(
+            """
+            UPDATE review_items
+            SET status='reviewing',batch_id=?,lease_owner=?,
+                lease_expires_at=?,raw_metadata_expires_at=?
+            WHERE id=?
+            """,
+            (
+                legacy_batch_id,
+                "legacy-marker-owner",
+                self.runtime.iso_utc(cleanup_at + 10_000),
+                self.runtime.iso_utc(cleanup_at + 1),
+                int(legacy["id"]),
+            ),
+        )
+        normal = self.insert_pending(
+            connection, 5, now=cleanup_at
+        )
+        connection.execute(
+            """
+            UPDATE review_items
+            SET status='reviewed',pending_since=NULL,reviewed_at=?,
+                raw_metadata_expires_at=?
+            WHERE id=?
+            """,
+            (
+                self.runtime.iso_utc(cleanup_at),
+                self.runtime.iso_utc(cleanup_at + 1),
+                int(normal["id"]),
+            ),
+        )
+        legacy_result = self.runtime.run_maintenance(
+            connection,
+            self.installation,
+            self.config,
+            cleanup_at + 1,
+        )
+        legacy_state = connection.execute(
+            """
+            SELECT status,batch_id,raw_session_id,transcript_path,
+              lease_owner
+            FROM review_items WHERE id=?
+            """,
+            (int(legacy["id"]),),
+        ).fetchone()
+        normal_state = connection.execute(
+            """
+            SELECT status,raw_session_id,transcript_path
+            FROM review_items WHERE id=?
+            """,
+            (int(normal["id"]),),
+        ).fetchone()
+        orphan_batch_status = connection.execute(
+            "SELECT status FROM review_batches WHERE id=?",
+            (legacy_batch_id,),
+        ).fetchone()["status"]
+        rows = connection.execute(
+            """
+            SELECT id,status,reviewed_boundary,raw_session_id,
+              transcript_path,batch_id,lease_owner,error_code
+            FROM review_items ORDER BY id
+            """
+        ).fetchall()
+        batch = connection.execute(
+            "SELECT status FROM review_batches WHERE id=?",
+            (batch_id,),
+        ).fetchone()
+        keys = {
+            row["key"]
+            for row in connection.execute(
+                "SELECT key FROM metadata WHERE key LIKE ?",
+                (f"review.batch.{batch_id}.%",),
+            )
+        }
+        audit = json.loads(
+            connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (self.runtime.review_audit_key(batch_id),),
+            ).fetchone()["value"]
+        )
+        connection.close()
+        self.assertEqual(result["raw_redacted"], 1)
+        self.assertEqual(legacy_result["raw_redacted"], 2)
+        self.assertEqual(
+            tuple(legacy_state),
+            ("expired", None, None, None, None),
+        )
+        self.assertEqual(
+            tuple(normal_state),
+            ("reviewed", None, None),
+        )
+        self.assertEqual(orphan_batch_status, "preparing")
+        self.assertEqual(
+            tuple(rows[0]),
+            (
+                int(first["id"]),
+                "expired",
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        self.assertEqual(
+            tuple(rows[1]),
+            (
+                int(second["id"]),
+                "pending",
+                0,
+                "raw-session-2",
+                str(second["transcript_path"]),
+                None,
+                None,
+                None,
+            ),
+        )
+        self.assertEqual(
+            tuple(rows[2]),
+            (
+                int(third["id"]),
+                "expired",
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        self.assertEqual(batch["status"], "expired")
+        self.assertEqual(keys, {
+            self.runtime.review_audit_key(batch_id)
+        })
+        self.assertEqual(
+            audit["exclusion_counts"],
+            {"raw_metadata_ttl": 1},
+        )
+        self.assertEqual(result["capacity_expired"], 1)
+        self.assertEqual(result["result_scan_saturated"], 1)
+        self.assertEqual(result["result_cleanup_failed"], 0)
+        self.assertEqual(
+            result["result_scan_entries"],
+            self.runtime.REVIEW_RESULT_SCAN_MAX,
+        )
+        self.assertFalse(result_path.exists())
+
+    def test_raw_ttl_audit_failure_rolls_back_rows_batch_and_metadata(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        cleanup_at = now + 100
+        connection = self.runtime.open_database(self.installation)
+        item = self.insert_pending(connection, 1, now=now)
+        claimed = self.claim_ready_batch(
+            connection, [self.make_export("one")], now=now
+        )
+        batch_id = int(claimed["batch_id"])
+        result_path = Path(str(claimed["result_path"]))
+        recent_ns = int(cleanup_at * 1_000_000_000)
+        os.utime(result_path, ns=(recent_ns, recent_ns))
+        connection.execute(
+            """
+            UPDATE review_items
+            SET raw_metadata_expires_at=?,lease_expires_at=?
+            WHERE id=?
+            """,
+            (
+                self.runtime.iso_utc(cleanup_at),
+                self.runtime.iso_utc(cleanup_at + 10_000),
+                int(item["id"]),
+            ),
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER reject_batch_audit
+            BEFORE INSERT ON metadata
+            WHEN NEW.key LIKE 'review.batch.%.audit'
+            BEGIN
+              SELECT RAISE(ABORT,'audit rejected');
+            END
+            """
+        )
+        with mock.patch.object(
+            self.runtime,
+            "cleanup_review_results",
+        ) as cleanup:
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError, "audit rejected"
+            ):
+                self.runtime.run_maintenance(
+                    connection,
+                    self.installation,
+                    self.config,
+                    cleanup_at,
+                )
+            cleanup.assert_not_called()
+        row = connection.execute(
+            """
+            SELECT status,batch_id,raw_session_id,lease_owner
+            FROM review_items WHERE id=?
+            """,
+            (int(item["id"]),),
+        ).fetchone()
+        batch = connection.execute(
+            "SELECT status FROM review_batches WHERE id=?",
+            (batch_id,),
+        ).fetchone()
+        contract_count = connection.execute(
+            """
+            SELECT COUNT(*) FROM metadata WHERE key IN (?,?)
+            """,
+            (
+                self.runtime.review_contract_key(batch_id),
+                self.runtime.review_result_key(batch_id),
+            ),
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(
+            tuple(row),
+            (
+                "reviewing",
+                batch_id,
+                "raw-session-1",
+                self.runtime.review_owner_digest(
+                    self.installation,
+                    str(claimed["owner_token"]),
+                ),
+            ),
+        )
+        self.assertEqual(batch["status"], "ready")
+        self.assertEqual(contract_count, 2)
+        self.assertTrue(result_path.exists())
+
+    def test_maintenance_purges_terminal_batch_and_audit_after_90_days(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        self.insert_pending(connection, 1, now=now)
+        claimed = self.claim_ready_batch(
+            connection, [self.make_export("one")], now=now
+        )
+        batch_id = int(claimed["batch_id"])
+        self.runtime.abort_review_batch(
+            connection,
+            self.installation,
+            batch_id,
+            str(claimed["owner_token"]),
+            now + 1,
+        )
+        result = self.runtime.run_maintenance(
+            connection,
+            self.installation,
+            self.config,
+            now + 1 + 90 * 86_400,
+        )
+        batch_count = connection.execute(
+            "SELECT COUNT(*) FROM review_batches WHERE id=?",
+            (batch_id,),
+        ).fetchone()[0]
+        audit_count = connection.execute(
+            "SELECT COUNT(*) FROM metadata WHERE key=?",
+            (self.runtime.review_audit_key(batch_id),),
+        ).fetchone()[0]
+        backlog_start = batch_id + 10_000
+        backlog_ids = list(
+            range(backlog_start, backlog_start + 1_100)
+        )
+        connection.executemany(
+            """
+            INSERT INTO review_batches(
+              id,status,started_at,finished_at
+            ) VALUES(?,'failed',?,?)
+            """,
+            [
+                (
+                    queued_id,
+                    self.runtime.iso_utc(now),
+                    self.runtime.iso_utc(now + 1),
+                )
+                for queued_id in backlog_ids
+            ],
+        )
+        connection.executemany(
+            "INSERT INTO metadata(key,value) VALUES(?,?)",
+            [
+                (
+                    self.runtime.review_audit_key(queued_id),
+                    "{}",
+                )
+                for queued_id in backlog_ids
+            ],
+        )
+        with mock.patch.object(
+            self.runtime,
+            "cleanup_review_results",
+            side_effect=ValueError(
+                "review_result_root_invalid"
+            ),
+        ):
+            backlog_result = self.runtime.run_maintenance(
+                connection,
+                self.installation,
+                self.config,
+                now + 1 + 90 * 86_400,
+            )
+        backlog_batches = connection.execute(
+            """
+            SELECT COUNT(*) FROM review_batches
+            WHERE id>=? AND id<?
+            """,
+            (backlog_start, backlog_start + 1_100),
+        ).fetchone()[0]
+        backlog_audits = connection.execute(
+            """
+            SELECT COUNT(*) FROM metadata
+            WHERE key LIKE 'review.batch.%.audit'
+            """
+        ).fetchone()[0]
+        connection.execute(
+            "DELETE FROM metadata WHERE key=?",
+            (
+                self.runtime.review_audit_key(
+                    backlog_start
+                    + self.runtime.REVIEW_MAINTENANCE_BATCH_MAX
+                ),
+            ),
+        )
+        with mock.patch.object(
+            self.runtime,
+            "cleanup_review_results",
+        ) as cleanup:
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "terminal_batch_audit_purge_race",
+            ):
+                self.runtime.run_maintenance(
+                    connection,
+                    self.installation,
+                    self.config,
+                    now + 1 + 90 * 86_400,
+                )
+            cleanup.assert_not_called()
+        rollback_backlog_batches = connection.execute(
+            """
+            SELECT COUNT(*) FROM review_batches
+            WHERE id>=? AND id<?
+            """,
+            (backlog_start, backlog_start + 1_100),
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(result["terminal_batches_deleted"], 1)
+        self.assertEqual((batch_count, audit_count), (0, 0))
+        self.assertEqual(
+            backlog_result["terminal_batches_deleted"],
+            self.runtime.REVIEW_MAINTENANCE_BATCH_MAX,
+        )
+        self.assertEqual(
+            (
+                backlog_result["result_scan_saturated"],
+                backlog_result["result_cleanup_failed"],
+            ),
+            (0, 1),
+        )
+        self.assertEqual(
+            (backlog_batches, backlog_audits),
+            (
+                1_100
+                - self.runtime.REVIEW_MAINTENANCE_BATCH_MAX,
+                1_100
+                - self.runtime.REVIEW_MAINTENANCE_BATCH_MAX,
+            ),
+        )
+        self.assertEqual(
+            rollback_backlog_batches,
+            1_100 - self.runtime.REVIEW_MAINTENANCE_BATCH_MAX,
+        )
+
+    def test_expired_partial_export_retains_capacity_release_count(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        first = self.insert_pending(connection, 1, now=now)
+        self.insert_pending(connection, 2, now=now)
+        one = replace(
+            self.make_export("first"),
+            canonical_records_bytes=5_000_000,
+        )
+        two = replace(
+            self.make_export("second"),
+            canonical_records_bytes=5_000_000,
+        )
+        claimed = self.claim_ready_batch(
+            connection, [one, two], now=now
+        )
+        batch_id = int(claimed["batch_id"])
+        connection.execute(
+            """
+            UPDATE review_items SET lease_expires_at=?
+            WHERE id=?
+            """,
+            (
+                self.runtime.iso_utc(now - 1),
+                int(first["id"]),
+            ),
+        )
+        recovered = self.runtime.recover_expired_review_leases(
+            connection, now
+        )
+        audit = json.loads(
+            connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (self.runtime.review_audit_key(batch_id),),
+            ).fetchone()["value"]
+        )
+        connection.close()
+        self.assertEqual(recovered, 1)
+        self.assertEqual(audit["terminal_status"], "expired")
+        self.assertEqual(audit["exclusion_counts"], {})
+        self.assertEqual(audit["batch_capacity_released"], 1)

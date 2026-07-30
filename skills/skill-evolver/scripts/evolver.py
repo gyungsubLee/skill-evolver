@@ -59,6 +59,7 @@ REVIEW_RESULT_MAX_FILES = 200
 REVIEW_RESULT_SCAN_MAX = 201
 REVIEW_RESULT_TTL_SECONDS = 3_600
 REVIEW_BATCH_AUDIT_TTL_SECONDS = 90 * 86_400
+REVIEW_MAINTENANCE_BATCH_MAX = 200
 
 
 @dataclass(frozen=True)
@@ -446,9 +447,12 @@ def _prepare_review_batch(
     policy_digest = improvement_policy_digest(policy)
     transcript_digest = transcript_adapter_digest(runtime)
     catalog_digest = catalog_adapter_digest(runtime)
+    result_files: list[BoundReviewResult] = []
     connection.execute("BEGIN IMMEDIATE")
     try:
-        _recover_expired_review_leases(connection, now)
+        _recover_expired_review_leases(
+            connection, now, result_files
+        )
         rows = connection.execute(
             """
             SELECT * FROM review_items
@@ -462,7 +466,7 @@ def _prepare_review_batch(
         ).fetchall()
         if not rows:
             connection.commit()
-            return {
+            prepared = {
                 "schema_version": 1,
                 "status": "empty",
                 "batch_id": None,
@@ -470,6 +474,9 @@ def _prepare_review_batch(
                 "claims": [],
                 "contract": None,
             }
+            for opened in result_files:
+                delete_bound_review_result(opened)
+            return prepared
         owner_token = secrets.token_hex(32)
         owner_digest = review_owner_digest(installation, owner_token)
         batch_id = int(
@@ -538,7 +545,7 @@ def _prepare_review_batch(
             (len(claims), len(claims), batch_id),
         )
         connection.commit()
-        return {
+        prepared = {
             "schema_version": 1,
             "status": "preparing",
             "batch_id": batch_id,
@@ -546,6 +553,9 @@ def _prepare_review_batch(
             "claims": claims,
             "contract": seed,
         }
+        for opened in result_files:
+            delete_bound_review_result(opened)
+        return prepared
     except BaseException:
         connection.rollback()
         raise
@@ -895,6 +905,269 @@ def _store_review_result_binding(
         ),
     )
     return binding
+
+
+def _bound_result_from_binding(
+    batch_id: int,
+    binding: dict[str, object],
+) -> BoundReviewResult:
+    binding = _validate_review_result_binding(
+        binding, batch_id
+    )
+    parent = REVIEW_RESULT_PARENT
+    if not isinstance(parent, Path) or not parent.is_absolute():
+        raise ValueError("review_result_parent_invalid")
+    root = parent / f"{REVIEW_RESULT_PREFIX}{os.getuid()}"
+    return BoundReviewResult(
+        batch_id=batch_id,
+        path=root / str(binding["basename"]),
+        basename=str(binding["basename"]),
+        device=int(binding["device"]),
+        inode=int(binding["inode"]),
+        encoded=b"",
+    )
+
+
+def _capture_bound_review_result(
+    connection: sqlite3.Connection,
+    batch_id: int,
+    destination: list[BoundReviewResult],
+    *,
+    required: bool,
+) -> None:
+    try:
+        binding = load_review_result_binding(connection, batch_id)
+    except ValueError as error:
+        if (
+            str(error) == "review_result_binding_missing"
+            and not required
+        ):
+            return
+        raise
+    destination.append(
+        _bound_result_from_binding(batch_id, binding)
+    )
+
+
+def _refresh_bound_review_result(
+    opened: BoundReviewResult,
+    now: float,
+) -> bool:
+    descriptor: Optional[int] = None
+    try:
+        with _locked_review_result_root() as root:
+            info = _safe_review_result_info(opened.path, root)
+            if (
+                info is None
+                or opened.path.name != opened.basename
+                or opened.path.parent != root
+                or (info.st_dev, info.st_ino)
+                != (opened.device, opened.inode)
+            ):
+                return False
+            descriptor = os.open(
+                str(opened.path),
+                os.O_RDONLY
+                | os.O_NONBLOCK
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.getuid()
+                or stat.S_IMODE(before.st_mode) != 0o600
+                or before.st_nlink != 1
+                or (before.st_dev, before.st_ino)
+                != (opened.device, opened.inode)
+            ):
+                return False
+            target_ns = max(
+                before.st_mtime_ns,
+                int(now * 1_000_000_000),
+            )
+            os.utime(
+                descriptor,
+                ns=(target_ns, target_ns),
+            )
+            after = os.fstat(descriptor)
+            return (
+                stat.S_ISREG(after.st_mode)
+                and after.st_uid == os.getuid()
+                and stat.S_IMODE(after.st_mode) == 0o600
+                and after.st_nlink == 1
+                and (after.st_dev, after.st_ino)
+                == (opened.device, opened.inode)
+                and after.st_mtime_ns == target_ns
+            )
+    except (OSError, RuntimeError, ValueError):
+        return False
+    finally:
+        if descriptor is not None:
+            try:
+                _close_review_descriptor(descriptor)
+            except (OSError, RuntimeError):
+                pass
+
+
+def heartbeat_review_batch(
+    connection: sqlite3.Connection,
+    installation: Installation,
+    batch_id: int,
+    owner_token: str,
+    now: float,
+    config: Config,
+) -> bool:
+    if connection.in_transaction:
+        raise ValueError("active_transaction")
+    try:
+        require_live_review_batch(
+            connection,
+            installation,
+            batch_id,
+            owner_token,
+            now,
+        )
+        opened = _bound_result_from_binding(
+            batch_id,
+            load_review_result_binding(connection, batch_id),
+        )
+    except ValueError as error:
+        if str(error) in {
+            "review_batch_owner_mismatch",
+            "review_batch_not_live",
+            "review_generation_contract_mismatch",
+        }:
+            return False
+        raise
+    # ponytail: refreshing before the database lock can harmlessly extend
+    # file TTL if the later write rolls back, but never extends the DB lease
+    # after a failed file refresh. A DB-aware cleanup or durable file lease
+    # can replace this ceiling without holding DB and root locks together.
+    if not _refresh_bound_review_result(opened, now):
+        return False
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        try:
+            batch, _contract, owner_digest = (
+                require_live_review_batch(
+                    connection,
+                    installation,
+                    batch_id,
+                    owner_token,
+                    now,
+                )
+            )
+            require_bound_review_result_binding(
+                connection,
+                batch_id,
+                opened,
+            )
+        except ValueError as error:
+            if str(error) in {
+                "review_batch_owner_mismatch",
+                "review_batch_not_live",
+                "review_generation_contract_mismatch",
+                "review_result_binding_mismatch",
+            }:
+                connection.rollback()
+                return False
+            raise
+        changed = connection.execute(
+            """
+            UPDATE review_items
+            SET lease_expires_at=MAX(lease_expires_at,?)
+            WHERE batch_id=? AND status='reviewing'
+              AND lease_owner=? AND lease_expires_at>=?
+            """,
+            (
+                iso_utc(now + config.lease_seconds),
+                batch_id,
+                owner_digest,
+                iso_utc(now),
+            ),
+        ).rowcount
+        if changed != int(batch["generation_count"]):
+            raise sqlite3.IntegrityError("review_heartbeat_race")
+        connection.commit()
+        return True
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+
+
+def abort_review_batch(
+    connection: sqlite3.Connection,
+    installation: Installation,
+    batch_id: int,
+    owner_token: str,
+    now: float,
+) -> dict[str, object]:
+    if connection.in_transaction:
+        raise ValueError("active_transaction")
+    require_live_review_batch(
+        connection,
+        installation,
+        batch_id,
+        owner_token,
+        now,
+    )
+    load_review_result_binding(connection, batch_id)
+    result_files: list[BoundReviewResult] = []
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        _batch, contract, owner_digest = require_live_review_batch(
+            connection,
+            installation,
+            batch_id,
+            owner_token,
+            now,
+        )
+        _capture_bound_review_result(
+            connection,
+            batch_id,
+            result_files,
+            required=True,
+        )
+        for session in contract["sessions"]:
+            claim = {
+                "review_item_id": session["review_item_id"],
+                "generation": session["expected_generation"],
+                "transcript_epoch": session["frozen_epoch"],
+                "review_from": session["frozen_from"],
+                "review_to": session["frozen_to"],
+                "locator_digest": session[
+                    "frozen_locator_digest"
+                ],
+            }
+            _release_batch_review_generation(
+                connection,
+                claim,
+                batch_id,
+                owner_digest,
+                now,
+            )
+        audit = finalize_review_batch(
+            connection,
+            batch_id,
+            owner_digest,
+            "aborted",
+            0,
+            {},
+            now,
+        )
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    for opened in result_files:
+        delete_bound_review_result(opened)
+    try:
+        cleanup_review_results(now)
+    except ValueError:
+        pass
+    return audit
 
 
 def review_result_root() -> Path:
@@ -1343,6 +1616,21 @@ HARD_LIMITS = {
     "max_candidates_per_session": 1,
     "max_candidates_per_batch": 3,
 }
+
+
+def _validate_lease_ttl_config(
+    values: Mapping[str, object],
+) -> None:
+    if int(values["lease_seconds"]) >= REVIEW_RESULT_TTL_SECONDS:
+        raise ValueError("invalid_config_lease_seconds")
+    if (
+        int(values["lease_heartbeat_seconds"])
+        >= int(values["lease_seconds"])
+    ):
+        raise ValueError(
+            "invalid_config_lease_heartbeat_seconds"
+        )
+
 
 SCHEMA_SQL = """
 CREATE TABLE review_batches (
@@ -2945,6 +3233,80 @@ def _load_any_review_contract(
     )
 
 
+def _require_exact_review_batch_members(
+    connection: sqlite3.Connection,
+    batch_id: int,
+    contract: dict[str, object],
+) -> tuple[sqlite3.Row, list[sqlite3.Row]]:
+    if not connection.in_transaction:
+        raise ValueError("active_review_transaction_required")
+    batch = connection.execute(
+        "SELECT * FROM review_batches WHERE id=?",
+        (batch_id,),
+    ).fetchone()
+    expected_status = (
+        "preparing"
+        if contract["stage"] == "seed"
+        else "ready"
+    )
+    if batch is None or batch["status"] != expected_status:
+        raise ValueError("review_batch_not_live")
+    sessions = {
+        int(session["review_item_id"]): session
+        for session in contract["sessions"]
+    }
+    rows = connection.execute(
+        """
+        SELECT * FROM review_items
+        WHERE batch_id=? ORDER BY id
+        """,
+        (batch_id,),
+    ).fetchall()
+    if (
+        type(batch["session_count"]) is not int
+        or type(batch["generation_count"]) is not int
+        or int(batch["session_count"]) != len(sessions)
+        or int(batch["generation_count"]) != len(sessions)
+        or len(rows) != len(sessions)
+        or {int(row["id"]) for row in rows} != set(sessions)
+    ):
+        raise ValueError("review_batch_membership_changed")
+    owner_digest = str(contract["owner_digest"])
+    for row in rows:
+        session = sessions[int(row["id"])]
+        locator_json = row["frozen_locator_json"]
+        if (
+            row["status"] != "reviewing"
+            or not hmac.compare_digest(
+                str(row["lease_owner"]),
+                owner_digest,
+            )
+            or (
+                row["generation"],
+                row["frozen_epoch"],
+                row["frozen_from"],
+                row["frozen_to"],
+            )
+            != (
+                session["expected_generation"],
+                session["frozen_epoch"],
+                session["frozen_from"],
+                session["frozen_to"],
+            )
+            or not isinstance(locator_json, str)
+            or not hmac.compare_digest(
+                hashlib.sha256(
+                    locator_json.encode("utf-8")
+                ).hexdigest(),
+                str(session["frozen_locator_digest"]),
+            )
+        ):
+            raise ValueError(
+                "review_generation_contract_mismatch"
+            )
+    return batch, rows
+
+
 REVIEW_EXTERNAL_EXCLUSION_REASONS = frozenset(
     {
         "configuration_envelope_error",
@@ -4071,6 +4433,7 @@ def initialize_runtime(
     for key, maximum in HARD_LIMITS.items():
         if int(merged[key]) > maximum:
             raise ValueError(f"invalid_config_{key}")
+    _validate_lease_ttl_config(merged)
     if merged["max_candidates_per_session"] != 1:
         raise ValueError("invalid_config_max_candidates_per_session")
 
@@ -4194,6 +4557,7 @@ def load_config(installation: Installation) -> Config:
     for key, maximum in HARD_LIMITS.items():
         if values[key] > maximum:
             raise ValueError(f"invalid_config_{key}")
+    _validate_lease_ttl_config(values)
     if values["max_candidates_per_session"] != 1:
         raise ValueError("invalid_config_max_candidates_per_session")
     return Config(
@@ -4759,8 +5123,21 @@ def adopt_transcript_epoch(
 def _recover_expired_review_leases(
     connection: sqlite3.Connection,
     now: float,
+    result_files: list[BoundReviewResult],
+    *,
+    priority_session_key: Optional[str] = None,
 ) -> int:
-    return connection.execute(
+    if not connection.in_transaction:
+        raise ValueError("active_review_transaction_required")
+    if not isinstance(result_files, list):
+        raise ValueError("review_result_destination_required")
+    if (
+        priority_session_key is not None
+        and not isinstance(priority_session_key, str)
+    ):
+        raise ValueError("invalid_priority_session_key")
+    destination = result_files
+    changed = connection.execute(
         """
         UPDATE review_items
         SET status='pending',batch_id=NULL,review_started_at=NULL,
@@ -4768,24 +5145,107 @@ def _recover_expired_review_leases(
             frozen_locator_json=NULL,lease_owner=NULL,lease_expires_at=NULL,
             pending_since=COALESCE(pending_since,?)
         WHERE status='reviewing' AND batch_id IS NULL
-          AND lease_expires_at < ?
+          AND id IN (
+            SELECT id FROM review_items
+            WHERE status='reviewing' AND batch_id IS NULL
+              AND lease_expires_at<?
+            ORDER BY CASE WHEN session_key=? THEN 0 ELSE 1 END,id
+            LIMIT ?
+          )
         """,
-        (iso_utc(now), iso_utc(now)),
+        (
+            iso_utc(now),
+            iso_utc(now),
+            priority_session_key or "",
+            REVIEW_MAINTENANCE_BATCH_MAX,
+        ),
     ).rowcount
+    batch_ids = [
+        int(row["batch_id"])
+        for row in connection.execute(
+            """
+            SELECT DISTINCT item.batch_id
+            FROM review_items AS item
+            WHERE item.status='reviewing'
+              AND item.batch_id IS NOT NULL
+              AND item.lease_expires_at<?
+              AND EXISTS(
+                SELECT 1 FROM metadata AS metadata_row
+                WHERE metadata_row.key=
+                  'review.batch.' || item.batch_id || '.contract'
+              )
+            ORDER BY item.batch_id
+            LIMIT ?
+            """,
+            (iso_utc(now), REVIEW_MAINTENANCE_BATCH_MAX),
+        )
+    ]
+    for batch_id in batch_ids:
+        contract = _load_any_review_contract(
+            connection, batch_id
+        )
+        _batch, rows = _require_exact_review_batch_members(
+            connection,
+            batch_id,
+            contract,
+        )
+        _capture_bound_review_result(
+            connection,
+            batch_id,
+            destination,
+            required=contract["stage"] == "final",
+        )
+        owner_digest = str(contract["owner_digest"])
+        released = connection.execute(
+            """
+            UPDATE review_items
+            SET status='pending',batch_id=NULL,
+                review_started_at=NULL,frozen_epoch=NULL,
+                frozen_from=NULL,frozen_to=NULL,
+                frozen_locator_json=NULL,lease_owner=NULL,
+                lease_expires_at=NULL,
+                pending_since=COALESCE(pending_since,?)
+            WHERE status='reviewing' AND batch_id=?
+              AND lease_owner=?
+            """,
+            (iso_utc(now), batch_id, owner_digest),
+        ).rowcount
+        if released != len(rows):
+            raise sqlite3.IntegrityError(
+                "review_expiry_release_race"
+            )
+        changed += released
+        finalize_review_batch(
+            connection,
+            batch_id,
+            owner_digest,
+            "expired",
+            0,
+            {},
+            now,
+        )
+    return changed
 
 
 def recover_expired_review_leases(
     connection: sqlite3.Connection,
     now: float,
 ) -> int:
+    if connection.in_transaction:
+        raise ValueError("active_transaction")
+    result_files: list[BoundReviewResult] = []
     connection.execute("BEGIN IMMEDIATE")
     try:
-        changed = _recover_expired_review_leases(connection, now)
+        changed = _recover_expired_review_leases(
+            connection, now, result_files
+        )
         connection.commit()
-        return changed
     except BaseException:
         connection.rollback()
         raise
+    for opened in result_files:
+        delete_bound_review_result(opened)
+    return changed
 
 
 def _claim_review_generation(
@@ -4882,9 +5342,17 @@ def claim_review_generation(
 ) -> dict[str, object]:
     if not owner or len(owner.encode("utf-8")) > 128:
         raise ValueError("invalid_lease_owner")
+    if connection.in_transaction:
+        raise ValueError("active_transaction")
+    result_files: list[BoundReviewResult] = []
     connection.execute("BEGIN IMMEDIATE")
     try:
-        _recover_expired_review_leases(connection, now)
+        _recover_expired_review_leases(
+            connection,
+            now,
+            result_files,
+            priority_session_key=session_key_value,
+        )
         claim = _claim_review_generation(
             connection,
             session_key_value,
@@ -4894,7 +5362,7 @@ def claim_review_generation(
             batch_id=None,
         )
         connection.commit()
-        return {
+        result = {
             name: claim[name]
             for name in (
                 "session_key",
@@ -4907,6 +5375,9 @@ def claim_review_generation(
                 "lease_expires_at",
             )
         }
+        for opened in result_files:
+            delete_bound_review_result(opened)
+        return result
     except BaseException:
         connection.rollback()
         raise
@@ -5840,21 +6311,183 @@ def run_maintenance(
     if connection.in_transaction:
         raise ValueError("active_transaction")
     counts = import_spool(connection, installation, config, now)
-    leases_recovered = recover_expired_review_leases(connection, now)
+    result_files: list[BoundReviewResult] = []
     connection.execute("BEGIN IMMEDIATE")
     try:
+        leases_recovered = _recover_expired_review_leases(
+            connection, now, result_files
+        )
+        uncontracted_raw_ids = [
+            int(row["id"])
+            for row in connection.execute(
+                """
+                SELECT item.id FROM review_items AS item
+                WHERE item.raw_redacted_at IS NULL
+                  AND item.raw_metadata_expires_at<=?
+                  AND item.status='reviewing'
+                  AND item.batch_id IS NOT NULL
+                  AND NOT EXISTS(
+                    SELECT 1 FROM metadata AS metadata_row
+                    WHERE metadata_row.key=
+                      'review.batch.' || item.batch_id || '.contract'
+                  )
+                ORDER BY item.id
+                LIMIT ?
+                """,
+                (
+                    iso_utc(now),
+                    REVIEW_MAINTENANCE_BATCH_MAX,
+                ),
+            )
+        ]
+        if uncontracted_raw_ids:
+            # ponytail: privacy wins over a contractless legacy marker;
+            # the empty batch row is harmless and can be removed by a
+            # future bounded orphan-batch cleanup.
+            marks = ",".join(
+                "?" for _ in uncontracted_raw_ids
+            )
+            uncontracted_raw_redacted = connection.execute(
+                f"""
+                UPDATE review_items
+                SET status='expired',
+                    excluded_reason=COALESCE(
+                      excluded_reason,'raw_metadata_ttl'
+                    ),
+                    reviewed_at=?,batch_id=NULL,
+                    review_started_at=NULL,frozen_epoch=NULL,
+                    frozen_from=NULL,frozen_to=NULL,
+                    frozen_locator_json=NULL,lease_owner=NULL,
+                    lease_expires_at=NULL,raw_redacted_at=?,
+                    {RAW_CLEAR_ASSIGNMENTS}
+                WHERE id IN ({marks}) AND status='reviewing'
+                  AND batch_id IS NOT NULL
+                  AND raw_redacted_at IS NULL
+                  AND raw_metadata_expires_at<=?
+                """,
+                (
+                    iso_utc(now),
+                    iso_utc(now),
+                    *uncontracted_raw_ids,
+                    iso_utc(now),
+                ),
+            ).rowcount
+            if uncontracted_raw_redacted != len(
+                uncontracted_raw_ids
+            ):
+                raise sqlite3.IntegrityError(
+                    "uncontracted_raw_ttl_race"
+                )
+        else:
+            uncontracted_raw_redacted = 0
+        raw_batch_ids = [
+            int(row["batch_id"])
+            for row in connection.execute(
+                """
+                SELECT DISTINCT item.batch_id
+                FROM review_items AS item
+                WHERE item.raw_redacted_at IS NULL
+                  AND item.raw_metadata_expires_at<=?
+                  AND item.status='reviewing'
+                  AND item.batch_id IS NOT NULL
+                  AND EXISTS(
+                    SELECT 1 FROM metadata AS metadata_row
+                    WHERE metadata_row.key=
+                      'review.batch.' || item.batch_id || '.contract'
+                  )
+                ORDER BY item.batch_id
+                LIMIT ?
+                """,
+                (
+                    iso_utc(now),
+                    REVIEW_MAINTENANCE_BATCH_MAX,
+                ),
+            )
+        ]
+        batch_raw_redacted = uncontracted_raw_redacted
+        for batch_id in raw_batch_ids:
+            contract = _load_any_review_contract(
+                connection, batch_id
+            )
+            _batch, rows = (
+                _require_exact_review_batch_members(
+                    connection,
+                    batch_id,
+                    contract,
+                )
+            )
+            _capture_bound_review_result(
+                connection,
+                batch_id,
+                result_files,
+                required=contract["stage"] == "final",
+            )
+            raw_expired_ids = [
+                int(row["id"])
+                for row in connection.execute(
+                    """
+                    SELECT id FROM review_items
+                    WHERE batch_id=? AND status='reviewing'
+                      AND raw_redacted_at IS NULL
+                      AND raw_metadata_expires_at<=?
+                    ORDER BY id
+                    """,
+                    (batch_id, iso_utc(now)),
+                )
+            ]
+            raw_expired_count = len(raw_expired_ids)
+            if raw_expired_count < 1:
+                raise sqlite3.IntegrityError(
+                    "raw_ttl_batch_membership_changed"
+                )
+            owner_digest = str(contract["owner_digest"])
+            released = connection.execute(
+                """
+                UPDATE review_items
+                SET status='pending',batch_id=NULL,
+                    review_started_at=NULL,frozen_epoch=NULL,
+                    frozen_from=NULL,frozen_to=NULL,
+                    frozen_locator_json=NULL,lease_owner=NULL,
+                    lease_expires_at=NULL,pending_since=?
+                WHERE status='reviewing' AND batch_id=?
+                  AND lease_owner=?
+                """,
+                (iso_utc(now), batch_id, owner_digest),
+            ).rowcount
+            if released != len(rows):
+                raise sqlite3.IntegrityError(
+                    "raw_ttl_batch_release_race"
+                )
+            batch_raw_redacted += expire_session_ids(
+                connection,
+                raw_expired_ids,
+                "raw_metadata_ttl",
+                now,
+            )
+            finalize_review_batch(
+                connection,
+                batch_id,
+                owner_digest,
+                "expired",
+                0,
+                {"raw_metadata_ttl": raw_expired_count},
+                now,
+            )
+        retention_cutoff = iso_utc(
+            now - config.pending_retention_days * 86_400
+        )
         retention_ids = [
             int(row["id"])
             for row in connection.execute(
                 """
                 SELECT id FROM review_items
-                WHERE status='pending' AND pending_since <= ?
+                WHERE status='pending' AND pending_since<=?
                 ORDER BY pending_since,id
+                LIMIT ?
                 """,
                 (
-                    iso_utc(
-                        now - config.pending_retention_days * 86_400
-                    ),
+                    retention_cutoff,
+                    REVIEW_MAINTENANCE_BATCH_MAX,
                 ),
             )
         ]
@@ -5866,22 +6499,50 @@ def run_maintenance(
                 "SELECT COUNT(*) FROM review_items WHERE status='pending'"
             ).fetchone()[0]
         )
-        capacity_ids = [
-            int(row["id"])
-            for row in connection.execute(
+        retention_backlog = bool(
+            connection.execute(
                 """
-                SELECT id FROM review_items
-                WHERE status='pending'
-                ORDER BY pending_since,id
-                LIMIT ?
+                SELECT EXISTS(
+                  SELECT 1 FROM review_items
+                  WHERE status='pending' AND pending_since<=?
+                )
                 """,
-                (max(pending_count - config.pending_limit_sessions, 0),),
+                (retention_cutoff,),
+            ).fetchone()[0]
+        )
+        capacity_needed = (
+            0
+            if retention_backlog
+            else max(
+                pending_count - config.pending_limit_sessions,
+                0,
             )
-        ]
+        )
+        if capacity_needed:
+            capacity_ids = [
+                int(row["id"])
+                for row in connection.execute(
+                    """
+                    SELECT id FROM review_items
+                    WHERE status='pending' AND pending_since>?
+                    ORDER BY pending_since,id
+                    LIMIT ?
+                    """,
+                    (
+                        retention_cutoff,
+                        min(
+                            capacity_needed,
+                            REVIEW_MAINTENANCE_BATCH_MAX,
+                        ),
+                    ),
+                )
+            ]
+        else:
+            capacity_ids = []
         capacity_expired = expire_session_ids(
             connection, capacity_ids, "capacity", now
         )
-        raw_redacted = connection.execute(
+        raw_redacted = batch_raw_redacted + connection.execute(
             f"""
             UPDATE review_items
             SET status=CASE
@@ -5902,7 +6563,8 @@ def run_maintenance(
                 lease_owner=NULL,lease_expires_at=NULL,raw_redacted_at=?,
                 {RAW_CLEAR_ASSIGNMENTS}
             WHERE raw_redacted_at IS NULL
-              AND raw_metadata_expires_at <= ?
+              AND raw_metadata_expires_at<=?
+              AND batch_id IS NULL
             """,
             (iso_utc(now), iso_utc(now), iso_utc(now)),
         ).rowcount
@@ -5926,6 +6588,55 @@ def run_maintenance(
             """,
             (dedupe_cutoff,),
         ).rowcount
+        terminal_cutoff = iso_utc(
+            now - REVIEW_BATCH_AUDIT_TTL_SECONDS
+        )
+        terminal_ids = [
+            int(row["id"])
+            for row in connection.execute(
+                """
+                SELECT id FROM review_batches
+                WHERE status IN (
+                  'completed','aborted','expired','failed'
+                )
+                  AND finished_at<=?
+                ORDER BY id
+                LIMIT ?
+                """,
+                (
+                    terminal_cutoff,
+                    REVIEW_MAINTENANCE_BATCH_MAX,
+                ),
+            )
+        ]
+        if terminal_ids:
+            marks = ",".join("?" for _ in terminal_ids)
+            audit_keys = [
+                review_audit_key(batch_id)
+                for batch_id in terminal_ids
+            ]
+            audits_deleted = connection.execute(
+                f"DELETE FROM metadata WHERE key IN ({marks})",
+                audit_keys,
+            ).rowcount
+            if audits_deleted != len(terminal_ids):
+                raise sqlite3.IntegrityError(
+                    "terminal_batch_audit_purge_race"
+                )
+            deleted = connection.execute(
+                f"""
+                DELETE FROM review_batches
+                WHERE id IN ({marks})
+                """,
+                terminal_ids,
+            ).rowcount
+            if deleted != len(terminal_ids):
+                raise sqlite3.IntegrityError(
+                    "terminal_batch_purge_race"
+                )
+            terminal_batches_deleted = deleted
+        else:
+            terminal_batches_deleted = 0
         connection.execute(
             """
             INSERT INTO metadata(key,value) VALUES('last_maintenance_at',?)
@@ -5947,13 +6658,34 @@ def run_maintenance(
     except BaseException:
         connection.rollback()
         raise
+    for opened in result_files:
+        delete_bound_review_result(opened)
+    result_cleanup_failed = 0
+    try:
+        result_counts = cleanup_review_results(now)
+    except ValueError as error:
+        saturated = (
+            str(error) == "review_result_namespace_saturated"
+        )
+        result_counts = {
+            "result_scan_entries": (
+                REVIEW_RESULT_SCAN_MAX if saturated else 0
+            ),
+            "result_files_deleted": 0,
+            "result_files_preserved": 0,
+            "result_scan_saturated": int(saturated),
+        }
+        result_cleanup_failed = int(not saturated)
     return {
         **counts,
+        **result_counts,
         "leases_recovered": leases_recovered,
         "pending_expired": pending_expired,
         "capacity_expired": capacity_expired,
         "raw_redacted": raw_redacted,
         "dedupe_deleted": dedupe_deleted,
+        "terminal_batches_deleted": terminal_batches_deleted,
+        "result_cleanup_failed": result_cleanup_failed,
     }
 
 
