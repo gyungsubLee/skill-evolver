@@ -112,6 +112,7 @@ Plans:
 **Depends on**: Phase 4
 **Requirements**: QUALITY-01
 **Entry Gate**: Review/Inbox suite passes with zero target-skill writes
+**Gate Result**: **COLLECTING** — production epoch `Q-001`, 0/10 distinct real sessions as of 2026-07-30
 **Failure Route**: Phase 4 transcript adapter 또는 improvement policy로 돌아간다.
 **Success Criteria** (what must be TRUE):
   1. 개발자가 최소 10 sessions 또는 30 review items에 대한 complete label set을 확인할 수 있다.
@@ -230,7 +231,7 @@ Plans:
 | 2. Session-Level Capture Design Amendment | 1/1 | Complete (gate PASS) | 2026-07-29 |
 | 3. Runtime Queue | 1/1 | Complete (gate PASS) | 2026-07-29 |
 | 4. Review and Inbox | 1/1 | Complete (gate PASS) | 2026-07-30 |
-| 5. Read-only Quality Gate | 0/1 | Not started (current) | - |
+| 5. Read-only Quality Gate | 0/1 | In progress — Q-001 collecting 0/10 real sessions (current) | - |
 | 6. Evaluate Runner Spike | 0/1 | Not started | - |
 | 7. Evaluate Prepare | 0/1 | Not started | - |
 | 8. Evaluate Execution | 0/1 | Not started | - |

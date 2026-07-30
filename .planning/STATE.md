@@ -1,10 +1,10 @@
 ---
 gsd_state_version: '1.0'
-status: planning
+status: executing
 progress:
   total_phases: 11
   completed_phases: 4
-  total_plans: 4
+  total_plans: 5
   completed_plans: 4
   percent: 36
 ---
@@ -22,9 +22,10 @@ See: `.planning/PROJECT.md` (updated 2026-07-27)
 
 Phase: 5 of 11 (Read-only Quality Gate)
 Plan: 0 of 1 in current phase
-Status: Ready to design the read-only sample and human-label gate
-Last activity: 2026-07-30 — Phase 4 Review and Inbox gate recorded PASS;
-`REVIEW-01` complete; canonical report committed
+Status: Implementation and boundary verification complete; production epoch
+`Q-001` is COLLECTING at 0/10 distinct real sessions
+Last activity: 2026-07-30 — Phase 5 quality-gate implementation, independent
+reviews, 443-test suite, plugin installation and production `Q-001` open complete
 
 Progress: [████░░░░░░] 36%
 
@@ -44,7 +45,8 @@ Progress: [████░░░░░░] 36%
 | 3. Runtime Queue | 1/1 | Not recorded | Not recorded |
 | 4. Review and Inbox | 1/1 | Not recorded | Not recorded |
 
-**Recent Trend:** Four sequential phase gates recorded; Phase 2, Phase 3 and Phase 4 are PASS
+**Recent Trend:** Four sequential phase gates recorded; Phase 2, Phase 3 and
+Phase 4 are PASS; Phase 5 mechanics are verified and its real cohort is open
 
 ## Accumulated Context
 
@@ -66,17 +68,28 @@ Progress: [████░░░░░░] 36%
 - Phase 4 must use session generations and frozen byte boundaries, not required
   turn identity, per-Stop rows or a 20-item batch abstraction.
 - Review, evaluation and mutation remain explicit-only; apply/undo require external TTY and complete digest/hash.
+- Phase 5 labels are user-entered only in a user-controlled external terminal;
+  the agent must not enter or infer them, including through a PTY.
+- `Q-001` opened at `2026-07-30T10:15:35Z`; only distinct meaningful Codex
+  tasks captured after plugin activation count as real quality evidence.
 
 ### Pending Todos
 
-- Design the Phase 5 read-only sample and complete human-label contract.
-- Bind the Phase 5 sample to the committed policy and adapter digests.
+- Collect at least 10 distinct meaningful real Codex sessions in `Q-001`.
+- Explicitly review the collected sessions in bounded batches and seal `Q-001`.
+- Have the user attest every sealed candidate in an external terminal, then run
+  the terminal quality gate and commit its content-addressed PASS report.
 - Keep Runner, Prepare, Evaluate and Apply disabled until `QUALITY-01` passes.
 
 ### Blockers/Concerns
 
 - No Phase 4 implementation blocker remains: `docs/release-reports/review-inbox.json` records `PASS`.
 - Phase 4 PASS proves deterministic mechanics and safety only; candidate quality remains unmeasured until Phase 5.
+- Phase 5 cannot use fixtures, subagents, repeated generations in this task, or
+  empty generated tasks as substitutes for 10 distinct real sessions.
+- Production status at `2026-07-30T10:17:31Z` is `pending_sessions=0`,
+  `last_hook_success_at=null`; `Q-001` is `COLLECTING` with 0 sessions,
+  0 candidates and 0 labels.
 - The original Phase 1 `FAIL` and superseded turn-level Review plan remain immutable historical evidence.
 
 ## Deferred Items
@@ -89,5 +102,6 @@ Progress: [████░░░░░░] 36%
 ## Session Continuity
 
 Last session: 2026-07-30
-Stopped at: Phase 4 complete and verified; Phase 5 read-only quality planning is current
+Stopped at: Phase 5 mechanics complete; Q-001 awaits distinct post-install real
+Codex tasks before bounded review, sealing, external-terminal labels and gate
 Resume file: None
