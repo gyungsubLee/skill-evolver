@@ -3782,3 +3782,506 @@ class ResultNamespaceTests(BatchExportTestCase):
                     self.runtime.delete_bound_review_result(allocated)
                 )
             self.assertFalse(allocated.path.exists())
+
+
+class ReviewBatchSeedTests(BatchExportTestCase):
+    def test_seed_claims_five_eligible_rows_and_stores_only_digests(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        blocked = self.insert_pending(
+            connection,
+            0,
+            error_code="transcript_changed",
+            now=now,
+        )
+        rows = [
+            self.insert_pending(connection, number, now=now)
+            for number in range(1, 7)
+        ]
+        with self.fixed_review_inputs():
+            prepared = self.runtime._prepare_review_batch(
+                connection,
+                self.installation,
+                self.config,
+                self.review_runtime,
+                self.policy,
+                self.catalog,
+                now,
+            )
+        contract = self.runtime.load_review_contract(
+            connection,
+            int(prepared["batch_id"]),
+            "seed",
+        )
+        leased = connection.execute(
+            """
+            SELECT id,lease_owner FROM review_items
+            WHERE batch_id=? ORDER BY pending_since,id
+            """,
+            (int(prepared["batch_id"]),),
+        ).fetchall()
+        still_pending = connection.execute(
+            """
+            SELECT id,error_code FROM review_items
+            WHERE status='pending' ORDER BY pending_since,id
+            """
+        ).fetchall()
+        metadata_text = connection.execute(
+            "SELECT value FROM metadata WHERE key=?",
+            (
+                self.runtime.review_contract_key(
+                    int(prepared["batch_id"])
+                ),
+            ),
+        ).fetchone()["value"]
+        connection.close()
+
+        owner_token = str(prepared["owner_token"])
+        owner_digest = self.runtime.review_owner_digest(
+            self.installation, owner_token
+        )
+        self.assertRegex(owner_token, r"\A[0-9a-f]{64}\Z")
+        self.assertEqual(contract["owner_digest"], owner_digest)
+        self.assertEqual(
+            [row["lease_owner"] for row in leased],
+            [owner_digest] * 5,
+        )
+        self.assertEqual(
+            [int(row["id"]) for row in leased],
+            [int(row["id"]) for row in rows[:5]],
+        )
+        self.assertEqual(
+            [int(row["id"]) for row in still_pending],
+            [int(blocked["id"]), int(rows[5]["id"])],
+        )
+        self.assertNotIn(owner_token, metadata_text)
+        for row in rows:
+            self.assertNotIn(str(row["session_key"]), metadata_text)
+            self.assertNotIn(str(row["raw_session_id"]), metadata_text)
+            self.assertNotIn(str(row["transcript_path"]), metadata_text)
+        self.assertEqual(
+            set(contract),
+            {
+                "schema_version",
+                "stage",
+                "batch_id",
+                "owner_digest",
+                "sessions",
+                "policy_digest",
+                "transcript_adapter_digest",
+                "catalog_adapter_digest",
+                "catalog_snapshot_digest",
+                "created_at",
+                "lease_expires_at",
+            },
+        )
+        self.assertEqual(
+            set(contract["sessions"][0]),
+            {
+                "session_ref",
+                "review_item_id",
+                "expected_generation",
+                "frozen_epoch",
+                "frozen_from",
+                "frozen_to",
+                "frozen_locator_digest",
+            },
+        )
+        for session in contract["sessions"]:
+            self.assertRegex(
+                session["session_ref"],
+                r"\AS-[0-9a-f]{64}\Z",
+            )
+        first_claim = prepared["claims"][0]
+        session_ref = self.runtime.review_session_ref(
+            self.installation,
+            int(prepared["batch_id"]),
+            int(first_claim["review_item_id"]),
+            int(first_claim["generation"]),
+        )
+        record_hmac = self.runtime.review_record_content_hmac(
+            self.installation,
+            int(prepared["batch_id"]),
+            session_ref,
+            "R-1",
+            "user_direct",
+            True,
+            "private record text",
+        )
+        self.assertRegex(record_hmac, r"\A[0-9a-f]{64}\Z")
+        self.assertNotEqual(owner_digest, session_ref[2:])
+        self.assertNotEqual(owner_digest, record_hmac)
+        self.assertNotIn("private record text", metadata_text)
+
+        invalid_contracts = []
+        for field, value in (
+            ("created_at", "not-iso"),
+            ("batch_id", True),
+        ):
+            invalid = json.loads(json.dumps(contract))
+            invalid[field] = value
+            invalid_contracts.append(invalid)
+        invalid = json.loads(json.dumps(contract))
+        invalid["sessions"][0]["session_ref"] = "S-" + "A" * 64
+        invalid_contracts.append(invalid)
+        invalid = json.loads(json.dumps(contract))
+        invalid["sessions"][0]["expected_generation"] = True
+        invalid_contracts.append(invalid)
+        invalid = json.loads(json.dumps(contract))
+        invalid["sessions"][1]["review_item_id"] = invalid["sessions"][0][
+            "review_item_id"
+        ]
+        invalid_contracts.append(invalid)
+        for invalid in invalid_contracts:
+            with self.subTest(
+                invalid_contract=invalid
+            ), self.assertRaisesRegex(
+                ValueError, "review_contract_invalid"
+            ):
+                self.runtime._validate_review_contract(
+                    invalid,
+                    int(prepared["batch_id"]),
+                    "seed",
+                )
+        final_contract = json.loads(json.dumps(contract))
+        final_contract["stage"] = "final"
+        for session in final_contract["sessions"]:
+            session["records"] = [
+                {
+                    "record_ref": (
+                        f"{session['session_ref']}-R-001"
+                    ),
+                    "source_kind": "assistant",
+                    "evidence_eligible": False,
+                    "content_hmac": "d" * 64,
+                }
+            ]
+        self.assertEqual(
+            self.runtime._validate_review_contract(
+                final_contract,
+                int(prepared["batch_id"]),
+                "final",
+            ),
+            final_contract,
+        )
+        invalid_final = json.loads(json.dumps(final_contract))
+        invalid_final["sessions"][0]["records"] = [
+            {
+                "record_ref": "R-1",
+                "source_kind": [],
+                "evidence_eligible": True,
+                "content_hmac": "d" * 64,
+            }
+        ]
+        with self.assertRaisesRegex(
+            ValueError, "review_contract_invalid"
+        ):
+            self.runtime._validate_review_contract(
+                invalid_final,
+                int(prepared["batch_id"]),
+                "final",
+            )
+        for label, record_ref in (
+            ("wrong_prefix", "R-001"),
+            (
+                "cross_session",
+                final_contract["sessions"][0]["records"][0][
+                    "record_ref"
+                ],
+            ),
+        ):
+            invalid_ref = json.loads(json.dumps(final_contract))
+            target = 0 if label == "wrong_prefix" else 1
+            invalid_ref["sessions"][target]["records"][0][
+                "record_ref"
+            ] = record_ref
+            with self.subTest(
+                invalid_record_ref=label
+            ), self.assertRaisesRegex(
+                ValueError, "review_contract_invalid"
+            ):
+                self.runtime._validate_review_contract(
+                    invalid_ref,
+                    int(prepared["batch_id"]),
+                    "final",
+                )
+        oversized_final = json.loads(json.dumps(final_contract))
+        oversized_final["sessions"][0]["records"] = [
+            {
+                "record_ref": (
+                    f"{final_contract['sessions'][0]['session_ref']}"
+                    f"-R-{index:03d}"
+                ),
+                "source_kind": "assistant",
+                "evidence_eligible": False,
+                "content_hmac": f"{index:064x}",
+            }
+            for index in range(1, 102)
+        ]
+        with self.assertRaisesRegex(
+            ValueError, "review_contract_invalid"
+        ):
+            self.runtime._validate_review_contract(
+                oversized_final,
+                int(prepared["batch_id"]),
+                "final",
+            )
+        connection = self.runtime.open_database(self.installation)
+        contract_key = self.runtime.review_contract_key(
+            int(prepared["batch_id"])
+        )
+        connection.execute(
+            "UPDATE metadata SET value=? WHERE key=?",
+            (
+                "x" * (self.runtime.MODEL_ENVELOPE_MAX_BYTES + 1),
+                contract_key,
+            ),
+        )
+        with mock.patch.object(
+            self.runtime.json,
+            "loads",
+            side_effect=AssertionError("oversize contract parsed"),
+        ), self.assertRaisesRegex(
+            ValueError, "review_contract_invalid"
+        ):
+            self.runtime.load_review_contract(
+                connection,
+                int(prepared["batch_id"]),
+                "seed",
+            )
+        connection.execute(
+            "UPDATE metadata SET value=? WHERE key=?",
+            (sqlite3.Binary(b"{}"), contract_key),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "review_contract_invalid"
+        ):
+            self.runtime.load_review_contract(
+                connection,
+                int(prepared["batch_id"]),
+                "seed",
+            )
+        connection.close()
+
+    def test_seed_and_leases_roll_back_when_contract_insert_fails(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        self.insert_pending(connection, 1, now=now)
+        connection.execute(
+            """
+            CREATE TRIGGER reject_review_contract
+            BEFORE INSERT ON metadata
+            WHEN NEW.key LIKE 'review.batch.%.contract'
+            BEGIN
+              SELECT RAISE(ABORT,'seed rejected');
+            END
+            """
+        )
+        with self.fixed_review_inputs(), self.assertRaisesRegex(
+            sqlite3.IntegrityError, "seed rejected"
+        ):
+            self.runtime._prepare_review_batch(
+                connection,
+                self.installation,
+                self.config,
+                self.review_runtime,
+                self.policy,
+                self.catalog,
+                now,
+            )
+        counts = connection.execute(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM review_batches),
+              (SELECT COUNT(*) FROM metadata
+               WHERE key LIKE 'review.batch.%'),
+              (SELECT COUNT(*) FROM review_items
+               WHERE status='reviewing')
+            """
+        ).fetchone()
+        pending = connection.execute(
+            "SELECT status FROM review_items"
+        ).fetchone()["status"]
+        connection.close()
+        self.assertEqual(tuple(counts), (0, 0, 0))
+        self.assertEqual(pending, "pending")
+
+        allocated = self.runtime._allocate_review_result_file(now)
+        connection = self.runtime.open_database(self.installation)
+        connection.execute("BEGIN IMMEDIATE")
+        stored = self.runtime._store_review_result_binding(
+            connection,
+            7,
+            allocated,
+            now,
+        )
+        for label, invalid_allocated in (
+            (
+                "cross_batch",
+                replace(allocated, batch_id=8),
+            ),
+            (
+                "outside_path",
+                replace(
+                    allocated,
+                    path=self.base / allocated.basename,
+                ),
+            ),
+            (
+                "encoded",
+                replace(allocated, encoded=b"private"),
+            ),
+        ):
+            with self.subTest(
+                invalid_allocated=label
+            ), self.assertRaisesRegex(
+                ValueError, "review_result_binding_invalid"
+            ):
+                self.runtime._store_review_result_binding(
+                    connection,
+                    7,
+                    invalid_allocated,
+                    now,
+                )
+        connection.commit()
+        loaded = self.runtime.load_review_result_binding(connection, 7)
+        self.assertEqual(loaded, stored)
+        self.assertEqual(
+            set(stored),
+            {
+                "schema_version",
+                "batch_id",
+                "basename",
+                "device",
+                "inode",
+                "allocated_at",
+            },
+        )
+        for field, value in (
+            ("batch_id", True),
+            ("inode", True),
+            ("allocated_at", "not-iso"),
+        ):
+            invalid = dict(stored)
+            invalid[field] = value
+            with self.subTest(
+                invalid_result_binding=field
+            ), self.assertRaisesRegex(
+                ValueError, "review_result_binding_invalid"
+            ):
+                self.runtime._validate_review_result_binding(
+                    invalid, 7
+                )
+        result_key = self.runtime.review_result_key(7)
+        connection.execute(
+            "UPDATE metadata SET value=? WHERE key=?",
+            (
+                "x"
+                * (
+                    self.runtime.REVIEW_RESULT_BINDING_MAX_BYTES
+                    + 1
+                ),
+                result_key,
+            ),
+        )
+        with mock.patch.object(
+            self.runtime.json,
+            "loads",
+            side_effect=AssertionError("oversize binding parsed"),
+        ), self.assertRaisesRegex(
+            ValueError, "review_result_binding_invalid"
+        ):
+            self.runtime.load_review_result_binding(connection, 7)
+        connection.execute(
+            "UPDATE metadata SET value=? WHERE key=?",
+            (sqlite3.Binary(b"{}"), result_key),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "review_result_binding_invalid"
+        ):
+            self.runtime.load_review_result_binding(connection, 7)
+        connection.close()
+        self.assertTrue(
+            self.runtime.delete_bound_review_result(allocated)
+        )
+
+    def test_empty_prepare_creates_no_batch_or_owner_token(self) -> None:
+        connection = self.runtime.open_database(self.installation)
+        with self.fixed_review_inputs(), mock.patch.object(
+            self.runtime.secrets,
+            "token_hex",
+            side_effect=AssertionError(
+                "empty prepare generated an owner token"
+            ),
+        ):
+            prepared = self.runtime._prepare_review_batch(
+                connection,
+                self.installation,
+                self.config,
+                self.review_runtime,
+                self.policy,
+                self.catalog,
+                2_000_000_000.0,
+            )
+        counts = connection.execute(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM review_batches),
+              (SELECT COUNT(*) FROM metadata
+               WHERE key LIKE 'review.batch.%')
+            """
+        ).fetchone()
+        connection.close()
+        self.assertEqual(
+            prepared,
+            {
+                "schema_version": 1,
+                "status": "empty",
+                "batch_id": None,
+                "owner_token": None,
+                "claims": [],
+                "contract": None,
+            },
+        )
+        self.assertEqual(tuple(counts), (0, 0))
+
+        connection = self.runtime.open_database(self.installation)
+        self.insert_pending(connection, 99)
+        for invalid_limit in (-1, True):
+            with self.subTest(
+                invalid_review_batch_limit=invalid_limit
+            ), mock.patch.object(
+                self.runtime.secrets,
+                "token_hex",
+                side_effect=AssertionError(
+                    "invalid limit generated an owner token"
+                ),
+            ), self.assertRaisesRegex(
+                ValueError, "invalid_review_batch_limit"
+            ):
+                self.runtime._prepare_review_batch(
+                    connection,
+                    self.installation,
+                    replace(
+                        self.config,
+                        review_batch_sessions=invalid_limit,
+                    ),
+                    self.review_runtime,
+                    self.policy,
+                    self.catalog,
+                    2_000_000_000.0,
+                )
+        counts = connection.execute(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM review_batches),
+              (SELECT COUNT(*) FROM review_items
+               WHERE status='reviewing')
+            """
+        ).fetchone()
+        connection.close()
+        self.assertEqual(tuple(counts), (0, 0))

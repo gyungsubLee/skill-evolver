@@ -89,6 +89,549 @@ def review_audit_key(batch_id: int) -> str:
     return f"review.batch.{batch_id}.audit"
 
 
+SEED_CONTRACT_KEYS = frozenset(
+    {
+        "schema_version",
+        "stage",
+        "batch_id",
+        "owner_digest",
+        "sessions",
+        "policy_digest",
+        "transcript_adapter_digest",
+        "catalog_adapter_digest",
+        "catalog_snapshot_digest",
+        "created_at",
+        "lease_expires_at",
+    }
+)
+SEED_SESSION_KEYS = frozenset(
+    {
+        "session_ref",
+        "review_item_id",
+        "expected_generation",
+        "frozen_epoch",
+        "frozen_from",
+        "frozen_to",
+        "frozen_locator_digest",
+    }
+)
+FINAL_SESSION_KEYS = frozenset({*SEED_SESSION_KEYS, "records"})
+FINAL_RECORD_KEYS = frozenset(
+    {
+        "record_ref",
+        "source_kind",
+        "evidence_eligible",
+        "content_hmac",
+    }
+)
+HEX_DIGEST_FIELDS = (
+    "owner_digest",
+    "policy_digest",
+    "transcript_adapter_digest",
+    "catalog_adapter_digest",
+    "catalog_snapshot_digest",
+)
+RESULT_BINDING_KEYS = frozenset(
+    {
+        "schema_version",
+        "batch_id",
+        "basename",
+        "device",
+        "inode",
+        "allocated_at",
+    }
+)
+REVIEW_RESULT_BINDING_MAX_BYTES = 1_024
+
+
+def _is_lower_hex(value: object, length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _is_iso_utc_string(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parse_iso_utc(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _load_bounded_json(
+    value: object,
+    max_bytes: int,
+    error_code: str,
+) -> object:
+    if type(value) is not str:
+        raise ValueError(error_code)
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(error_code) from None
+    if len(encoded) > max_bytes:
+        raise ValueError(error_code)
+    try:
+        return json.loads(value)
+    except (RecursionError, TypeError, ValueError, json.JSONDecodeError):
+        raise ValueError(error_code) from None
+
+
+def review_owner_digest(
+    installation: Installation,
+    owner_token: str,
+) -> str:
+    if not _is_lower_hex(owner_token, 64):
+        raise ValueError("invalid_review_owner_token")
+    return hmac.new(
+        installation.identity_key.read_bytes(),
+        b"review-owner\0" + owner_token.encode("ascii"),
+        "sha256",
+    ).hexdigest()
+
+
+def review_session_ref(
+    installation: Installation,
+    batch_id: int,
+    review_item_id: int,
+    generation: int,
+) -> str:
+    if any(
+        type(value) is not int or value < 1
+        for value in (batch_id, review_item_id, generation)
+    ):
+        raise ValueError("invalid_review_session_ref_input")
+    digest = hmac.new(
+        installation.identity_key.read_bytes(),
+        b"review-session\0"
+        + canonical_json_bytes(
+            [batch_id, review_item_id, generation]
+        ),
+        "sha256",
+    ).hexdigest()
+    return f"S-{digest}"
+
+
+def review_record_content_hmac(
+    installation: Installation,
+    batch_id: int,
+    session_ref: str,
+    record_ref: str,
+    source_kind: str,
+    evidence_eligible: bool,
+    text: str,
+) -> str:
+    if (
+        type(batch_id) is not int
+        or batch_id < 1
+        or not isinstance(session_ref, str)
+        or re.fullmatch(r"S-[0-9a-f]{64}", session_ref) is None
+        or not isinstance(record_ref, str)
+        or not record_ref
+        or not isinstance(source_kind, str)
+        or source_kind not in {"user_direct", "assistant", "tool_output"}
+        or type(evidence_eligible) is not bool
+        or not isinstance(text, str)
+    ):
+        raise ValueError("invalid_review_record_hmac_input")
+    payload = {
+        "batch_id": batch_id,
+        "session_ref": session_ref,
+        "record_ref": record_ref,
+        "source_kind": source_kind,
+        "evidence_eligible": evidence_eligible,
+        "text": text,
+    }
+    return hmac.new(
+        installation.identity_key.read_bytes(),
+        b"review-record\0" + canonical_json_bytes(payload),
+        "sha256",
+    ).hexdigest()
+
+
+def _validate_review_contract(
+    contract: object,
+    batch_id: int,
+    expected_stage: str,
+) -> dict[str, object]:
+    if (
+        type(batch_id) is not int
+        or batch_id < 1
+        or not isinstance(expected_stage, str)
+        or expected_stage not in {"seed", "final"}
+        or not isinstance(contract, dict)
+        or set(contract) != SEED_CONTRACT_KEYS
+        or type(contract.get("schema_version")) is not int
+        or contract.get("schema_version") != 1
+        or contract.get("stage") != expected_stage
+        or type(contract.get("batch_id")) is not int
+        or contract.get("batch_id") != batch_id
+        or any(
+            not _is_lower_hex(contract.get(name), 64)
+            for name in HEX_DIGEST_FIELDS
+        )
+        or not _is_iso_utc_string(contract.get("created_at"))
+        or not _is_iso_utc_string(contract.get("lease_expires_at"))
+        or not isinstance(contract.get("sessions"), list)
+    ):
+        raise ValueError("review_contract_invalid")
+    if parse_iso_utc(str(contract["lease_expires_at"])) <= parse_iso_utc(
+        str(contract["created_at"])
+    ):
+        raise ValueError("review_contract_invalid")
+    expected_session_keys = (
+        SEED_SESSION_KEYS
+        if expected_stage == "seed"
+        else FINAL_SESSION_KEYS
+    )
+    sessions = contract["sessions"]
+    if not 1 <= len(sessions) <= REVIEW_BATCH_SESSIONS_MAX:
+        raise ValueError("review_contract_invalid")
+    refs: set[str] = set()
+    item_ids: set[int] = set()
+    record_refs: set[str] = set()
+    for session in sessions:
+        if not isinstance(session, dict):
+            raise ValueError("review_contract_invalid")
+        session_ref = session.get("session_ref")
+        review_item_id = session.get("review_item_id")
+        if (
+            set(session) != expected_session_keys
+            or not isinstance(session_ref, str)
+            or re.fullmatch(r"S-[0-9a-f]{64}", session_ref) is None
+            or session_ref in refs
+            or type(review_item_id) is not int
+            or review_item_id < 1
+            or review_item_id in item_ids
+            or any(
+                type(session.get(name)) is not int
+                or int(session[name]) < minimum
+                for name, minimum in (
+                    ("expected_generation", 1),
+                    ("frozen_epoch", 0),
+                    ("frozen_from", 0),
+                    ("frozen_to", 1),
+                )
+            )
+            or int(session["frozen_to"])
+            <= int(session["frozen_from"])
+            or not _is_lower_hex(
+                session.get("frozen_locator_digest"), 64
+            )
+        ):
+            raise ValueError("review_contract_invalid")
+        refs.add(session_ref)
+        item_ids.add(review_item_id)
+        if expected_stage == "final":
+            records = session["records"]
+            if (
+                not isinstance(records, list)
+                or len(records) > TRANSCRIPT_SESSION_MAX_RECORDS
+            ):
+                raise ValueError("review_contract_invalid")
+            for index, record in enumerate(records, start=1):
+                if not isinstance(record, dict):
+                    raise ValueError("review_contract_invalid")
+                record_ref = record.get("record_ref")
+                source_kind = record.get("source_kind")
+                if (
+                    set(record) != FINAL_RECORD_KEYS
+                    or not isinstance(source_kind, str)
+                    or source_kind not in (
+                        "user_direct",
+                        "assistant",
+                        "tool_output",
+                    )
+                    or type(record.get("evidence_eligible")) is not bool
+                    or not isinstance(record_ref, str)
+                    or record_ref
+                    != f"{session_ref}-R-{index:03d}"
+                    or record_ref in record_refs
+                    or not _is_lower_hex(
+                        record.get("content_hmac"), 64
+                    )
+                ):
+                    raise ValueError("review_contract_invalid")
+                record_refs.add(record_ref)
+    return contract
+
+
+def load_review_contract(
+    connection: sqlite3.Connection,
+    batch_id: int,
+    expected_stage: str,
+) -> dict[str, object]:
+    if (
+        not isinstance(expected_stage, str)
+        or expected_stage not in {"seed", "final"}
+    ):
+        raise ValueError("invalid_review_contract_stage")
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key=?",
+        (review_contract_key(batch_id),),
+    ).fetchone()
+    if row is None:
+        raise ValueError("review_contract_missing")
+    contract = _load_bounded_json(
+        row["value"],
+        MODEL_ENVELOPE_MAX_BYTES,
+        "review_contract_invalid",
+    )
+    return _validate_review_contract(
+        contract, batch_id, expected_stage
+    )
+
+
+def _insert_seed_contract(
+    connection: sqlite3.Connection,
+    contract: dict[str, object],
+) -> None:
+    if not connection.in_transaction:
+        raise ValueError("active_review_transaction_required")
+    if (
+        not isinstance(contract, dict)
+        or type(contract.get("batch_id")) is not int
+    ):
+        raise ValueError("review_contract_invalid")
+    batch_id = int(contract["batch_id"])
+    _validate_review_contract(contract, batch_id, "seed")
+    connection.execute(
+        "INSERT INTO metadata(key,value) VALUES(?,?)",
+        (
+            review_contract_key(batch_id),
+            canonical_json_bytes(contract).decode("utf-8"),
+        ),
+    )
+
+
+def _prepare_review_batch(
+    connection: sqlite3.Connection,
+    installation: Installation,
+    config: Config,
+    runtime: ReviewRuntime,
+    policy: bytes,
+    catalog: CatalogSnapshot,
+    now: float,
+) -> dict[str, object]:
+    if connection.in_transaction:
+        raise ValueError("active_transaction")
+    limits = (
+        config.review_batch_sessions,
+        runtime.review_batch_sessions,
+        REVIEW_BATCH_SESSIONS_MAX,
+    )
+    if any(
+        type(value) is not int
+        or not 1 <= value <= REVIEW_BATCH_SESSIONS_MAX
+        for value in limits
+    ):
+        raise ValueError("invalid_review_batch_limit")
+    limit = min(limits)
+    policy_digest = improvement_policy_digest(policy)
+    transcript_digest = transcript_adapter_digest(runtime)
+    catalog_digest = catalog_adapter_digest(runtime)
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        _recover_expired_review_leases(connection, now)
+        rows = connection.execute(
+            """
+            SELECT * FROM review_items
+            WHERE status='pending' AND binding_status='accepted'
+              AND error_code IS NULL
+              AND observed_boundary>reviewed_boundary
+            ORDER BY pending_since,id
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        if not rows:
+            connection.commit()
+            return {
+                "schema_version": 1,
+                "status": "empty",
+                "batch_id": None,
+                "owner_token": None,
+                "claims": [],
+                "contract": None,
+            }
+        owner_token = secrets.token_hex(32)
+        owner_digest = review_owner_digest(installation, owner_token)
+        batch_id = int(
+            connection.execute(
+                """
+                INSERT INTO review_batches(status,started_at)
+                VALUES('preparing',?)
+                """,
+                (iso_utc(now),),
+            ).lastrowid
+        )
+        claims: list[dict[str, object]] = []
+        sessions: list[dict[str, object]] = []
+        for row in rows:
+            claim = _claim_review_generation(
+                connection,
+                str(row["session_key"]),
+                owner_digest,
+                now,
+                config,
+                batch_id=batch_id,
+            )
+            session_ref = review_session_ref(
+                installation,
+                batch_id,
+                int(claim["review_item_id"]),
+                int(claim["generation"]),
+            )
+            claim["session_ref"] = session_ref
+            claims.append(claim)
+            sessions.append(
+                {
+                    "session_ref": session_ref,
+                    "review_item_id": int(claim["review_item_id"]),
+                    "expected_generation": int(claim["generation"]),
+                    "frozen_epoch": int(claim["transcript_epoch"]),
+                    "frozen_from": int(claim["review_from"]),
+                    "frozen_to": int(claim["review_to"]),
+                    "frozen_locator_digest": str(
+                        claim["locator_digest"]
+                    ),
+                }
+            )
+        seed = {
+            "schema_version": 1,
+            "stage": "seed",
+            "batch_id": batch_id,
+            "owner_digest": owner_digest,
+            "sessions": sessions,
+            "policy_digest": policy_digest,
+            "transcript_adapter_digest": transcript_digest,
+            "catalog_adapter_digest": catalog_digest,
+            "catalog_snapshot_digest": catalog.snapshot_digest,
+            "created_at": iso_utc(now),
+            "lease_expires_at": iso_utc(
+                now + config.lease_seconds
+            ),
+        }
+        _insert_seed_contract(connection, seed)
+        connection.execute(
+            """
+            UPDATE review_batches
+            SET session_count=?,generation_count=?
+            WHERE id=? AND status='preparing'
+            """,
+            (len(claims), len(claims), batch_id),
+        )
+        connection.commit()
+        return {
+            "schema_version": 1,
+            "status": "preparing",
+            "batch_id": batch_id,
+            "owner_token": owner_token,
+            "claims": claims,
+            "contract": seed,
+        }
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def _validate_review_result_binding(
+    binding: object,
+    batch_id: int,
+) -> dict[str, object]:
+    if (
+        type(batch_id) is not int
+        or batch_id < 1
+        or not isinstance(binding, dict)
+        or set(binding) != RESULT_BINDING_KEYS
+        or type(binding.get("schema_version")) is not int
+        or binding.get("schema_version") != 1
+        or type(binding.get("batch_id")) is not int
+        or binding.get("batch_id") != batch_id
+        or not isinstance(binding.get("basename"), str)
+        or REVIEW_RESULT_NAME.fullmatch(str(binding["basename"])) is None
+        or type(binding.get("device")) is not int
+        or int(binding["device"]) < 0
+        or type(binding.get("inode")) is not int
+        or int(binding["inode"]) < 0
+        or not _is_iso_utc_string(binding.get("allocated_at"))
+    ):
+        raise ValueError("review_result_binding_invalid")
+    return binding
+
+
+def load_review_result_binding(
+    connection: sqlite3.Connection,
+    batch_id: int,
+) -> dict[str, object]:
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key=?",
+        (review_result_key(batch_id),),
+    ).fetchone()
+    if row is None:
+        raise ValueError("review_result_binding_missing")
+    binding = _load_bounded_json(
+        row["value"],
+        REVIEW_RESULT_BINDING_MAX_BYTES,
+        "review_result_binding_invalid",
+    )
+    return _validate_review_result_binding(binding, batch_id)
+
+
+def _store_review_result_binding(
+    connection: sqlite3.Connection,
+    batch_id: int,
+    allocated: BoundReviewResult,
+    now: float,
+) -> dict[str, object]:
+    if not connection.in_transaction:
+        raise ValueError("active_review_transaction_required")
+    if (
+        type(batch_id) is not int
+        or batch_id < 1
+        or not isinstance(allocated, BoundReviewResult)
+    ):
+        raise ValueError("review_result_binding_invalid")
+    try:
+        root = review_result_root()
+    except ValueError:
+        raise ValueError("review_result_binding_invalid") from None
+    if (
+        type(allocated.batch_id) is not int
+        or allocated.batch_id not in (0, batch_id)
+        or not isinstance(allocated.path, Path)
+        or allocated.path.name != allocated.basename
+        or allocated.path.parent != root
+        or type(allocated.encoded) is not bytes
+        or allocated.encoded != b""
+    ):
+        raise ValueError("review_result_binding_invalid")
+    binding = {
+        "schema_version": 1,
+        "batch_id": batch_id,
+        "basename": allocated.basename,
+        "device": allocated.device,
+        "inode": allocated.inode,
+        "allocated_at": iso_utc(now),
+    }
+    _validate_review_result_binding(binding, batch_id)
+    connection.execute(
+        """
+        INSERT INTO metadata(key,value) VALUES(?,?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (
+            review_result_key(batch_id),
+            canonical_json_bytes(binding).decode("utf-8"),
+        ),
+    )
+    return binding
+
+
 def review_result_root() -> Path:
     parent = REVIEW_RESULT_PARENT
     if not isinstance(parent, Path):
