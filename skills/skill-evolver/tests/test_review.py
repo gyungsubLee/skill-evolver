@@ -13258,3 +13258,113 @@ class ReviewResultCleanupSurfaceTests(CandidateBatchFixture):
         self.assertEqual(
             maintained["value"], self.runtime.iso_utc(now)
         )
+
+
+class ReviewDocumentationTests(unittest.TestCase):
+    def test_skill_is_explicit_only_and_names_every_boundary(self) -> None:
+        root = Path(__file__).resolve().parents[3]
+        text = (
+            root / "skills" / "skill-evolver" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        for phrase in (
+            "Use only when the user explicitly names $skill-evolver",
+            "Python never invokes a model",
+            "The current model consumes only the returned envelope plus "
+            "separately approved bounded catalog-inspect content.",
+            "Command shapes are not approvals",
+            "fully expanded literal values",
+            "catalog-inspect opens one allowlisted target",
+            "batch-scoped ephemeral owner token",
+            "The same live owner token may be used for an optional "
+            "heartbeat and the terminal commit or abort.",
+            "Each lifecycle invocation requires separate approval.",
+            "Keep the owner token in current-turn memory only until "
+            "commit or abort reaches a terminal state.",
+            "Never persist the owner token",
+            "Never put it in a reusable shell variable, shell history, "
+            "example value, or placeholder",
+            "Never apply a candidate",
+        ):
+            self.assertIn(phrase, text)
+        for command in (
+            "review-claim",
+            "review-heartbeat",
+            "review-commit",
+            "review-abort",
+            "defer",
+            "resume",
+            "reject",
+            "maintain",
+        ):
+            self.assertIn(
+                f"`{command}` requires separate approval for one fully "
+                "expanded command and the exact installation data root.",
+                text,
+            )
+        for forbidden in (
+            "Future `review` is a mutating workflow",
+            "current model consumes only the returned envelope during",
+            "$BATCH_ID",
+            "$OWNER_TOKEN",
+            "$RESULT_PATH",
+            "<owner-token>",
+            "one-use owner token",
+            "one separately approved invocation",
+            "single approved invocation",
+        ):
+            self.assertNotIn(forbidden, text)
+
+    def test_readme_documents_read_only_and_mutating_commands(self) -> None:
+        root = Path(__file__).resolve().parents[3]
+        text = (root / "README.md").read_text(encoding="utf-8")
+        for phrase in (
+            "## Explicit session review",
+            "## Candidate inbox",
+            "review-claim",
+            "review-heartbeat",
+            "review-commit",
+            "review-abort",
+            "catalog-inspect",
+            "status and inspect are read-only",
+            "catalog-inspect opens one allowlisted target",
+            "The current model consumes only the returned envelope plus "
+            "separately approved bounded catalog-inspect content.",
+            "Command shapes are not approvals",
+            "fully expanded literal values",
+            "current-turn memory only",
+            "batch-scoped ephemeral owner token",
+            "The same live owner token may be used for an optional "
+            "heartbeat and the terminal commit or abort.",
+            "Each lifecycle invocation requires separate approval.",
+            "Keep the owner token in current-turn memory only until "
+            "commit or abort reaches a terminal state.",
+            "does not apply a candidate",
+        ):
+            self.assertIn(phrase, text)
+        for command in (
+            "review-claim",
+            "review-heartbeat",
+            "review-commit",
+            "review-abort",
+            "defer",
+            "resume",
+            "reject",
+            "maintain",
+        ):
+            self.assertIn(
+                f"`{command}` requires separate approval for one fully "
+                "expanded command and the exact installation data root.",
+                text,
+            )
+        for forbidden in (
+            "Explicit review in the next release",
+            "$BATCH_ID",
+            "$OWNER_TOKEN",
+            "$RESULT_PATH",
+            "OWNER_TOKEN=",
+            "<owner-token>",
+            "one-use owner token",
+            "one separately approved invocation",
+            "single approved invocation",
+        ):
+            self.assertNotIn(forbidden, text)
