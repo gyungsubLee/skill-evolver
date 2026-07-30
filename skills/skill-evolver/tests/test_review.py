@@ -831,6 +831,30 @@ class BatchExportTestCase(unittest.TestCase):
             read_path_changed=False,
         )
 
+    def claim_ready_batch(
+        self,
+        connection: sqlite3.Connection,
+        exports: list[TranscriptExport],
+        *,
+        now: float = 2_000_000_000.0,
+    ) -> dict[str, object]:
+        with self.fixed_review_inputs(), mock.patch.object(
+            self.runtime,
+            "read_frozen_transcript",
+            side_effect=exports,
+        ):
+            claimed = self.runtime.claim_review_batch(
+                connection,
+                self.installation,
+                self.config,
+                now,
+            )
+        self.assertEqual(claimed["status"], "ready")
+        result_path = Path(str(claimed["result_path"]))
+        recent_ns = int(now * 1_000_000_000)
+        os.utime(result_path, ns=(recent_ns, recent_ns))
+        return claimed
+
     def write_result_bytes(
         self,
         path: Path,
@@ -4285,3 +4309,1173 @@ class ReviewBatchSeedTests(BatchExportTestCase):
         ).fetchone()
         connection.close()
         self.assertEqual(tuple(counts), (0, 0))
+
+class ReviewEnvelopeTests(BatchExportTestCase):
+    def test_ready_envelope_and_final_contract_are_complete_and_text_free(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        first = self.insert_pending(connection, 1, now=now)
+        second = self.insert_pending(connection, 2, now=now)
+        exports = [
+            self.make_export(
+                "older assistant context",
+                "user delta one",
+                context=1,
+            ),
+            self.make_export("user delta two"),
+        ]
+        claimed = self.claim_ready_batch(
+            connection, exports, now=now
+        )
+        batch_id = int(claimed["batch_id"])
+        contract = self.runtime.load_review_contract(
+            connection, batch_id, "final"
+        )
+        binding = self.runtime.load_review_result_binding(
+            connection, batch_id
+        )
+        rows = connection.execute(
+            """
+            SELECT id,lease_owner,batch_id,status
+            FROM review_items WHERE batch_id=? ORDER BY id
+            """,
+            (batch_id,),
+        ).fetchall()
+        connection.close()
+
+        encoded_envelope = self.runtime.canonical_json_bytes(
+            claimed["envelope"]
+        )
+        self.assertLessEqual(
+            len(encoded_envelope),
+            self.runtime.MODEL_ENVELOPE_MAX_BYTES,
+        )
+        self.assertEqual(
+            self.runtime.sha256_json(contract),
+            claimed["contract_digest"],
+        )
+        self.assertEqual(
+            set(claimed),
+            {
+                "schema_version",
+                "status",
+                "batch_id",
+                "owner_token",
+                "contract_digest",
+                "lease_expires_at",
+                "result_path",
+                "envelope",
+            },
+        )
+        self.assertEqual(
+            binding["basename"],
+            Path(str(claimed["result_path"])).name,
+        )
+        self.assertEqual(
+            [int(row["id"]) for row in rows],
+            [int(first["id"]), int(second["id"])],
+        )
+        self.assertTrue(
+            all(row["status"] == "reviewing" for row in rows)
+        )
+        contract_text = json.dumps(contract, sort_keys=True)
+        for private in (
+            "raw-session-1",
+            "raw-session-2",
+            str(first["session_key"]),
+            str(second["session_key"]),
+            "older assistant context",
+            "user delta one",
+            "user delta two",
+            str(first["transcript_path"]),
+            str(second["transcript_path"]),
+            str(claimed["owner_token"]),
+        ):
+            self.assertNotIn(private, contract_text)
+        envelope_records = claimed["envelope"]["sessions"]
+        self.assertEqual(
+            [
+                record["content"]
+                for session in envelope_records
+                for record in session["records"]
+            ],
+            [
+                "older assistant context",
+                "user delta one",
+                "user delta two",
+            ],
+        )
+        self.assertEqual(
+            [
+                record["evidence_eligible"]
+                for session in contract["sessions"]
+                for record in session["records"]
+            ],
+            [False, True, True],
+        )
+
+    def test_context_is_removed_oldest_first_but_delta_is_never_truncated(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        self.insert_pending(connection, 1, now=now)
+        high_entropy = "".join(
+            hashlib.sha256(str(index).encode("ascii")).hexdigest()
+            for index in range(2_400)
+        )
+        export = self.make_export(
+            high_entropy[:75_000],
+            high_entropy[75_000:150_000],
+            "required delta",
+            context=2,
+        )
+        claimed = self.claim_ready_batch(
+            connection, [export], now=now
+        )
+        contents = [
+            record["content"]
+            for record in claimed["envelope"]["sessions"][0]["records"]
+        ]
+        connection.close()
+        self.assertEqual(contents[-1], "required delta")
+        self.assertNotIn(high_entropy[:75_000], contents)
+        self.assertIn(high_entropy[75_000:150_000], contents)
+        self.assertLessEqual(
+            len(
+                self.runtime.canonical_json_bytes(
+                    claimed["envelope"]
+                )
+            ),
+            self.runtime.MODEL_ENVELOPE_MAX_BYTES,
+        )
+
+    def test_record_hmac_domains_bind_content_and_evidence_flag(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        self.insert_pending(connection, 1, now=now)
+        claimed = self.claim_ready_batch(
+            connection,
+            [self.make_export("bound text")],
+            now=now,
+        )
+        contract = self.runtime.load_review_contract(
+            connection, int(claimed["batch_id"]), "final"
+        )
+        session = contract["sessions"][0]
+        record = session["records"][0]
+        expected = self.runtime.review_record_content_hmac(
+            self.installation,
+            int(claimed["batch_id"]),
+            str(session["session_ref"]),
+            str(record["record_ref"]),
+            str(record["source_kind"]),
+            bool(record["evidence_eligible"]),
+            "bound text",
+        )
+        changed_text = self.runtime.review_record_content_hmac(
+            self.installation,
+            int(claimed["batch_id"]),
+            str(session["session_ref"]),
+            str(record["record_ref"]),
+            str(record["source_kind"]),
+            True,
+            "changed text",
+        )
+        changed_evidence = self.runtime.review_record_content_hmac(
+            self.installation,
+            int(claimed["batch_id"]),
+            str(session["session_ref"]),
+            str(record["record_ref"]),
+            str(record["source_kind"]),
+            False,
+            "bound text",
+        )
+        connection.close()
+        self.assertEqual(record["content_hmac"], expected)
+        self.assertNotEqual(expected, changed_text)
+        self.assertNotEqual(expected, changed_evidence)
+
+    def test_result_schema_instruction_bytes_are_canonical_and_bounded(
+        self,
+    ) -> None:
+        self.assertEqual(
+            self.runtime.REVIEW_RESULT_SCHEMA_INSTRUCTIONS_BYTES,
+            self.runtime.canonical_json_bytes(
+                self.runtime.REVIEW_RESULT_SCHEMA_INSTRUCTIONS
+            ),
+        )
+        self.assertLessEqual(
+            len(
+                self.runtime.REVIEW_RESULT_SCHEMA_INSTRUCTIONS_BYTES
+            ),
+            self.runtime.RESULT_SCHEMA_INSTRUCTIONS_MAX_BYTES,
+        )
+
+class ReviewEnvelopeFailureTests(BatchExportTestCase):
+    def run_configuration_failure(
+        self,
+        *,
+        catalog: Optional[object] = None,
+        policy: Optional[bytes] = None,
+        runtime: Optional[object] = None,
+    ) -> tuple[sqlite3.Row, sqlite3.Row, dict[str, object]]:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        item = self.insert_pending(connection, 1, now=now)
+        result_parent = self.base / f"results-{secrets.token_hex(4)}"
+        result_parent.mkdir(mode=0o700)
+        with mock.patch.object(
+            self.runtime,
+            "REVIEW_RESULT_PARENT",
+            result_parent,
+        ), mock.patch.object(
+            self.runtime,
+            "load_review_runtime",
+            return_value=runtime or self.review_runtime,
+        ), mock.patch.object(
+            self.runtime,
+            "load_improvement_policy",
+            return_value=policy if policy is not None else self.policy,
+        ), mock.patch.object(
+            self.runtime,
+            "build_catalog_snapshot",
+            return_value=catalog or self.catalog,
+        ), mock.patch.object(
+            self.runtime,
+            "read_frozen_transcript",
+            side_effect=AssertionError("configuration read transcript"),
+        ):
+            result = self.runtime.claim_review_batch(
+                connection,
+                self.installation,
+                self.config,
+                now,
+            )
+        row = connection.execute(
+            """
+            SELECT status,reviewed_boundary,error_code,batch_id,
+              frozen_to,lease_owner
+            FROM review_items WHERE id=?
+            """,
+            (int(item["id"]),),
+        ).fetchone()
+        batch = connection.execute(
+            "SELECT * FROM review_batches WHERE id=?",
+            (int(result["batch_id"]),),
+        ).fetchone()
+        audit = json.loads(
+            connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (
+                    self.runtime.review_audit_key(
+                        int(result["batch_id"])
+                    ),
+                ),
+            ).fetchone()["value"]
+        )
+        contract_count = connection.execute(
+            """
+            SELECT COUNT(*) FROM metadata
+            WHERE key IN (?,?)
+            """,
+            (
+                self.runtime.review_contract_key(
+                    int(result["batch_id"])
+                ),
+                self.runtime.review_result_key(
+                    int(result["batch_id"])
+                ),
+            ),
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(result["error_code"], "configuration_envelope_error")
+        self.assertEqual(tuple(row), ("pending", 0, None, None, None, None))
+        self.assertEqual(batch["status"], "failed")
+        self.assertEqual(contract_count, 0)
+        return batch, row, audit
+
+    def test_every_fixed_input_overflow_fails_the_batch(
+        self,
+    ) -> None:
+        oversized_catalog = self.runtime.CatalogSnapshot(
+            entries=self.catalog.entries,
+            export_bytes=b"x"
+            * (self.runtime.CATALOG_EXPORT_MAX_BYTES + 1),
+            snapshot_digest=self.catalog.snapshot_digest,
+            rejected_count=0,
+        )
+        cases = (
+            {
+                "catalog": oversized_catalog,
+                "policy": self.policy,
+                "runtime": self.review_runtime,
+            },
+            {
+                "catalog": self.catalog,
+                "policy": b"x" * (self.runtime.POLICY_MAX_BYTES + 1),
+                "runtime": self.review_runtime,
+            },
+            {
+                "catalog": self.catalog,
+                "policy": self.policy,
+                "runtime": replace(
+                    self.review_runtime,
+                    result_schema_instructions_max_bytes=1,
+                ),
+            },
+            {
+                "catalog": self.catalog,
+                "policy": self.policy,
+                "runtime": replace(
+                    self.review_runtime,
+                    claim_contract_overhead_max_bytes=1,
+                ),
+            },
+            {
+                "catalog": self.catalog,
+                "policy": self.policy,
+                "runtime": replace(
+                    self.review_runtime,
+                    model_envelope_max_bytes=1,
+                ),
+            },
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                isolated = type(self)(
+                    methodName="test_every_fixed_input_overflow_fails_the_batch"
+                )
+                isolated.setUp()
+                try:
+                    _, _, audit = isolated.run_configuration_failure(
+                        **case
+                    )
+                    self.assertEqual(
+                        audit["exclusion_counts"],
+                        {"configuration_envelope_error": 1},
+                    )
+                    self.assertEqual(audit["generation_count"], 0)
+                finally:
+                    isolated.doCleanups()
+
+    def test_result_binding_failure_rolls_back_final_contract_and_file(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        item = self.insert_pending(connection, 1, now=now)
+        connection.execute(
+            """
+            CREATE TRIGGER reject_review_result_binding
+            BEFORE INSERT ON metadata
+            WHEN NEW.key LIKE 'review.batch.%.result'
+            BEGIN
+              SELECT RAISE(ABORT,'result binding rejected');
+            END
+            """
+        )
+        with self.fixed_review_inputs(), mock.patch.object(
+            self.runtime,
+            "read_frozen_transcript",
+            return_value=self.make_export("delta"),
+        ), self.assertRaisesRegex(
+            sqlite3.IntegrityError, "result binding rejected"
+        ):
+            self.runtime.claim_review_batch(
+                connection,
+                self.installation,
+                self.config,
+                now,
+            )
+        batch = connection.execute(
+            "SELECT id,status FROM review_batches"
+        ).fetchone()
+        row = connection.execute(
+            """
+            SELECT status,batch_id,reviewed_boundary
+            FROM review_items WHERE id=?
+            """,
+            (int(item["id"]),),
+        ).fetchone()
+        contract = self.runtime.load_review_contract(
+            connection, int(batch["id"]), "seed"
+        )
+        metadata = connection.execute(
+            """
+            SELECT key FROM metadata
+            WHERE key LIKE 'review.batch.%'
+            ORDER BY key
+            """
+        ).fetchall()
+        root_entries = list(
+            self.runtime.review_result_root().iterdir()
+        )
+        connection.close()
+        self.assertEqual(batch["status"], "preparing")
+        self.assertEqual(
+            tuple(row),
+            ("reviewing", int(batch["id"]), 0),
+        )
+        self.assertEqual(contract["stage"], "seed")
+        self.assertEqual(
+            [entry["key"] for entry in metadata],
+            [self.runtime.review_contract_key(int(batch["id"]))],
+        )
+        self.assertEqual(root_entries, [])
+
+        class AllocationAbort(BaseException):
+            pass
+
+        allocation_failures = (
+            RuntimeError("private allocation detail"),
+            ValueError("review_result_namespace_saturated"),
+            AllocationAbort("private base-exception detail"),
+        )
+        for failure in allocation_failures:
+            with self.subTest(allocation_failure=type(failure).__name__):
+                failed = type(self)(
+                    methodName=(
+                        "test_result_binding_failure_rolls_back_final_contract_and_file"
+                    )
+                )
+                failed.setUp()
+                try:
+                    failed_connection = failed.runtime.open_database(
+                        failed.installation
+                    )
+                    failed_item = failed.insert_pending(
+                        failed_connection, 2, now=now
+                    )
+                    owner_token = "a" * 64
+                    with failed.fixed_review_inputs(), mock.patch.object(
+                        failed.runtime,
+                        "read_frozen_transcript",
+                        return_value=failed.make_export("delta"),
+                    ), mock.patch.object(
+                        failed.runtime,
+                        "_allocate_review_result_file",
+                        side_effect=failure,
+                    ), mock.patch.object(
+                        failed.runtime.secrets,
+                        "token_hex",
+                        return_value=owner_token,
+                    ), self.assertRaises(type(failure)) as raised:
+                        failed.runtime.claim_review_batch(
+                            failed_connection,
+                            failed.installation,
+                            failed.config,
+                            now,
+                        )
+                    failed_batch = failed_connection.execute(
+                        "SELECT * FROM review_batches"
+                    ).fetchone()
+                    failed_row = failed_connection.execute(
+                        """
+                        SELECT status,batch_id,review_started_at,frozen_to,
+                          lease_owner,error_code
+                        FROM review_items WHERE id=?
+                        """,
+                        (int(failed_item["id"]),),
+                    ).fetchone()
+                    failed_metadata = failed_connection.execute(
+                        """
+                        SELECT key,value FROM metadata
+                        WHERE key LIKE 'review.batch.%'
+                        ORDER BY key
+                        """
+                    ).fetchall()
+                    failed_audit = json.loads(
+                        failed_metadata[0]["value"]
+                    )
+                    failed_connection.close()
+                    self.assertIs(raised.exception, failure)
+                    self.assertEqual(
+                        (
+                            failed_batch["status"],
+                            failed_batch["session_count"],
+                            failed_batch["generation_count"],
+                        ),
+                        ("failed", 0, 0),
+                    )
+                    self.assertEqual(
+                        tuple(failed_row),
+                        ("pending", None, None, None, None, None),
+                    )
+                    self.assertEqual(
+                        [entry["key"] for entry in failed_metadata],
+                        [
+                            failed.runtime.review_audit_key(
+                                int(failed_batch["id"])
+                            )
+                        ],
+                    )
+                    self.assertEqual(
+                        failed_audit["exclusion_counts"],
+                        {"review_result_allocation_error": 1},
+                    )
+                    self.assertNotIn(
+                        owner_token,
+                        json.dumps(failed_audit, sort_keys=True),
+                    )
+                    self.assertEqual(
+                        list(failed.runtime.review_result_root().iterdir()),
+                        [],
+                    )
+                finally:
+                    failed.doCleanups()
+
+        cleanup_failed = type(self)(
+            methodName=(
+                "test_result_binding_failure_rolls_back_final_contract_and_file"
+            )
+        )
+        cleanup_failed.setUp()
+        try:
+            cleanup_connection = cleanup_failed.runtime.open_database(
+                cleanup_failed.installation
+            )
+            cleanup_item = cleanup_failed.insert_pending(
+                cleanup_connection, 3, now=now
+            )
+            with cleanup_failed.fixed_review_inputs(), mock.patch.object(
+                cleanup_failed.runtime,
+                "read_frozen_transcript",
+                return_value=cleanup_failed.make_export("delta"),
+            ), mock.patch.object(
+                cleanup_failed.runtime,
+                "_allocate_review_result_file",
+                side_effect=RuntimeError("allocation failed"),
+            ), mock.patch.object(
+                cleanup_failed.runtime,
+                "_release_batch_review_generation",
+                side_effect=sqlite3.IntegrityError("release failed"),
+            ), self.assertRaisesRegex(
+                sqlite3.IntegrityError, "release failed"
+            ):
+                cleanup_failed.runtime.claim_review_batch(
+                    cleanup_connection,
+                    cleanup_failed.installation,
+                    cleanup_failed.config,
+                    now,
+                )
+            cleanup_batch = cleanup_connection.execute(
+                "SELECT id,status FROM review_batches"
+            ).fetchone()
+            cleanup_row = cleanup_connection.execute(
+                """
+                SELECT status,batch_id FROM review_items WHERE id=?
+                """,
+                (int(cleanup_item["id"]),),
+            ).fetchone()
+            cleanup_metadata = cleanup_connection.execute(
+                """
+                SELECT key FROM metadata
+                WHERE key LIKE 'review.batch.%'
+                ORDER BY key
+                """
+            ).fetchall()
+            cleanup_connection.close()
+            self.assertEqual(cleanup_batch["status"], "preparing")
+            self.assertEqual(
+                tuple(cleanup_row),
+                ("reviewing", int(cleanup_batch["id"])),
+            )
+            self.assertEqual(
+                [entry["key"] for entry in cleanup_metadata],
+                [
+                    cleanup_failed.runtime.review_contract_key(
+                        int(cleanup_batch["id"])
+                    )
+                ],
+            )
+        finally:
+            cleanup_failed.doCleanups()
+
+        isolated = type(self)(
+            methodName=(
+                "test_result_binding_failure_rolls_back_final_contract_and_file"
+            )
+        )
+        isolated.setUp()
+        blocker: Optional[sqlite3.Connection] = None
+        try:
+            isolated_connection = isolated.runtime.open_database(
+                isolated.installation
+            )
+            isolated.insert_pending(isolated_connection, 2, now=now)
+            real_allocate = isolated.runtime._allocate_review_result_file
+
+            def allocate_then_lock(value: float):
+                nonlocal blocker
+                allocated = real_allocate(value)
+                blocker = isolated.runtime.open_database(
+                    isolated.installation
+                )
+                blocker.execute("BEGIN IMMEDIATE")
+                return allocated
+
+            with isolated.fixed_review_inputs(), mock.patch.object(
+                isolated.runtime,
+                "read_frozen_transcript",
+                return_value=isolated.make_export("delta"),
+            ), mock.patch.object(
+                isolated.runtime,
+                "_allocate_review_result_file",
+                side_effect=allocate_then_lock,
+            ), self.assertRaises(sqlite3.OperationalError):
+                isolated.runtime.claim_review_batch(
+                    isolated_connection,
+                    isolated.installation,
+                    isolated.config,
+                    now,
+                )
+            self.assertEqual(
+                list(isolated.runtime.review_result_root().iterdir()),
+                [],
+            )
+            isolated_connection.close()
+        finally:
+            if blocker is not None:
+                blocker.rollback()
+                blocker.close()
+            isolated.doCleanups()
+
+    def test_individual_model_overflow_is_terminal_for_only_that_generation(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        item = self.insert_pending(connection, 1, now=now)
+        result_parent = self.base / "individual-results"
+        result_parent.mkdir(mode=0o700)
+        huge_delta = "".join(
+            hashlib.sha256(str(index).encode("ascii")).hexdigest()
+            for index in range(2_100)
+        )
+        with self.fixed_review_inputs(), mock.patch.object(
+            self.runtime,
+            "REVIEW_RESULT_PARENT",
+            result_parent,
+        ), mock.patch.object(
+            self.runtime,
+            "read_frozen_transcript",
+            return_value=self.make_export(huge_delta),
+        ):
+            result = self.runtime.claim_review_batch(
+                connection,
+                self.installation,
+                self.config,
+                now,
+            )
+        row = connection.execute(
+            """
+            SELECT status,reviewed_boundary,excluded_reason,error_code
+            FROM review_items WHERE id=?
+            """,
+            (int(item["id"]),),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error_code"], "no_exportable_sessions")
+        self.assertEqual(row["status"], "excluded")
+        self.assertEqual(
+            row["reviewed_boundary"], item["observed_boundary"]
+        )
+        self.assertEqual(
+            row["excluded_reason"], "oversized_model_export"
+        )
+        self.assertIsNone(row["error_code"])
+
+    def test_aggregate_model_pressure_releases_this_and_later_rows(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        rows = [
+            self.insert_pending(connection, number, now=now)
+            for number in range(1, 5)
+        ]
+        content = "".join(
+            hashlib.sha256(str(index).encode("ascii")).hexdigest()
+            for index in range(1_100)
+        )
+        result_parent = self.base / "aggregate-results"
+        result_parent.mkdir(mode=0o700)
+        with self.fixed_review_inputs(), mock.patch.object(
+            self.runtime,
+            "REVIEW_RESULT_PARENT",
+            result_parent,
+        ), mock.patch.object(
+            self.runtime,
+            "read_frozen_transcript",
+            side_effect=[
+                self.make_export(content),
+                self.make_export(content),
+                self.make_export("small later delta"),
+                self.runtime.TranscriptAdapterError(
+                    "unsupported_transcript",
+                    retryable=False,
+                ),
+            ],
+        ):
+            result = self.runtime.claim_review_batch(
+                connection,
+                self.installation,
+                self.config,
+                now,
+            )
+        after = connection.execute(
+            """
+            SELECT id,status,reviewed_boundary,error_code,batch_id
+            FROM review_items ORDER BY id
+            """
+        ).fetchall()
+        batch = connection.execute(
+            "SELECT * FROM review_batches WHERE id=?",
+            (int(result["batch_id"]),),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(
+            [tuple(row)[1:] for row in after],
+            [
+                ("reviewing", 0, None, int(result["batch_id"])),
+                ("pending", 0, None, None),
+                ("pending", 0, None, None),
+                ("pending", 0, None, None),
+            ],
+        )
+        self.assertEqual(batch["session_count"], 1)
+        self.assertEqual(
+            json.loads(batch["exclusion_counts_json"])[
+                "batch_capacity_released"
+            ],
+            3,
+        )
+        self.assertEqual(
+            [int(row["id"]) for row in rows],
+            [int(row["id"]) for row in after],
+        )
+
+    def test_outer_eight_mib_cap_releases_without_session_error(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        first = self.insert_pending(connection, 1, now=now)
+        second = self.insert_pending(connection, 2, now=now)
+        one = self.make_export("small one")
+        two = self.make_export("small two")
+        one = replace(one, canonical_records_bytes=5_000_000)
+        two = replace(two, canonical_records_bytes=5_000_000)
+        root = self.runtime.review_result_root()
+        recent_ns = int(now * 1_000_000_000)
+        for index in range(self.runtime.REVIEW_RESULT_MAX_FILES):
+            path = root / f"result-{index:032x}.json"
+            path.write_bytes(b"")
+            path.chmod(0o600)
+            os.utime(path, ns=(recent_ns, recent_ns))
+        with self.fixed_review_inputs(), mock.patch.object(
+            self.runtime,
+            "read_frozen_transcript",
+            side_effect=AssertionError("saturation read transcript"),
+        ), self.assertRaisesRegex(
+            ValueError, "review_result_namespace_saturated"
+        ):
+            self.runtime.claim_review_batch(
+                connection,
+                self.installation,
+                self.config,
+                now,
+            )
+        self.assertEqual(
+            connection.execute(
+                "SELECT COUNT(*) FROM review_batches"
+            ).fetchone()[0],
+            0,
+        )
+        for path in root.iterdir():
+            path.unlink()
+        result = self.claim_ready_batch(
+            connection, [one, two], now=now
+        )
+        rows = connection.execute(
+            """
+            SELECT id,status,error_code,reviewed_boundary
+            FROM review_items ORDER BY id
+            """
+        ).fetchall()
+        connection.close()
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [
+                (int(first["id"]), "reviewing", None, 0),
+                (int(second["id"]), "pending", None, 0),
+            ],
+        )
+        self.assertEqual(
+            len(result["envelope"]["sessions"]), 1
+        )
+
+    def test_retryable_partial_export_and_zero_survivor_close_cleanly(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        item = self.insert_pending(connection, 1, now=now)
+        connection.execute("BEGIN IMMEDIATE")
+        with mock.patch.object(
+            self.runtime,
+            "cleanup_review_results",
+            side_effect=AssertionError("active transaction cleaned"),
+        ), self.assertRaisesRegex(
+            ValueError, "active_transaction"
+        ):
+            self.runtime.claim_review_batch(
+                connection,
+                self.installation,
+                self.config,
+                now,
+            )
+        connection.rollback()
+        result_parent = self.base / "partial-results"
+        result_parent.mkdir(mode=0o700)
+        error = self.runtime.TranscriptAdapterError(
+            "transcript_partial",
+            retryable=True,
+        )
+        with self.fixed_review_inputs(), mock.patch.object(
+            self.runtime,
+            "REVIEW_RESULT_PARENT",
+            result_parent,
+        ), mock.patch.object(
+            self.runtime,
+            "read_frozen_transcript",
+            side_effect=error,
+        ):
+            result = self.runtime.claim_review_batch(
+                connection,
+                self.installation,
+                self.config,
+                now,
+            )
+        row = connection.execute(
+            """
+            SELECT status,reviewed_boundary,error_code,batch_id
+            FROM review_items WHERE id=?
+            """,
+            (int(item["id"]),),
+        ).fetchone()
+        contract = connection.execute(
+            """
+            SELECT COUNT(*) FROM metadata
+            WHERE key IN (?,?)
+            """,
+            (
+                self.runtime.review_contract_key(
+                    int(result["batch_id"])
+                ),
+                self.runtime.review_result_key(
+                    int(result["batch_id"])
+                ),
+            ),
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(tuple(row), (
+            "pending",
+            0,
+            "transcript_partial",
+            None,
+        ))
+        self.assertEqual(contract, 0)
+
+    def test_completed_partial_export_merges_export_and_terminal_exclusions(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        self.insert_pending(connection, 1, now=now)
+        self.insert_pending(connection, 2, now=now)
+        terminal = self.runtime.TranscriptAdapterError(
+            "unsupported_transcript",
+            retryable=False,
+        )
+        with self.fixed_review_inputs(), mock.patch.object(
+            self.runtime,
+            "read_frozen_transcript",
+            side_effect=[self.make_export("survivor"), terminal],
+        ):
+            claimed = self.runtime.claim_review_batch(
+                connection,
+                self.installation,
+                self.config,
+                now,
+            )
+        batch_id = int(claimed["batch_id"])
+        owner_token = str(claimed["owner_token"])
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            contract = self.runtime.load_review_contract(
+                connection, batch_id, "final"
+            )
+            owner_digest = self.runtime.review_owner_digest(
+                self.installation, owner_token
+            )
+            session = contract["sessions"][0]
+            self.runtime.complete_batch_review_generation(
+                connection,
+                int(session["review_item_id"]),
+                batch_id,
+                owner_digest,
+                int(session["expected_generation"]),
+                int(session["frozen_epoch"]),
+                int(session["frozen_from"]),
+                int(session["frozen_to"]),
+                str(session["frozen_locator_digest"]),
+                "excluded",
+                "no_reusable_improvement",
+                now + 1,
+            )
+            audit = self.runtime.finalize_review_batch(
+                connection,
+                batch_id,
+                owner_digest,
+                "completed",
+                0,
+                {"no_reusable_improvement": 1},
+                now + 1,
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        connection.close()
+        self.assertEqual(
+            audit["exclusion_counts"],
+            {
+                "no_reusable_improvement": 1,
+                "unsupported_transcript": 1,
+            },
+        )
+        self.assertEqual(audit["batch_capacity_released"], 0)
+
+        five_reasons = (
+            "environment",
+            "one_off",
+            "external_content",
+            "attribution_uncertain",
+            "unsupported_target",
+        )
+        isolated = type(self)(
+            methodName=(
+                "test_completed_partial_export_merges_export_and_terminal_exclusions"
+            )
+        )
+        isolated.setUp()
+        try:
+            isolated_connection = isolated.runtime.open_database(
+                isolated.installation
+            )
+            for number in range(1, 6):
+                isolated.insert_pending(
+                    isolated_connection, number, now=now
+                )
+            isolated_claimed = isolated.claim_ready_batch(
+                isolated_connection,
+                [
+                    isolated.make_export(f"delta-{number}")
+                    for number in range(1, 6)
+                ],
+                now=now,
+            )
+            isolated_batch_id = int(isolated_claimed["batch_id"])
+            isolated_owner_digest = (
+                isolated.runtime.review_owner_digest(
+                    isolated.installation,
+                    str(isolated_claimed["owner_token"]),
+                )
+            )
+            isolated_connection.execute("BEGIN IMMEDIATE")
+            try:
+                isolated_contract = (
+                    isolated.runtime.load_review_contract(
+                        isolated_connection,
+                        isolated_batch_id,
+                        "final",
+                    )
+                )
+                for session, reason in zip(
+                    isolated_contract["sessions"],
+                    five_reasons,
+                ):
+                    isolated.runtime.complete_batch_review_generation(
+                        isolated_connection,
+                        int(session["review_item_id"]),
+                        isolated_batch_id,
+                        isolated_owner_digest,
+                        int(session["expected_generation"]),
+                        int(session["frozen_epoch"]),
+                        int(session["frozen_from"]),
+                        int(session["frozen_to"]),
+                        str(session["frozen_locator_digest"]),
+                        "excluded",
+                        reason,
+                        now + 1,
+                    )
+                isolated_audit = (
+                    isolated.runtime.finalize_review_batch(
+                        isolated_connection,
+                        isolated_batch_id,
+                        isolated_owner_digest,
+                        "completed",
+                        0,
+                        {reason: 1 for reason in five_reasons},
+                        now + 1,
+                    )
+                )
+                isolated_connection.commit()
+            except BaseException:
+                isolated_connection.rollback()
+                raise
+            isolated_connection.close()
+            self.assertEqual(
+                isolated_audit["exclusion_counts"],
+                {reason: 1 for reason in five_reasons},
+            )
+            self.assertEqual(
+                isolated_audit["batch_capacity_released"], 0
+            )
+        finally:
+            isolated.doCleanups()
+
+    def test_finalize_rejects_any_remaining_member_and_rolls_back(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        connection = self.runtime.open_database(self.installation)
+        self.insert_pending(connection, 1, now=now)
+        claimed = self.claim_ready_batch(
+            connection, [self.make_export("one")], now=now
+        )
+        batch_id = int(claimed["batch_id"])
+        owner_digest = self.runtime.review_owner_digest(
+            self.installation, str(claimed["owner_token"])
+        )
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            invalid_finalizations = (
+                (
+                    "token-derived-key",
+                    "completed",
+                    0,
+                    {f"a{claimed['owner_token']}"[:64]: 1},
+                ),
+                (
+                    "candidate-over-generation",
+                    "completed",
+                    2,
+                    {},
+                ),
+                (
+                    "candidate-on-failure",
+                    "failed",
+                    1,
+                    {},
+                ),
+                (
+                    "semantic-count-overflow",
+                    "completed",
+                    0,
+                    {"environment": 5, "one_off": 5},
+                ),
+                (
+                    "semantic-count-underrun",
+                    "completed",
+                    0,
+                    {"environment": 0},
+                ),
+                (
+                    "too-many-keys",
+                    "completed",
+                    0,
+                    {
+                        "environment": 0,
+                        "one_off": 0,
+                        "external_content": 0,
+                        "attribution_uncertain": 0,
+                        "unsupported_target": 0,
+                        "candidate_limit": 0,
+                    },
+                ),
+            )
+            for (
+                case,
+                terminal_status,
+                candidate_count,
+                exclusion_counts,
+            ) in invalid_finalizations:
+                with self.subTest(case=case), self.assertRaisesRegex(
+                    ValueError, "invalid_review_batch_finalization"
+                ):
+                    self.runtime.finalize_review_batch(
+                        connection,
+                        batch_id,
+                        owner_digest,
+                        terminal_status,
+                        candidate_count,
+                        exclusion_counts,
+                        now + 1,
+                    )
+            changed = connection.execute(
+                """
+                UPDATE review_items SET status='pending'
+                WHERE batch_id=?
+                """,
+                (batch_id,),
+            ).rowcount
+            self.assertEqual(changed, 1)
+            with self.assertRaisesRegex(
+                ValueError, "review_batch_members_remain"
+            ):
+                self.runtime.finalize_review_batch(
+                    connection,
+                    batch_id,
+                    owner_digest,
+                    "completed",
+                    1,
+                    {},
+                    now + 1,
+                )
+        finally:
+            connection.rollback()
+        row = connection.execute(
+            """
+            SELECT status,batch_id FROM review_items
+            WHERE batch_id=?
+            """,
+            (batch_id,),
+        ).fetchone()
+        batch = connection.execute(
+            "SELECT status FROM review_batches WHERE id=?",
+            (batch_id,),
+        ).fetchone()
+        metadata_count = connection.execute(
+            """
+            SELECT COUNT(*) FROM metadata
+            WHERE key IN (?,?)
+            """,
+            (
+                self.runtime.review_contract_key(batch_id),
+                self.runtime.review_result_key(batch_id),
+            ),
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(tuple(row), ("reviewing", batch_id))
+        self.assertEqual(batch["status"], "ready")
+        self.assertEqual(metadata_count, 2)
