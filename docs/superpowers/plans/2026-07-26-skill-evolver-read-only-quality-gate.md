@@ -1,5 +1,12 @@
 # Skill Evolver Read-only Quality Gate Implementation Plan
 
+> **SUPERSEDED (2026-07-30):** Do not execute this turn-level plan. Phase 4
+> already implements its retention work, uses one row per session rather than
+> turns, deletes completed review contracts, and has no WAL or
+> `Installation.reports` contract. The replacement is
+> `2026-07-30-skill-evolver-session-quality-gate.md`. Privacy purge remains a
+> separate, unapproved requirement.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Finish Read-only MVP retention/privacy controls and produce a deterministic PASS/FAIL report after at least 10 reviewed sessions or 30 reviewed turns, with every candidate manually labeled for usefulness and attribution.
