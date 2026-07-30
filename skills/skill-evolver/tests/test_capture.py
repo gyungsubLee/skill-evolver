@@ -47,6 +47,94 @@ class RuntimeStoreTests(unittest.TestCase):
         )
         installation_path.chmod(0o600)
 
+    def test_plugin_spool_requires_exact_private_nonoverlapping_root(
+        self,
+    ) -> None:
+        installation_path = self.runtime.initialize_runtime(
+            self.base / "data", (self.sessions,), self.config
+        )
+        installation = self.runtime.load_installation(installation_path)
+        expected = (
+            installation.data_root.parent
+            / "plugins/data/skill-evolver-skill-evolver-dev"
+        )
+        expected.mkdir(mode=0o700, parents=True)
+        runtime = replace(
+            self.runtime.load_review_runtime(),
+            plugin_data=expected,
+        )
+        with mock.patch.object(
+            self.runtime, "load_review_runtime", return_value=runtime
+        ):
+            bound = self.runtime.plugin_spool_installation(
+                installation, expected, create=True
+            )
+            self.assertEqual(bound.spool, expected / "stop-spool")
+            self.assertEqual(stat.S_IMODE(bound.spool.stat().st_mode), 0o700)
+            for rejected in (
+                Path("relative"),
+                installation.data_root,
+                self.sessions,
+            ):
+                with self.subTest(rejected=rejected):
+                    with self.assertRaisesRegex(
+                        ValueError, "invalid_plugin_data"
+                    ):
+                        self.runtime.plugin_spool_installation(
+                            installation, rejected, create=False
+                        )
+
+    def test_plugin_spool_rejects_symlink_without_touching_sentinel(
+        self,
+    ) -> None:
+        installation_path = self.runtime.initialize_runtime(
+            self.base / "data", (self.sessions,), self.config
+        )
+        installation = self.runtime.load_installation(installation_path)
+        expected = (
+            installation.data_root.parent
+            / "plugins/data/skill-evolver-skill-evolver-dev"
+        )
+        expected.mkdir(mode=0o700, parents=True)
+        sentinel = expected / "unrelated.json"
+        sentinel.write_bytes(b"unrelated content")
+        sentinel.chmod(0o600)
+        runtime = replace(
+            self.runtime.load_review_runtime(),
+            plugin_data=expected,
+        )
+        alias = self.base / "plugin-data-alias"
+        alias.symlink_to(expected, target_is_directory=True)
+        with mock.patch.object(
+            self.runtime, "load_review_runtime", return_value=runtime
+        ):
+            for rejected in (alias,):
+                with self.assertRaisesRegex(
+                    ValueError, "invalid_plugin_data"
+                ):
+                    self.runtime.plugin_spool_installation(
+                        installation, rejected, create=False
+                    )
+                self.assertEqual(sentinel.read_bytes(), b"unrelated content")
+
+            expected.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, "invalid_plugin_data"):
+                self.runtime.plugin_spool_installation(
+                    installation, expected, create=False
+                )
+            self.assertEqual(sentinel.read_bytes(), b"unrelated content")
+            expected.chmod(0o700)
+
+            spool = expected / "stop-spool"
+            spool.mkdir(mode=0o700)
+            spool.rmdir()
+            spool.symlink_to(sentinel)
+            with self.assertRaisesRegex(ValueError, "invalid_plugin_data"):
+                self.runtime.plugin_spool_installation(
+                    installation, expected, create=True
+                )
+            self.assertEqual(sentinel.read_bytes(), b"unrelated content")
+
     def test_initialize_rejects_world_writable_transcript_root_before_writes(
         self,
     ) -> None:

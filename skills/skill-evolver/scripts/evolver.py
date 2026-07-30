@@ -19,7 +19,7 @@ import tempfile
 import time
 import unicodedata
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping, Optional, Sequence, TypedDict
 from urllib.parse import quote
@@ -63,6 +63,11 @@ POLICY_MAX_BYTES = 8_192
 RESULT_SCHEMA_INSTRUCTIONS_MAX_BYTES = 8_192
 CLAIM_CONTRACT_OVERHEAD_MAX_BYTES = 8_192
 FIXED_MUTABLE_SKILL_ROOTS = (Path("/Users/igyeongseob/.codex/skills"),)
+FIXED_PLUGIN_DATA_ROOT = Path(
+    "/Users/igyeongseob/.codex/plugins/data/"
+    "skill-evolver-skill-evolver-dev"
+)
+PLUGIN_STOP_SPOOL_NAME = "stop-spool"
 
 REVIEW_RESULT_PARENT = Path("/private/tmp")
 REVIEW_RESULT_PREFIX = "skill-evolver-review-results-"
@@ -1909,6 +1914,7 @@ class Config:
 
 @dataclass(frozen=True)
 class ReviewRuntime:
+    plugin_data: Path
     mutable_skill_roots: tuple[Path, ...]
     review_batch_sessions: int
     max_transcript_bytes: int
@@ -8433,6 +8439,7 @@ def load_review_runtime() -> ReviewRuntime:
             "schema_version",
             "version",
             "installation",
+            "plugin_data",
             "mutable_skill_roots",
             "review_limits",
         }
@@ -8443,10 +8450,12 @@ def load_review_runtime() -> ReviewRuntime:
         type(payload["schema_version"]) is not int
         or payload["schema_version"] != 1
         or type(payload["version"]) is not str
-        or payload["version"] != "0.1.0"
+        or payload["version"] != "0.1.1"
         or type(payload["installation"]) is not str
         or payload["installation"]
         != "/Users/igyeongseob/.codex/skill-evolver/installation.json"
+        or type(payload["plugin_data"]) is not str
+        or payload["plugin_data"] != str(FIXED_PLUGIN_DATA_ROOT)
         or type(payload["mutable_skill_roots"]) is not list
         or any(
             type(value) is not str
@@ -8461,9 +8470,67 @@ def load_review_runtime() -> ReviewRuntime:
     ):
         raise ValueError("invalid_review_runtime")
     return ReviewRuntime(
+        plugin_data=FIXED_PLUGIN_DATA_ROOT,
         mutable_skill_roots=FIXED_MUTABLE_SKILL_ROOTS,
         **REVIEW_RUNTIME_FIXED,
     )
+
+
+def plugin_spool_installation(
+    installation: Installation,
+    plugin_data: Path,
+    *,
+    create: bool,
+) -> Installation:
+    if (
+        type(installation) is not Installation
+        or not isinstance(plugin_data, Path)
+        or not plugin_data.is_absolute()
+        or plugin_data.is_symlink()
+    ):
+        raise ValueError("invalid_plugin_data")
+    runtime = load_review_runtime()
+    expected = (
+        installation.data_root.parent
+        / "plugins/data/skill-evolver-skill-evolver-dev"
+    )
+    if (
+        plugin_data != runtime.plugin_data
+        or plugin_data != expected
+        or plugin_data.resolve(strict=False) != plugin_data
+        or within(
+            plugin_data,
+            (installation.data_root, *installation.transcript_roots),
+        )
+        or within(installation.data_root, (plugin_data,))
+        or within(PLUGIN_ROOT, (plugin_data,))
+        or within(plugin_data, (PLUGIN_ROOT,))
+    ):
+        raise ValueError("invalid_plugin_data")
+    spool = plugin_data / PLUGIN_STOP_SPOOL_NAME
+    if not plugin_data.exists():
+        if create:
+            raise ValueError("invalid_plugin_data")
+        return replace(installation, spool=spool)
+    try:
+        root = private_directory(plugin_data)
+    except (FileNotFoundError, OSError, ValueError):
+        raise ValueError("invalid_plugin_data") from None
+    if plugin_data != root:
+        raise ValueError("invalid_plugin_data")
+    if create:
+        try:
+            spool.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+    if spool.exists() or spool.is_symlink():
+        try:
+            spool = private_directory(spool)
+        except (OSError, ValueError):
+            raise ValueError("invalid_plugin_data") from None
+    elif create:
+        raise ValueError("invalid_plugin_data")
+    return replace(installation, spool=spool)
 
 
 def load_improvement_policy(runtime: ReviewRuntime) -> bytes:

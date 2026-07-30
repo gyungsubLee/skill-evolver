@@ -32,6 +32,13 @@ class ReviewRuntimeContractTests(unittest.TestCase):
     def test_fixed_runtime_reference_and_policy_are_bounded(self) -> None:
         review = self.runtime.load_review_runtime()
         self.assertEqual(
+            review.plugin_data,
+            Path(
+                "/Users/igyeongseob/.codex/plugins/data/"
+                "skill-evolver-skill-evolver-dev"
+            ),
+        )
+        self.assertEqual(
             review.mutable_skill_roots,
             (Path("/Users/igyeongseob/.codex/skills"),),
         )
@@ -82,6 +89,11 @@ class ReviewRuntimeContractTests(unittest.TestCase):
                     "changed_limit",
                     ("review_limits", "catalog_inspect_max_bytes"),
                     65_537,
+                ),
+                (
+                    "changed_plugin_data",
+                    ("plugin_data",),
+                    "/private/tmp/not-the-installed-plugin",
                 ),
                 ("bool_schema", ("schema_version",), True),
                 (
