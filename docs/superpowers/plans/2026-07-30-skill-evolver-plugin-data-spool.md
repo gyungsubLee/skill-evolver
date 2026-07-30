@@ -240,7 +240,7 @@ def plugin_spool_installation(
 ) -> Installation:
     if (
         type(installation) is not Installation
-        or type(plugin_data) is not Path
+        or not isinstance(plugin_data, Path)
         or not plugin_data.is_absolute()
         or plugin_data.is_symlink()
     ):
