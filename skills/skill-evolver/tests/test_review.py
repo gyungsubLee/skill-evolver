@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import errno
 import hashlib
 import inspect
@@ -8039,3 +8040,648 @@ class ReviewBatchIntegrationTests(BatchExportTestCase):
         self.assertEqual(changes_after, changes_before)
         self.assertEqual(tuple(row), ("pending", None, None, None))
         self.assertEqual(batches, 0)
+
+
+class ReviewCandidateValidationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.runtime = load_runtime()
+        self.first_ref = f"S-{'1' * 64}"
+        self.second_ref = f"S-{'2' * 64}"
+        self.first_user_record = f"{self.first_ref}-R-001"
+        self.first_context_record = f"{self.first_ref}-R-002"
+        self.second_tool_record = f"{self.second_ref}-R-001"
+        self.contract = {
+            "schema_version": 1,
+            "stage": "final",
+            "batch_id": 7,
+            "owner_digest": "a" * 64,
+            "sessions": [
+                {
+                    "session_ref": self.first_ref,
+                    "review_item_id": 11,
+                    "expected_generation": 2,
+                    "frozen_epoch": 0,
+                    "frozen_from": 10,
+                    "frozen_to": 90,
+                    "frozen_locator_digest": "b" * 64,
+                    "records": [
+                        {
+                            "record_ref": self.first_user_record,
+                            "source_kind": "user_direct",
+                            "evidence_eligible": True,
+                            "content_hmac": "c" * 64,
+                        },
+                        {
+                            "record_ref": self.first_context_record,
+                            "source_kind": "assistant",
+                            "evidence_eligible": False,
+                            "content_hmac": "d" * 64,
+                        },
+                    ],
+                },
+                {
+                    "session_ref": self.second_ref,
+                    "review_item_id": 12,
+                    "expected_generation": 1,
+                    "frozen_epoch": 1,
+                    "frozen_from": 0,
+                    "frozen_to": 70,
+                    "frozen_locator_digest": "e" * 64,
+                    "records": [
+                        {
+                            "record_ref": self.second_tool_record,
+                            "source_kind": "tool_output",
+                            "evidence_eligible": True,
+                            "content_hmac": "f" * 64,
+                        }
+                    ],
+                },
+            ],
+            "policy_digest": "1" * 64,
+            "transcript_adapter_digest": "2" * 64,
+            "catalog_adapter_digest": "3" * 64,
+            "catalog_snapshot_digest": "4" * 64,
+            "created_at": "2033-05-18T03:33:20Z",
+            "lease_expires_at": "2033-05-18T03:43:20Z",
+        }
+        self.api_key = "ｓｋ－abcdefghijklmnopqrst－"
+        self.payload = {
+            "schema_version": 1,
+            "contract_digest": self.runtime.sha256_json(self.contract),
+            "sessions": [
+                {
+                    "session_ref": self.first_ref,
+                    "decision": "candidate",
+                    "target_identity": (
+                        "user-skill:verification-before-completion"
+                    ),
+                    "classification": {
+                        "problem_category": "verification",
+                        "target_locator": "completion claim",
+                        "proposal_intent": (
+                            "require successful verification"
+                        ),
+                    },
+                    "problem_summary": (
+                        f"A leaked {self.api_key} value was corrected."
+                    ),
+                    "proposal_summary": (
+                        "Require fresh successful evidence before completion."
+                    ),
+                    "validation_plan": (
+                        "Reproduce the failure and add focused regressions."
+                    ),
+                    "risk_level": "low",
+                    "evidence": [
+                        {
+                            "record_ref": self.first_user_record,
+                            "signal_type": "explicit_correction",
+                            "summary": (
+                                "The user corrected a completion claim."
+                            ),
+                        }
+                    ],
+                },
+                {
+                    "session_ref": self.second_ref,
+                    "decision": "excluded",
+                    "excluded_reason": "environment",
+                },
+            ],
+        }
+        self.targets = frozenset(
+            {"user-skill:verification-before-completion"}
+        )
+        self.runtime._validate_review_contract(
+            self.contract, 7, "final"
+        )
+
+    def test_exact_schema_normalizes_unicode_and_redacts_secret(self) -> None:
+        reversed_payload = copy.deepcopy(self.payload)
+        reversed_payload["sessions"].reverse()
+        result = self.runtime.validate_declarative_result(
+            reversed_payload, self.contract, self.targets
+        )
+        self.assertEqual(
+            [item["session_ref"] for item in result["sessions"]],
+            [self.first_ref, self.second_ref],
+        )
+        self.assertEqual(
+            result["sessions"][0]["problem_summary"],
+            "A leaked [REDACTED:api-key] value was corrected.",
+        )
+        self.assertEqual(
+            result["sessions"][1],
+            {
+                "session_ref": self.second_ref,
+                "decision": "excluded",
+                "excluded_reason": "environment",
+            },
+        )
+        serialized = self.runtime.canonical_json_bytes(result).decode()
+        self.assertNotIn(self.api_key, serialized)
+        self.assertNotIn(
+            "sk-abcdefghijklmnopqrst-",
+            serialized,
+        )
+
+    def test_result_requires_the_exact_session_ref_set_once(self) -> None:
+        self.runtime.validate_declarative_result(
+            self.payload, self.contract, self.targets
+        )
+        mutations = []
+        missing = copy.deepcopy(self.payload)
+        missing["sessions"].pop()
+        mutations.append(missing)
+        duplicate = copy.deepcopy(self.payload)
+        duplicate["sessions"][1]["session_ref"] = self.first_ref
+        mutations.append(duplicate)
+        unknown = copy.deepcopy(self.payload)
+        unknown["sessions"][1]["session_ref"] = f"S-{'9' * 64}"
+        mutations.append(unknown)
+        extra = copy.deepcopy(self.payload)
+        extra["sessions"].append(
+            {
+                "session_ref": f"S-{'8' * 64}",
+                "decision": "excluded",
+                "excluded_reason": "one_off",
+            }
+        )
+        mutations.append(extra)
+        non_string = copy.deepcopy(self.payload)
+        non_string["sessions"][1]["session_ref"] = ["not-a-ref"]
+        mutations.append(non_string)
+        for payload in mutations:
+            with self.subTest(session_count=len(payload["sessions"])):
+                with self.assertRaisesRegex(
+                    ValueError, "invalid_result_session_coverage"
+                ):
+                    self.runtime.validate_declarative_result(
+                        payload, self.contract, self.targets
+                    )
+
+        wrong_digest = copy.deepcopy(self.payload)
+        wrong_digest["contract_digest"] = "0" * 64
+        invalid_shapes = (
+            ("wrong-digest", wrong_digest),
+            ("top-scalar", "not-an-object"),
+            (
+                "sessions-non-list",
+                {
+                    **self.payload,
+                    "sessions": tuple(self.payload["sessions"]),
+                },
+            ),
+        )
+        for label, payload in invalid_shapes:
+            with self.subTest(invalid_shape=label):
+                with self.assertRaises(ValueError):
+                    self.runtime.validate_declarative_result(
+                        payload, self.contract, self.targets
+                    )
+
+        encoded = self.runtime.canonical_json_bytes(self.payload)
+        self.assertEqual(
+            self.runtime._load_declarative_result_json(encoded),
+            self.payload,
+        )
+        self.assertEqual(
+            self.runtime.RESULT_FILE_MAX_BYTES,
+            self.runtime.REVIEW_RESULT_MAX_BYTES,
+        )
+        padded = encoded + b" " * (
+            self.runtime.RESULT_FILE_MAX_BYTES - len(encoded)
+        )
+        self.assertEqual(
+            self.runtime._load_declarative_result_json(padded),
+            self.payload,
+        )
+        invalid_json = (
+            ("duplicate", b'{"value":1,"value":2}'),
+            ("nan", b'{"value":NaN}'),
+            ("infinity", b'{"value":Infinity}'),
+            ("float-overflow", b'{"value":1e9999}'),
+            ("negative-float-overflow", b'{"value":-1e9999}'),
+            ("invalid-utf8", b'{"value":"\xff"}'),
+            ("bom", b"\xef\xbb\xbf{}"),
+            ("trailing-document", b"{}{}"),
+            ("non-bytes", "{}"),
+            ("oversized", padded + b" "),
+        )
+        for label, value in invalid_json:
+            with self.subTest(strict_json=label):
+                with self.assertRaises(ValueError) as caught:
+                    self.runtime._load_declarative_result_json(value)
+                self.assertNotIn("value", str(caught.exception))
+
+    def test_unknown_keys_enums_and_context_evidence_fail_closed(
+        self,
+    ) -> None:
+        self.runtime.validate_declarative_result(
+            self.payload, self.contract, self.targets
+        )
+        cases = []
+        unknown_key = copy.deepcopy(self.payload)
+        unknown_key["sessions"][0]["confidence"] = 1
+        cases.append(("unknown-key", unknown_key))
+        category = copy.deepcopy(self.payload)
+        category["sessions"][0]["classification"][
+            "problem_category"
+        ] = "other"
+        cases.append(("category", category))
+        risk = copy.deepcopy(self.payload)
+        risk["sessions"][0]["risk_level"] = "critical"
+        cases.append(("risk", risk))
+        reason = copy.deepcopy(self.payload)
+        reason["sessions"][1]["excluded_reason"] = "candidate_limit"
+        cases.append(("reason", reason))
+        context = copy.deepcopy(self.payload)
+        context["sessions"][0]["evidence"][0][
+            "record_ref"
+        ] = self.first_context_record
+        cases.append(("context", context))
+        cross_session = copy.deepcopy(self.payload)
+        cross_session["sessions"][0]["evidence"][0][
+            "record_ref"
+        ] = self.second_tool_record
+        cases.append(("cross-session", cross_session))
+        bad_pair = copy.deepcopy(self.payload)
+        bad_pair["sessions"][0]["evidence"][0][
+            "signal_type"
+        ] = "verification_failure"
+        cases.append(("bad-pair", bad_pair))
+        boolean_version = copy.deepcopy(self.payload)
+        boolean_version["schema_version"] = True
+        cases.append(("bool-version", boolean_version))
+        non_string_signal = copy.deepcopy(self.payload)
+        non_string_signal["sessions"][0]["evidence"][0][
+            "signal_type"
+        ] = ["explicit_correction"]
+        cases.append(("non-string-signal", non_string_signal))
+        unsupported = copy.deepcopy(self.payload)
+        unsupported["sessions"][0]["target_identity"] = (
+            "user-skill:unknown"
+        )
+        cases.append(("unsupported-target", unsupported))
+        for level, path, missing_key in (
+            ("top", (), "schema_version"),
+            (
+                "candidate",
+                ("sessions", 0),
+                "problem_summary",
+            ),
+            (
+                "excluded",
+                ("sessions", 1),
+                "excluded_reason",
+            ),
+            (
+                "classification",
+                ("sessions", 0, "classification"),
+                "problem_category",
+            ),
+            (
+                "evidence",
+                ("sessions", 0, "evidence", 0),
+                "summary",
+            ),
+        ):
+            unknown = copy.deepcopy(self.payload)
+            target = unknown
+            for part in path:
+                target = target[part]
+            target["unknown"] = "value"
+            cases.append((f"{level}-unknown", unknown))
+            missing = copy.deepcopy(self.payload)
+            target = missing
+            for part in path:
+                target = target[part]
+            target.pop(missing_key)
+            cases.append((f"{level}-missing", missing))
+        empty_evidence = copy.deepcopy(self.payload)
+        empty_evidence["sessions"][0]["evidence"] = []
+        cases.append(("empty-evidence", empty_evidence))
+        four_evidence = copy.deepcopy(self.payload)
+        four_evidence["sessions"][0]["evidence"] = [
+            copy.deepcopy(self.payload["sessions"][0]["evidence"][0])
+            for _ in range(4)
+        ]
+        cases.append(("four-evidence", four_evidence))
+        duplicate_evidence = copy.deepcopy(self.payload)
+        duplicate_evidence["sessions"][0]["evidence"].append(
+            copy.deepcopy(
+                self.payload["sessions"][0]["evidence"][0]
+            )
+        )
+        cases.append(("duplicate-evidence", duplicate_evidence))
+        for label, payload in cases:
+            with self.subTest(invalid_result=label):
+                with self.assertRaises(ValueError):
+                    self.runtime.validate_declarative_result(
+                        payload, self.contract, self.targets
+                    )
+        oversized_targets = frozenset(
+            {
+                *self.targets,
+                *(
+                    f"user-skill:extra-{index}"
+                    for index in range(self.runtime.CATALOG_MAX_SKILLS)
+                ),
+            }
+        )
+        with self.assertRaisesRegex(
+            ValueError, "invalid_allowed_targets"
+        ):
+            self.runtime.validate_declarative_result(
+                self.payload,
+                self.contract,
+                oversized_targets,
+            )
+
+        contract_marker = "LEAKED_CONTRACT_SECRET"
+        payload_marker = "LEAKED_PAYLOAD_SECRET"
+
+        class EvilList(list):
+            def __iter__(self):
+                raise RuntimeError(contract_marker)
+
+            def __len__(self):
+                raise RuntimeError(contract_marker)
+
+        class EvilStr(str):
+            def __eq__(self, other):
+                raise RuntimeError(payload_marker)
+
+            def __hash__(self):
+                raise RuntimeError(payload_marker)
+
+        hostile_contract = copy.deepcopy(self.contract)
+        hostile_contract["sessions"] = EvilList(
+            hostile_contract["sessions"]
+        )
+        with self.subTest(hostile_builtin="contract-list"):
+            with self.assertRaisesRegex(
+                ValueError, "review_contract_invalid"
+            ) as contract_error:
+                self.runtime.validate_declarative_result(
+                    self.payload,
+                    hostile_contract,
+                    self.targets,
+                )
+            self.assertNotIn(
+                contract_marker, str(contract_error.exception)
+            )
+
+        hostile_payload = copy.deepcopy(self.payload)
+        hostile_payload["sessions"][0]["decision"] = EvilStr(
+            "candidate"
+        )
+        with self.subTest(hostile_builtin="payload-string"):
+            with self.assertRaisesRegex(
+                ValueError, "invalid_result_fields"
+            ) as payload_error:
+                self.runtime.validate_declarative_result(
+                    hostile_payload,
+                    self.contract,
+                    self.targets,
+                )
+            self.assertNotIn(
+                payload_marker, str(payload_error.exception)
+            )
+
+        oversized_containers = (
+            [None] * 513,
+            [[None] * 512 for _ in range(17)],
+        )
+        for sessions in oversized_containers:
+            payload = {
+                **self.payload,
+                "sessions": sessions,
+            }
+            with self.subTest(plain_node_count=len(sessions)):
+                with self.assertRaisesRegex(
+                    ValueError, "invalid_result_fields"
+                ):
+                    self.runtime.validate_declarative_result(
+                        payload,
+                        self.contract,
+                        self.targets,
+                    )
+
+        for label, mutate in (
+            (
+                "bool-batch",
+                lambda value: value.__setitem__("batch_id", True),
+            ),
+            (
+                "malformed-session-ref",
+                lambda value: value["sessions"][0].__setitem__(
+                    "session_ref", "S-001"
+                ),
+            ),
+        ):
+            contract = copy.deepcopy(self.contract)
+            mutate(contract)
+            payload = copy.deepcopy(self.payload)
+            payload["contract_digest"] = self.runtime.sha256_json(
+                contract
+            )
+            with self.subTest(invalid_contract=label):
+                with self.assertRaisesRegex(
+                    ValueError, "review_contract_invalid"
+                ):
+                    self.runtime.validate_declarative_result(
+                        payload, contract, self.targets
+                    )
+
+    def test_residual_private_key_rejects_the_whole_result(
+        self,
+    ) -> None:
+        self.runtime.validate_declarative_result(
+            self.payload, self.contract, self.targets
+        )
+        bearer = "Bearer abcdefghijklmnop=="
+        unicode_bearer = "Bearer\u1680abcdefghijklmnop=="
+        github_token = f"ghp_{'a' * 20}"
+        redacted = copy.deepcopy(self.payload)
+        redacted["sessions"][0]["proposal_summary"] = (
+            f"Remove {bearer} before storage."
+        )
+        redacted["sessions"][0]["evidence"][0]["summary"] = (
+            f"Replace {github_token} immediately."
+        )
+        redacted["sessions"][0]["validation_plan"] = (
+            f"Remove {unicode_bearer} before storage."
+        )
+        normalized = self.runtime.validate_declarative_result(
+            redacted, self.contract, self.targets
+        )
+        encoded_normalized = self.runtime.canonical_json_bytes(normalized)
+        self.assertNotIn(bearer.encode(), encoded_normalized)
+        self.assertNotIn(unicode_bearer.encode(), encoded_normalized)
+        self.assertNotIn(github_token.encode(), encoded_normalized)
+        self.assertIn(b"[REDACTED:bearer-token]", encoded_normalized)
+        self.assertIn(b"[REDACTED:access-token]", encoded_normalized)
+
+        text_paths = (
+            ("target-locator", ("classification", "target_locator")),
+            ("proposal-intent", ("classification", "proposal_intent")),
+            ("problem-summary", ("problem_summary",)),
+            ("proposal-summary", ("proposal_summary",)),
+            ("validation-plan", ("validation_plan",)),
+            ("evidence-summary", ("evidence", 0, "summary")),
+        )
+        residual_secrets = (
+            ("private-key", "-----BEGIN PRIVATE KEY-----"),
+            ("jwt", "eyJabcdefgh.ijklmnop.qrstuvwx-"),
+        )
+        for secret_label, secret in residual_secrets:
+            for field_label, path in text_paths:
+                payload = copy.deepcopy(self.payload)
+                target = payload["sessions"][0]
+                for part in path[:-1]:
+                    target = target[part]
+                target[path[-1]] = secret
+                with self.subTest(
+                    residual_secret=secret_label,
+                    free_text=field_label,
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError, "residual_secret"
+                    ) as caught:
+                        self.runtime.validate_declarative_result(
+                            payload, self.contract, self.targets
+                        )
+                    self.assertNotIn(secret, str(caught.exception))
+
+        for label, path in text_paths:
+            payload = copy.deepcopy(self.payload)
+            target = payload["sessions"][0]
+            for part in path[:-1]:
+                target = target[part]
+            target[path[-1]] = "hidden\u200bcontrol"
+            with self.subTest(free_text=label):
+                with self.assertRaises(ValueError) as caught:
+                    self.runtime.validate_declarative_result(
+                        payload, self.contract, self.targets
+                    )
+                self.assertNotIn(
+                    "hidden\u200bcontrol", str(caught.exception)
+                )
+
+        for label, value in (
+            ("control", "unsafe\x00text"),
+            ("format", "unsafe\u200btext"),
+            ("line-separator", "unsafe\u2028text"),
+            ("paragraph-separator", "unsafe\u2029text"),
+            ("surrogate", "unsafe\ud800text"),
+            ("multiline", "unsafe\ntext"),
+            ("quote", "> unsafe quote"),
+            ("fence", "unsafe ``` fence"),
+            ("tilde-fence", "unsafe ~~~ fence"),
+            ("non-string", ["unsafe"]),
+        ):
+            payload = copy.deepcopy(self.payload)
+            payload["sessions"][0]["problem_summary"] = value
+            with self.subTest(invalid_text=label):
+                with self.assertRaises(ValueError) as caught:
+                    self.runtime.validate_declarative_result(
+                        payload, self.contract, self.targets
+                    )
+                self.assertNotIn("unsafe", str(caught.exception))
+
+        exact_input = copy.deepcopy(self.payload)
+        exact_input["sessions"][0]["problem_summary"] = (
+            "sk-" + "a" * 277
+        )
+        self.runtime.validate_declarative_result(
+            exact_input, self.contract, self.targets
+        )
+        oversized_input = copy.deepcopy(self.payload)
+        oversized_input["sessions"][0]["problem_summary"] = (
+            "sk-" + "a" * 278
+        )
+        with self.assertRaisesRegex(
+            ValueError, "candidate_text_too_long"
+        ):
+            self.runtime.validate_declarative_result(
+                oversized_input, self.contract, self.targets
+            )
+        oversized_output = copy.deepcopy(self.payload)
+        oversized_output["sessions"][0]["classification"][
+            "target_locator"
+        ] = f"{'x' * 148} secret=x234"
+        with self.assertRaisesRegex(
+            ValueError, "candidate_text_too_long"
+        ):
+            self.runtime.validate_declarative_result(
+                oversized_output, self.contract, self.targets
+            )
+
+        large_contract = copy.deepcopy(self.contract)
+        large_contract["sessions"] = []
+        large_payload = {
+            "schema_version": 1,
+            "contract_digest": "",
+            "sessions": [],
+        }
+        for index in range(1, 6):
+            session_ref = f"S-{index + 10:064x}"
+            records = [
+                {
+                    "record_ref": f"{session_ref}-R-{record:03d}",
+                    "source_kind": "user_direct",
+                    "evidence_eligible": True,
+                    "content_hmac": f"{index:x}" * 64,
+                }
+                for record in range(1, 4)
+            ]
+            large_contract["sessions"].append(
+                {
+                    "session_ref": session_ref,
+                    "review_item_id": index,
+                    "expected_generation": 1,
+                    "frozen_epoch": 0,
+                    "frozen_from": 0,
+                    "frozen_to": 1,
+                    "frozen_locator_digest": f"{index:x}" * 64,
+                    "records": records,
+                }
+            )
+            large_payload["sessions"].append(
+                {
+                    "session_ref": session_ref,
+                    "decision": "candidate",
+                    "target_identity": (
+                        "user-skill:verification-before-completion"
+                    ),
+                    "classification": {
+                        "problem_category": "verification",
+                        "target_locator": "😀" * 160,
+                        "proposal_intent": "😀" * 160,
+                    },
+                    "problem_summary": "😀" * 280,
+                    "proposal_summary": "😀" * 280,
+                    "validation_plan": "😀" * 500,
+                    "risk_level": "low",
+                    "evidence": [
+                        {
+                            "record_ref": record["record_ref"],
+                            "signal_type": "explicit_correction",
+                            "summary": "😀" * 280,
+                        }
+                        for record in records
+                    ],
+                }
+            )
+        large_payload["contract_digest"] = self.runtime.sha256_json(
+            large_contract
+        )
+        with self.assertRaisesRegex(
+            ValueError, "validated_result_too_large"
+        ):
+            self.runtime.validate_declarative_result(
+                large_payload,
+                large_contract,
+                self.targets,
+            )

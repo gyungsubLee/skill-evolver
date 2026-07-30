@@ -2758,6 +2758,458 @@ def sha256_json(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
+PROBLEM_CATEGORIES = frozenset(
+    {
+        "verification",
+        "instruction_clarity",
+        "workflow",
+        "safety",
+        "efficiency",
+        "tooling",
+    }
+)
+RISK_LEVELS = frozenset({"low", "medium", "high"})
+EXCLUDED_REASONS = frozenset(
+    {
+        "no_reusable_improvement",
+        "environment",
+        "one_off",
+        "external_content",
+        "attribution_uncertain",
+        "unsupported_target",
+        "privacy_redaction_required",
+    }
+)
+SIGNAL_SOURCE_PAIRS = frozenset(
+    {
+        ("explicit_correction", "user_direct"),
+        ("unnecessary_rework", "user_direct"),
+        ("verification_failure", "tool_output"),
+    }
+)
+RESULT_TOP_LEVEL_KEYS = frozenset(
+    {"schema_version", "contract_digest", "sessions"}
+)
+CANDIDATE_RESULT_KEYS = frozenset(
+    {
+        "session_ref",
+        "decision",
+        "target_identity",
+        "classification",
+        "problem_summary",
+        "proposal_summary",
+        "validation_plan",
+        "risk_level",
+        "evidence",
+    }
+)
+EXCLUDED_RESULT_KEYS = frozenset(
+    {"session_ref", "decision", "excluded_reason"}
+)
+CLASSIFICATION_KEYS = frozenset(
+    {"problem_category", "target_locator", "proposal_intent"}
+)
+EVIDENCE_RESULT_KEYS = frozenset(
+    {"record_ref", "signal_type", "summary"}
+)
+RESULT_FILE_MAX_BYTES = REVIEW_RESULT_MAX_BYTES
+CANONICAL_RESULT_MAX_BYTES = 32_768
+EVIDENCE_PER_CANDIDATE_MAX = 3
+SECRET_REDACTIONS = (
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{16,}"
+            r"(?![A-Za-z0-9_-])"
+        ),
+        "[REDACTED:api-key]",
+    ),
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{20,}"
+            r"(?![A-Za-z0-9])"
+        ),
+        "[REDACTED:access-token]",
+    ),
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9])(?i:Bearer)\s+"
+            r"[A-Za-z0-9._~+/=-]{12,}"
+            r"(?![A-Za-z0-9._~+/=-])"
+        ),
+        "[REDACTED:bearer-token]",
+    ),
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9_])"
+            r"(?i:password|passwd|secret|api[_-]?key|"
+            r"access[_-]?token)\s*[:=]\s*[^\s,;]{4,}"
+        ),
+        "[REDACTED:secret]",
+    ),
+)
+RESIDUAL_SECRET_PATTERNS = (
+    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
+    re.compile(
+        r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\."
+        r"[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
+        r"(?![A-Za-z0-9_-])"
+    ),
+)
+FORBIDDEN_CANDIDATE_CATEGORIES = frozenset(
+    {"Cc", "Cf", "Zl", "Zp"}
+)
+DECLARATIVE_JSON_CONTAINER_MAX = 512
+DECLARATIVE_JSON_NODE_MAX = 8_192
+
+
+def _require_plain_json_builtins(
+    value: object,
+    error_code: str,
+) -> object:
+    stack = [value]
+    nodes = 0
+    while stack:
+        current = stack.pop()
+        nodes += 1
+        if nodes > DECLARATIVE_JSON_NODE_MAX:
+            raise ValueError(error_code)
+        if current is None or type(current) in (str, int, bool):
+            continue
+        if type(current) is list:
+            if len(current) > DECLARATIVE_JSON_CONTAINER_MAX:
+                raise ValueError(error_code)
+            stack.extend(current)
+            continue
+        if type(current) is dict:
+            if len(current) > DECLARATIVE_JSON_CONTAINER_MAX:
+                raise ValueError(error_code)
+            for key in current:
+                if type(key) is not str:
+                    raise ValueError(error_code)
+                nodes += 1
+                if nodes > DECLARATIVE_JSON_NODE_MAX:
+                    raise ValueError(error_code)
+            stack.extend(current.values())
+            continue
+        raise ValueError(error_code)
+    return value
+
+
+def _load_declarative_result_json(encoded: object) -> object:
+    if type(encoded) is not bytes:
+        raise ValueError("invalid_result_json")
+    if len(encoded) > RESULT_FILE_MAX_BYTES:
+        raise ValueError("result_file_too_large")
+    if encoded.startswith(b"\xef\xbb\xbf"):
+        raise ValueError("invalid_result_json")
+
+    def unique_object(
+        pairs: list[tuple[str, object]],
+    ) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("invalid_result_json")
+            result[key] = value
+        return result
+
+    def reject_nonfinite(_: str) -> object:
+        raise ValueError("invalid_result_json")
+
+    def finite_float(value: str) -> float:
+        parsed = float(value)
+        if not -sys.float_info.max <= parsed <= sys.float_info.max:
+            raise ValueError("invalid_result_json")
+        return parsed
+
+    try:
+        return json.loads(
+            encoded.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=reject_nonfinite,
+            parse_float=finite_float,
+        )
+    except (
+        RecursionError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        raise ValueError("invalid_result_json") from None
+
+
+def require_exact_object(
+    value: object,
+    expected_keys: frozenset[str],
+    error_code: str,
+) -> dict[str, object]:
+    if (
+        type(value) is not dict
+        or any(type(key) is not str for key in value)
+        or set(value) != expected_keys
+    ):
+        raise ValueError(error_code)
+    return value
+
+
+def normalize_candidate_text(value: object, maximum: int) -> str:
+    if (
+        type(value) is not str
+        or not value
+        or type(maximum) is not int
+        or maximum < 1
+    ):
+        raise ValueError("invalid_candidate_text")
+    normalized = unicodedata.normalize("NFKC", value)
+    if any(
+        unicodedata.category(character)
+        in FORBIDDEN_CANDIDATE_CATEGORIES
+        or 0xD800 <= ord(character) <= 0xDFFF
+        for character in normalized
+    ):
+        raise ValueError("invalid_candidate_text")
+    if len(normalized) > maximum:
+        raise ValueError("candidate_text_too_long")
+    stripped = normalized.strip()
+    if (
+        not stripped
+        or stripped.startswith(">")
+        or stripped.startswith("```")
+        or "```" in stripped
+        or "~~~" in stripped
+    ):
+        raise ValueError("quoted_candidate_text")
+    redacted = stripped
+    for pattern, replacement in SECRET_REDACTIONS:
+        redacted = pattern.sub(replacement, redacted)
+    if any(
+        pattern.search(redacted)
+        for pattern in RESIDUAL_SECRET_PATTERNS
+    ):
+        raise ValueError("residual_secret")
+    if len(redacted) > maximum:
+        raise ValueError("candidate_text_too_long")
+    return redacted
+
+
+def validate_declarative_result(
+    payload: object,
+    contract: dict[str, object],
+    allowed_target_identities: frozenset[str],
+) -> dict[str, object]:
+    _require_plain_json_builtins(
+        contract, "review_contract_invalid"
+    )
+    if (
+        type(contract) is not dict
+        or type(contract.get("batch_id")) is not int
+    ):
+        raise ValueError("review_contract_invalid")
+    contract = _validate_review_contract(
+        contract,
+        int(contract["batch_id"]),
+        "final",
+    )
+    _require_plain_json_builtins(payload, "invalid_result_fields")
+    if (
+        type(allowed_target_identities) is not frozenset
+        or len(allowed_target_identities) > CATALOG_MAX_SKILLS
+    ):
+        raise ValueError("invalid_allowed_targets")
+    try:
+        valid_targets = all(
+            type(identity) is str
+            and bool(identity)
+            and len(identity.encode("utf-8"))
+            <= CATALOG_IDENTITY_MAX_BYTES
+            for identity in allowed_target_identities
+        )
+    except UnicodeError:
+        valid_targets = False
+    if not valid_targets:
+        raise ValueError("invalid_allowed_targets")
+    result = require_exact_object(
+        payload,
+        RESULT_TOP_LEVEL_KEYS,
+        "invalid_result_fields",
+    )
+    if (
+        type(result["schema_version"]) is not int
+        or result["schema_version"] != 1
+    ):
+        raise ValueError("invalid_result_schema")
+    if (
+        type(result["contract_digest"]) is not str
+        or result["contract_digest"] != sha256_json(contract)
+    ):
+        raise ValueError("result_contract_mismatch")
+    supplied = result["sessions"]
+    contract_sessions = contract["sessions"]
+    if type(supplied) is not list:
+        raise ValueError("invalid_result_sessions")
+    expected_refs = [
+        str(session["session_ref"]) for session in contract_sessions
+    ]
+    supplied_refs = [
+        item.get("session_ref") if type(item) is dict else None
+        for item in supplied
+    ]
+    if (
+        len(supplied_refs) != len(expected_refs)
+        or any(type(ref) is not str for ref in supplied_refs)
+        or len(set(supplied_refs)) != len(supplied_refs)
+        or set(supplied_refs) != set(expected_refs)
+    ):
+        raise ValueError("invalid_result_session_coverage")
+    supplied_by_ref = {
+        str(item["session_ref"]): item for item in supplied
+    }
+    contract_by_ref = {
+        str(item["session_ref"]): item
+        for item in contract_sessions
+    }
+    normalized_sessions: list[dict[str, object]] = []
+    for session_ref in expected_refs:
+        item = supplied_by_ref[session_ref]
+        decision = item.get("decision")
+        if type(decision) is not str:
+            raise ValueError("invalid_result_decision")
+        if decision == "excluded":
+            excluded = require_exact_object(
+                item,
+                EXCLUDED_RESULT_KEYS,
+                "invalid_excluded_result_fields",
+            )
+            reason = excluded["excluded_reason"]
+            if (
+                type(reason) is not str
+                or reason not in EXCLUDED_REASONS
+            ):
+                raise ValueError("invalid_excluded_reason")
+            normalized_sessions.append(
+                {
+                    "session_ref": session_ref,
+                    "decision": "excluded",
+                    "excluded_reason": reason,
+                }
+            )
+            continue
+        if decision != "candidate":
+            raise ValueError("invalid_result_decision")
+        candidate = require_exact_object(
+            item,
+            CANDIDATE_RESULT_KEYS,
+            "invalid_candidate_result_fields",
+        )
+        target_identity = candidate["target_identity"]
+        if (
+            type(target_identity) is not str
+            or target_identity not in allowed_target_identities
+        ):
+            raise ValueError("unsupported_target")
+        classification = require_exact_object(
+            candidate["classification"],
+            CLASSIFICATION_KEYS,
+            "invalid_classification_fields",
+        )
+        category = classification["problem_category"]
+        risk = candidate["risk_level"]
+        if (
+            type(category) is not str
+            or category not in PROBLEM_CATEGORIES
+        ):
+            raise ValueError("invalid_problem_category")
+        if type(risk) is not str or risk not in RISK_LEVELS:
+            raise ValueError("invalid_risk_level")
+        evidence_items = candidate["evidence"]
+        if (
+            type(evidence_items) is not list
+            or not evidence_items
+            or len(evidence_items) > EVIDENCE_PER_CANDIDATE_MAX
+        ):
+            raise ValueError("invalid_candidate_evidence_count")
+        records = {
+            str(record["record_ref"]): record
+            for record in contract_by_ref[session_ref]["records"]
+        }
+        normalized_evidence: list[dict[str, object]] = []
+        used_record_refs: set[str] = set()
+        for evidence_value in evidence_items:
+            evidence = require_exact_object(
+                evidence_value,
+                EVIDENCE_RESULT_KEYS,
+                "invalid_evidence_fields",
+            )
+            record_ref = evidence["record_ref"]
+            signal_type = evidence["signal_type"]
+            if (
+                type(record_ref) is not str
+                or record_ref in used_record_refs
+                or record_ref not in records
+            ):
+                raise ValueError("invalid_evidence_record_ref")
+            if type(signal_type) is not str:
+                raise ValueError("invalid_evidence_signal_type")
+            record = records[record_ref]
+            source_kind = record["source_kind"]
+            if (
+                record["evidence_eligible"] is not True
+                or (signal_type, source_kind)
+                not in SIGNAL_SOURCE_PAIRS
+            ):
+                raise ValueError("ineligible_evidence")
+            used_record_refs.add(record_ref)
+            normalized_evidence.append(
+                {
+                    "record_ref": record_ref,
+                    "signal_type": signal_type,
+                    "source_kind": source_kind,
+                    "summary": normalize_candidate_text(
+                        evidence["summary"], 280
+                    ),
+                }
+            )
+        normalized_sessions.append(
+            {
+                "session_ref": session_ref,
+                "decision": "candidate",
+                "target_identity": target_identity,
+                "classification": {
+                    "problem_category": category,
+                    "target_locator": normalize_candidate_text(
+                        classification["target_locator"], 160
+                    ),
+                    "proposal_intent": normalize_candidate_text(
+                        classification["proposal_intent"], 160
+                    ),
+                },
+                "problem_summary": normalize_candidate_text(
+                    candidate["problem_summary"], 280
+                ),
+                "proposal_summary": normalize_candidate_text(
+                    candidate["proposal_summary"], 280
+                ),
+                "validation_plan": normalize_candidate_text(
+                    candidate["validation_plan"], 500
+                ),
+                "risk_level": risk,
+                "evidence": normalized_evidence,
+            }
+        )
+    normalized = {
+        "schema_version": 1,
+        "contract_digest": result["contract_digest"],
+        "sessions": normalized_sessions,
+    }
+    if (
+        len(canonical_json_bytes(normalized))
+        > CANONICAL_RESULT_MAX_BYTES
+    ):
+        raise ValueError("validated_result_too_large")
+    return normalized
+
+
 def load_review_runtime() -> ReviewRuntime:
     with RUNTIME_REFERENCE_PATH.open("rb") as stream:
         encoded = stream.read(RUNTIME_REFERENCE_MAX_BYTES + 1)
