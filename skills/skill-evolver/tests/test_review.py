@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import errno
 import hashlib
+import hmac
 import inspect
 import json
 import os
@@ -8685,3 +8686,256 @@ class ReviewCandidateValidationTests(unittest.TestCase):
                 large_contract,
                 self.targets,
             )
+
+
+class CandidateIdentityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.runtime = load_runtime()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        sessions = self.root / "sessions"
+        sessions.mkdir(mode=0o700)
+        self.installation_path = self.runtime.initialize_runtime(
+            self.root / "data",
+            (sessions,),
+            {"capture_paused": False, "exclude_roots": []},
+        )
+        self.installation = self.runtime.load_installation(
+            self.installation_path
+        )
+
+    def test_fingerprint_is_nfkc_casefolded_and_field_bound(self) -> None:
+        first = self.runtime.candidate_fingerprint(
+            "user-skill:Example",
+            " ＶＥＲＩＦＩＣＡＴＩＯＮ ",
+            " Completion   Claim ",
+            "Require ＦＲＥＳＨ evidence",
+        )
+        normalized = self.runtime.candidate_fingerprint(
+            "user-skill:Example",
+            "verification",
+            "completion claim",
+            "require fresh evidence",
+        )
+        changed_identity = self.runtime.candidate_fingerprint(
+            "USER-SKILL:EXAMPLE",
+            "verification",
+            "completion claim",
+            "require fresh evidence",
+        )
+        changed_category = self.runtime.candidate_fingerprint(
+            "user-skill:Example",
+            "safety",
+            "completion claim",
+            "require fresh evidence",
+        )
+        swapped_fields = self.runtime.candidate_fingerprint(
+            "user-skill:Example",
+            "verification",
+            "require fresh evidence",
+            "completion claim",
+        )
+        self.assertEqual(first, normalized)
+        self.assertNotEqual(first, changed_identity)
+        self.assertNotEqual(first, changed_category)
+        self.assertNotEqual(first, swapped_fields)
+        self.assertRegex(first, r"^[0-9a-f]{64}$")
+        fingerprint_source = inspect.getsource(
+            self.runtime.candidate_fingerprint
+        )
+        self.assertLess(
+            fingerprint_source.index("len(target_identity)"),
+            fingerprint_source.index(
+                'target_identity.encode("utf-8")'
+            ),
+        )
+        self.assertEqual(
+            self.runtime.normalized_fingerprint_field(
+                " ＦＲＥＳＨ   Evidence "
+            ),
+            "fresh evidence",
+        )
+
+        class StringSubclass(str):
+            pass
+
+        for label, value, error in (
+            ("non-string", None, "invalid_fingerprint_field"),
+            ("subclass", StringSubclass("value"), "invalid_fingerprint_field"),
+            ("empty", "", "invalid_fingerprint_field"),
+            ("whitespace", " \t ", "invalid_fingerprint_field"),
+            ("control", "unsafe\x00value", "invalid_fingerprint_field"),
+            ("format", "unsafe\u200bvalue", "invalid_fingerprint_field"),
+            ("surrogate", "unsafe\ud800value", "invalid_fingerprint_field"),
+            (
+                "unbounded",
+                "x" * 161,
+                "fingerprint_field_too_long",
+            ),
+            (
+                "casefold-expansion",
+                "ß" * 81,
+                "fingerprint_field_too_long",
+            ),
+        ):
+            with self.subTest(fingerprint_field=label):
+                with self.assertRaisesRegex(ValueError, f"^{error}$"):
+                    self.runtime.normalized_fingerprint_field(value)
+
+        for label, value in (
+            ("non-string", None),
+            ("subclass", StringSubclass("user-skill:example")),
+            ("empty", ""),
+            ("whitespace", "   "),
+            ("surrogate", "user-skill:\ud800"),
+            ("unbounded", "x" * 273),
+            ("very-unbounded", "x" * 1_000_000),
+        ):
+            with self.subTest(target_identity=label):
+                with self.assertRaisesRegex(
+                    ValueError, "^invalid_target_identity$"
+                ):
+                    self.runtime.candidate_fingerprint(
+                        value,
+                        "verification",
+                        "completion claim",
+                        "require fresh evidence",
+                    )
+        with self.assertRaisesRegex(
+            ValueError, "^invalid_problem_category$"
+        ):
+            self.runtime.candidate_fingerprint(
+                "user-skill:example",
+                "other",
+                "completion claim",
+                "require fresh evidence",
+            )
+
+    def test_recurrence_key_and_value_store_no_session_key(self) -> None:
+        raw_session_key = "1" * 64
+        key = self.runtime.candidate_session_link_key(
+            self.installation, raw_session_key
+        )
+        identity_key = self.installation.identity_key.read_bytes()
+        expected_digest = hmac.new(
+            identity_key,
+            b"candidate-session\0" + raw_session_key.encode("ascii"),
+            "sha256",
+        ).hexdigest()
+        session_domain_digest = hmac.new(
+            identity_key,
+            b"session\0" + raw_session_key.encode("ascii"),
+            "sha256",
+        ).hexdigest()
+        self.assertEqual(key, f"candidate-session.{expected_digest}")
+        self.assertNotEqual(key, f"candidate-session.{session_domain_digest}")
+        self.assertNotIn(raw_session_key, key)
+
+        other_sessions = self.root / "other-sessions"
+        other_sessions.mkdir(mode=0o700)
+        other_path = self.runtime.initialize_runtime(
+            self.root / "other-data",
+            (other_sessions,),
+            {"capture_paused": False, "exclude_roots": []},
+        )
+        other_installation = self.runtime.load_installation(other_path)
+        self.assertNotEqual(
+            key,
+            self.runtime.candidate_session_link_key(
+                other_installation, raw_session_key
+            ),
+        )
+
+        expiry = "2033-11-14T22:13:20Z"
+        value = self.runtime.candidate_session_link_value(
+            candidate_id=17,
+            dedupe_expires_at=expiry,
+        )
+        self.assertEqual(
+            value,
+            {
+                "schema_version": 1,
+                "candidate_id": 17,
+                "dedupe_expires_at": expiry,
+            },
+        )
+        self.assertNotIn(raw_session_key, json.dumps(value))
+        self.assertEqual(
+            self.runtime.candidate_session_link_value(
+                self.runtime.SQLITE_INTEGER_MAX,
+                expiry,
+            )["candidate_id"],
+            self.runtime.SQLITE_INTEGER_MAX,
+        )
+        self.assertEqual(
+            self.runtime.candidate_evidence_aggregate_key(17),
+            "candidate.17.evidence_aggregate",
+        )
+
+        class StringSubclass(str):
+            pass
+
+        for label, value in (
+            ("non-string", None),
+            ("subclass", StringSubclass(raw_session_key)),
+            ("empty", ""),
+            ("short", "1" * 63),
+            ("long", "1" * 65),
+            ("upper", "A" * 64),
+            ("non-hex", "g" * 64),
+            ("surrogate", "\ud800" * 64),
+        ):
+            with self.subTest(session_key=label):
+                with self.assertRaisesRegex(
+                    ValueError, "^invalid_session_key$"
+                ):
+                    self.runtime.candidate_session_link_key(
+                        self.installation, value
+                    )
+        with self.assertRaisesRegex(
+            ValueError, "^invalid_installation$"
+        ):
+            self.runtime.candidate_session_link_key(
+                None, raw_session_key
+            )
+
+        for label, candidate_id in (
+            ("bool", True),
+            ("float", 1.0),
+            ("string", "1"),
+            ("zero", 0),
+            ("negative", -1),
+            ("overflow", self.runtime.SQLITE_INTEGER_MAX + 1),
+        ):
+            with self.subTest(candidate_id=label):
+                with self.assertRaisesRegex(
+                    ValueError, "^invalid_candidate_id$"
+                ):
+                    self.runtime.candidate_session_link_value(
+                        candidate_id, expiry
+                    )
+                with self.assertRaisesRegex(
+                    ValueError, "^invalid_candidate_id$"
+                ):
+                    self.runtime.candidate_evidence_aggregate_key(
+                        candidate_id
+                    )
+
+        for label, invalid_expiry in (
+            ("non-string", None),
+            ("subclass", StringSubclass(expiry)),
+            ("offset", "2033-11-14T22:13:20+00:00"),
+            ("fractional", "2033-11-14T22:13:20.000Z"),
+            ("missing-z", "2033-11-14T22:13:20"),
+            ("invalid-date", "2033-02-29T22:13:20Z"),
+            ("trailing-space", f"{expiry} "),
+            ("surrogate", f"{expiry}\ud800"),
+        ):
+            with self.subTest(dedupe_expiry=label):
+                with self.assertRaisesRegex(
+                    ValueError, "^invalid_dedupe_expiry$"
+                ):
+                    self.runtime.candidate_session_link_value(
+                        17, invalid_expiry
+                    )

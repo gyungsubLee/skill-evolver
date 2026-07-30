@@ -3210,6 +3210,131 @@ def validate_declarative_result(
     return normalized
 
 
+def normalized_fingerprint_field(value: object) -> str:
+    if type(value) is not str or not value or len(value) > 160:
+        if type(value) is str and len(value) > 160:
+            raise ValueError("fingerprint_field_too_long")
+        raise ValueError("invalid_fingerprint_field")
+    normalized = unicodedata.normalize("NFKC", value)
+    if len(normalized) > 160:
+        raise ValueError("fingerprint_field_too_long")
+    if any(
+        unicodedata.category(character)
+        in FORBIDDEN_CANDIDATE_CATEGORIES
+        or 0xD800 <= ord(character) <= 0xDFFF
+        for character in normalized
+    ):
+        raise ValueError("invalid_fingerprint_field")
+    collapsed = " ".join(normalized.casefold().split())
+    if len(collapsed) > 160:
+        raise ValueError("fingerprint_field_too_long")
+    if not collapsed:
+        raise ValueError("invalid_fingerprint_field")
+    return collapsed
+
+
+def candidate_fingerprint(
+    target_identity: object,
+    problem_category: object,
+    target_locator: object,
+    proposal_intent: object,
+) -> str:
+    if (
+        type(target_identity) is not str
+        or not target_identity
+        or len(target_identity) > CATALOG_IDENTITY_MAX_BYTES
+    ):
+        raise ValueError("invalid_target_identity")
+    try:
+        encoded_identity = target_identity.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("invalid_target_identity") from None
+    if (
+        not target_identity.strip()
+        or len(encoded_identity) > CATALOG_IDENTITY_MAX_BYTES
+        or any(
+            unicodedata.category(character)
+            in FORBIDDEN_CANDIDATE_CATEGORIES
+            or 0xD800 <= ord(character) <= 0xDFFF
+            for character in target_identity
+        )
+    ):
+        raise ValueError("invalid_target_identity")
+    try:
+        normalized_category = normalized_fingerprint_field(
+            problem_category
+        )
+    except ValueError:
+        raise ValueError("invalid_problem_category") from None
+    if normalized_category not in PROBLEM_CATEGORIES:
+        raise ValueError("invalid_problem_category")
+    return sha256_json(
+        {
+            "schema_version": 1,
+            "target_identity": target_identity,
+            "problem_category": normalized_category,
+            "target_locator": normalized_fingerprint_field(
+                target_locator
+            ),
+            "proposal_intent": normalized_fingerprint_field(
+                proposal_intent
+            ),
+        }
+    )
+
+
+def candidate_session_link_key(
+    installation: object,
+    session_key_value: object,
+) -> str:
+    if type(installation) is not Installation:
+        raise ValueError("invalid_installation")
+    if (
+        type(session_key_value) is not str
+        or not _is_lower_hex(session_key_value, 64)
+    ):
+        raise ValueError("invalid_session_key")
+    digest = hmac.new(
+        installation.identity_key.read_bytes(),
+        b"candidate-session\0" + session_key_value.encode("ascii"),
+        "sha256",
+    ).hexdigest()
+    return f"candidate-session.{digest}"
+
+
+def candidate_session_link_value(
+    candidate_id: object,
+    dedupe_expires_at: object,
+) -> dict[str, object]:
+    if (
+        type(candidate_id) is not int
+        or candidate_id < 1
+        or candidate_id > SQLITE_INTEGER_MAX
+    ):
+        raise ValueError("invalid_candidate_id")
+    if type(dedupe_expires_at) is not str:
+        raise ValueError("invalid_dedupe_expiry")
+    try:
+        parse_iso_utc(dedupe_expires_at)
+    except ValueError:
+        raise ValueError("invalid_dedupe_expiry") from None
+    return {
+        "schema_version": 1,
+        "candidate_id": candidate_id,
+        "dedupe_expires_at": dedupe_expires_at,
+    }
+
+
+def candidate_evidence_aggregate_key(candidate_id: object) -> str:
+    if (
+        type(candidate_id) is not int
+        or candidate_id < 1
+        or candidate_id > SQLITE_INTEGER_MAX
+    ):
+        raise ValueError("invalid_candidate_id")
+    return f"candidate.{candidate_id}.evidence_aggregate"
+
+
 def load_review_runtime() -> ReviewRuntime:
     with RUNTIME_REFERENCE_PATH.open("rb") as stream:
         encoded = stream.read(RUNTIME_REFERENCE_MAX_BYTES + 1)
