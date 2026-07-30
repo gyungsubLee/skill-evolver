@@ -10025,7 +10025,6 @@ def atomic_write_bytes(path: Path, value: bytes, mode: int = 0o600) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary_path, path)
-        os.chmod(path, mode)
         fsync_directory(path.parent)
     except BaseException:
         temporary_path.unlink(missing_ok=True)
@@ -11615,6 +11614,8 @@ def spool_session_stop(
     event: CapturedSessionStop,
     key: str,
     now: float,
+    *,
+    coalesce: bool = False,
 ) -> bool:
     if type(event.observed_at_ns) is not int or event.observed_at_ns < 0:
         raise ValueError("invalid_observed_at_ns")
@@ -11643,9 +11644,6 @@ def spool_session_stop(
                 if not entry.name.endswith(".json"):
                     continue
                 files.append(Path(entry.path))
-                if len(files) >= file_limit:
-                    record_spool_overflow(installation)
-                    return False
         if scanned_total + 1 >= MAX_SPOOL_SCAN_ENTRIES:
             record_spool_overflow(installation)
             return False
@@ -11660,15 +11658,42 @@ def spool_session_stop(
             )
             + b"\n"
         )
-        if (
-            len(files) >= file_limit
-            or total + len(encoded) > byte_limit
-        ):
+        destination = installation.spool / (
+            f"session-{key}.json"
+            if coalesce
+            else f"{time.time_ns()}-{os.getpid()}-{secrets.token_hex(4)}.json"
+        )
+        replaced_size = 0
+        if coalesce and destination.exists():
+            state, current_encoded, _identity = read_spool_snapshot(
+                destination
+            )
+            if state != "verified" or current_encoded is None:
+                raise ValueError("invalid_spool_payload")
+            current_payload = json.loads(current_encoded.decode("utf-8"))
+            current, current_key, _created, _expires = event_from_spool(
+                current_payload, installation, config, now
+            )
+            if current_key != key:
+                raise ValueError("invalid_spool_session_key")
+            same_identity = (
+                current.transcript_device == event.transcript_device
+                and current.transcript_inode == event.transcript_inode
+            )
+            newer = event.observed_at_ns > current.observed_at_ns or (
+                event.observed_at_ns == current.observed_at_ns
+                and same_identity
+                and event.transcript_size > current.transcript_size
+            )
+            if not newer:
+                return True
+            replaced_size = len(current_encoded)
+        adds_file = destination not in files
+        projected_files = len(files) + int(adds_file)
+        projected_bytes = total - replaced_size + len(encoded)
+        if projected_files > file_limit or projected_bytes > byte_limit:
             record_spool_overflow(installation)
             return False
-        destination = installation.spool / (
-            f"{time.time_ns()}-{os.getpid()}-{secrets.token_hex(4)}.json"
-        )
         atomic_write_bytes(destination, encoded)
         return True
 
@@ -13314,12 +13339,27 @@ def enqueue_stop(
     installation: Installation,
     config: Config,
     raw: bytes,
+    *,
+    spool_only: bool = False,
 ) -> str:
     event = parse_session_stop(raw, installation, config)
     if event is None:
         return "ignored"
     now = time.time()
     key = session_key(installation, event.session_id)
+    if spool_only:
+        return (
+            "spooled"
+            if spool_session_stop(
+                installation,
+                config,
+                event,
+                key,
+                now,
+                coalesce=True,
+            )
+            else "overflow"
+        )
     try:
         connection = open_database(installation)
         try:
@@ -13365,8 +13405,11 @@ def cmd_enqueue_stop(args: argparse.Namespace) -> int:
     try:
         installation = load_installation(Path(args.installation))
         config = load_config(installation)
+        capture = plugin_spool_installation(
+            installation, Path(args.plugin_data), create=True
+        )
         raw = sys.stdin.buffer.read(MAX_HOOK_BYTES + 1)
-        enqueue_stop(installation, config, raw)
+        enqueue_stop(capture, config, raw, spool_only=True)
     except Exception:
         pass
     return 0
@@ -13730,6 +13773,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.set_defaults(handler=cmd_init)
     enqueue = commands.add_parser("enqueue-stop")
     add_installation_argument(enqueue)
+    enqueue.add_argument("--plugin-data")
     enqueue.set_defaults(handler=cmd_enqueue_stop)
     maintain = commands.add_parser("maintain")
     add_installation_argument(maintain)

@@ -35,6 +35,19 @@ class RuntimeStoreTests(unittest.TestCase):
             "exclude_roots": [str(self.excluded)],
         }
 
+    def test_atomic_write_does_not_chmod_published_path_by_name(self) -> None:
+        parent = self.base / "atomic-parent"
+        parent.mkdir(mode=0o700)
+        target = parent / "payload.json"
+        with mock.patch.object(
+            os,
+            "chmod",
+            side_effect=AssertionError("path chmod race"),
+        ):
+            self.runtime.atomic_write_bytes(target, b"payload\n")
+        self.assertEqual(target.read_bytes(), b"payload\n")
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+
     def replace_transcript_roots(
         self, installation_path: Path, transcript_roots: tuple[Path, ...]
     ) -> None:
@@ -725,6 +738,119 @@ class SessionCaptureTests(unittest.TestCase):
             "cwd": str(self.workspace),
             "transcript_path": str(self.transcript),
         }
+
+    def plugin_runtime(self) -> tuple[Path, object]:
+        plugin_data = (
+            self.installation.data_root.parent
+            / "plugins/data/skill-evolver-skill-evolver-dev"
+        )
+        plugin_data.mkdir(mode=0o700, parents=True)
+        runtime = replace(
+            self.runtime.load_review_runtime(),
+            plugin_data=plugin_data,
+        )
+        return plugin_data, runtime
+
+    def test_hook_uses_plugin_data_when_canonical_store_is_read_only(
+        self,
+    ) -> None:
+        plugin_data, runtime = self.plugin_runtime()
+        before = self.installation.database.read_bytes()
+        args = Namespace(
+            installation=str(self.installation_path),
+            plugin_data=str(plugin_data),
+        )
+        stdin = mock.Mock()
+        stdin.buffer.read.return_value = json.dumps(self.payload).encode()
+        with (
+            mock.patch.object(
+                self.runtime, "load_review_runtime", return_value=runtime
+            ),
+            mock.patch.object(self.runtime.sys, "stdin", stdin),
+            mock.patch.object(
+                self.runtime,
+                "open_database",
+                side_effect=AssertionError("Hook must not open SQLite"),
+            ),
+        ):
+            self.assertEqual(self.runtime.cmd_enqueue_stop(args), 0)
+        payloads = list((plugin_data / "stop-spool").glob("*.json"))
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(self.installation.database.read_bytes(), before)
+        self.assertEqual(list(self.installation.spool.iterdir()), [])
+        self.assertNotIn(
+            self.transcript.read_bytes().strip(),
+            payloads[0].read_bytes(),
+        )
+
+    def test_plugin_ingress_coalesces_repeated_session_stops(self) -> None:
+        plugin_data, runtime = self.plugin_runtime()
+        bound = None
+        with mock.patch.object(
+            self.runtime, "load_review_runtime", return_value=runtime
+        ):
+            bound = self.runtime.plugin_spool_installation(
+                self.installation, plugin_data, create=True
+            )
+        raw = json.dumps(self.payload).encode()
+        self.assertEqual(
+            self.runtime.enqueue_stop(
+                bound, self.runtime_config, raw, spool_only=True
+            ),
+            "spooled",
+        )
+        first = next(bound.spool.glob("*.json")).read_bytes()
+        with self.transcript.open("ab") as stream:
+            stream.write(b"new-boundary-without-transcript-read\n")
+        self.assertEqual(
+            self.runtime.enqueue_stop(
+                bound, self.runtime_config, raw, spool_only=True
+            ),
+            "spooled",
+        )
+        payloads = list(bound.spool.glob("*.json"))
+        self.assertEqual(len(payloads), 1)
+        self.assertNotEqual(payloads[0].read_bytes(), first)
+
+    def test_plugin_ingress_rejects_stale_replacement(self) -> None:
+        plugin_data, runtime = self.plugin_runtime()
+        with mock.patch.object(
+            self.runtime, "load_review_runtime", return_value=runtime
+        ):
+            bound = self.runtime.plugin_spool_installation(
+                self.installation, plugin_data, create=True
+            )
+        event = self.runtime.parse_session_stop(
+            json.dumps(self.payload).encode(),
+            bound,
+            self.runtime_config,
+        )
+        assert event is not None
+        key = self.runtime.session_key(bound, event.session_id)
+        newer = replace(event, observed_at_ns=event.observed_at_ns + 1)
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                bound,
+                self.runtime_config,
+                newer,
+                key,
+                time.time(),
+                coalesce=True,
+            )
+        )
+        payload = next(bound.spool.glob("*.json"))
+        before = payload.read_bytes()
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                bound,
+                self.runtime_config,
+                event,
+                key,
+                time.time(),
+                coalesce=True,
+            )
+        )
+        self.assertEqual(payload.read_bytes(), before)
 
     def test_missing_turn_id_uses_exact_session_hmac(self) -> None:
         event = self.runtime.parse_session_stop(
