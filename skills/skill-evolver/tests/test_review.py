@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import inspect
 import json
@@ -8,8 +9,10 @@ import secrets
 import sqlite3
 import stat
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -3078,3 +3081,704 @@ class FrozenTranscriptIdentityTests(FrozenTranscriptTestCase):
                     self.runtime._close_transcript_descriptor(-1)
         finally:
             connection.close()
+
+
+class ResultNamespaceTests(BatchExportTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.result_parent = self.base / "private-tmp"
+        self.result_parent.mkdir(mode=0o700)
+
+    def test_metadata_keys_and_allocated_file_are_exact(self) -> None:
+        with mock.patch.object(
+            self.runtime,
+            "REVIEW_RESULT_PARENT",
+            self.result_parent,
+        ):
+            allocated = self.runtime._allocate_review_result_file(
+                2_000_000_000.0
+            )
+        self.assertEqual(
+            self.runtime.review_contract_key(7),
+            "review.batch.7.contract",
+        )
+        self.assertEqual(
+            self.runtime.review_result_key(7),
+            "review.batch.7.result",
+        )
+        self.assertEqual(
+            self.runtime.review_audit_key(7),
+            "review.batch.7.audit",
+        )
+        self.assertRegex(
+            allocated.basename,
+            r"\Aresult-[0-9a-f]{32}\.json\Z",
+        )
+        root = allocated.path.parent
+        self.assertEqual(root.parent, self.result_parent)
+        self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o700)
+        info = allocated.path.stat()
+        self.assertEqual(stat.S_IMODE(info.st_mode), 0o600)
+        self.assertEqual(info.st_nlink, 1)
+        self.assertEqual(
+            (allocated.device, allocated.inode),
+            (info.st_dev, info.st_ino),
+        )
+        self.assertEqual(
+            tuple(self.runtime.BoundReviewResult.__dataclass_fields__),
+            (
+                "batch_id",
+                "path",
+                "basename",
+                "device",
+                "inode",
+                "encoded",
+            ),
+        )
+        self.assertEqual(
+            (
+                self.runtime.REVIEW_RESULT_MAX_BYTES,
+                self.runtime.REVIEW_RESULT_MAX_FILES,
+                self.runtime.REVIEW_RESULT_SCAN_MAX,
+                self.runtime.REVIEW_RESULT_TTL_SECONDS,
+                self.runtime.REVIEW_BATCH_AUDIT_TTL_SECONDS,
+            ),
+            (262_144, 200, 201, 3_600, 90 * 86_400),
+        )
+        for invalid_batch_id in (True, 0, -1):
+            for key_helper in (
+                self.runtime.review_contract_key,
+                self.runtime.review_result_key,
+                self.runtime.review_audit_key,
+            ):
+                with self.subTest(
+                    invalid_batch_id=invalid_batch_id,
+                    key_helper=key_helper.__name__,
+                ), self.assertRaisesRegex(
+                    ValueError, "invalid_review_batch_id"
+                ):
+                    key_helper(invalid_batch_id)
+
+        with mock.patch.object(
+            self.runtime,
+            "REVIEW_RESULT_PARENT",
+            self.result_parent,
+        ):
+            self.assertTrue(
+                self.runtime.delete_bound_review_result(allocated)
+            )
+            root = self.runtime.review_result_root()
+            real_close = os.close
+            for error_type in (OSError, RuntimeError):
+                with self.subTest(
+                    allocation_operation="fchmod",
+                    error=error_type.__name__,
+                ), mock.patch.object(
+                    self.runtime.os,
+                    "fchmod",
+                    side_effect=error_type("synthetic fchmod failure"),
+                ), mock.patch.object(
+                    self.runtime.os,
+                    "close",
+                    wraps=real_close,
+                ) as close, self.assertRaisesRegex(
+                    ValueError, "review_result_file_invalid"
+                ):
+                    self.runtime._allocate_review_result_file(
+                        2_000_000_000.0
+                    )
+                self.assertEqual(close.call_count, 2)
+                self.assertEqual(
+                    len({call.args[0] for call in close.call_args_list}),
+                    2,
+                )
+                self.assertEqual(list(root.iterdir()), [])
+
+            def assert_descriptor_closed(descriptor: int) -> None:
+                with self.assertRaises(OSError) as caught:
+                    os.fstat(descriptor)
+                self.assertEqual(caught.exception.errno, errno.EBADF)
+
+            for error_type in (OSError, RuntimeError):
+                captured: list[int] = []
+                failed = False
+
+                def fail_result_close(descriptor: int) -> None:
+                    nonlocal failed
+                    if (
+                        not failed
+                        and stat.S_ISREG(os.fstat(descriptor).st_mode)
+                    ):
+                        failed = True
+                        captured.append(descriptor)
+                        raise error_type(
+                            "synthetic result close failure"
+                        )
+                    real_close(descriptor)
+
+                with self.subTest(
+                    close_target="result",
+                    error=error_type.__name__,
+                ), mock.patch.object(
+                    self.runtime.os,
+                    "close",
+                    side_effect=fail_result_close,
+                ), self.assertRaisesRegex(
+                    ValueError, "review_result_file_invalid"
+                ):
+                    self.runtime._allocate_review_result_file(
+                        2_000_000_000.0
+                    )
+                self.assertEqual(len(captured), 1)
+                assert_descriptor_closed(captured[0])
+                self.assertEqual(list(root.iterdir()), [])
+
+            for interrupt_type in (KeyboardInterrupt, SystemExit):
+                captured = []
+                failed = False
+
+                def interrupt_result_close(descriptor: int) -> None:
+                    nonlocal failed
+                    if (
+                        not failed
+                        and stat.S_ISREG(os.fstat(descriptor).st_mode)
+                    ):
+                        failed = True
+                        captured.append(descriptor)
+                        raise interrupt_type()
+                    real_close(descriptor)
+
+                with self.subTest(
+                    close_target="result",
+                    interrupt=interrupt_type.__name__,
+                ), mock.patch.object(
+                    self.runtime.os,
+                    "close",
+                    side_effect=interrupt_result_close,
+                ), self.assertRaises(interrupt_type):
+                    self.runtime._allocate_review_result_file(
+                        2_000_000_000.0
+                    )
+                self.assertEqual(len(captured), 1)
+                assert_descriptor_closed(captured[0])
+                self.assertEqual(list(root.iterdir()), [])
+
+            for error_type in (OSError, RuntimeError):
+                with self.subTest(
+                    allocation_operation="flock",
+                    error=error_type.__name__,
+                ), mock.patch.object(
+                    self.runtime.fcntl,
+                    "flock",
+                    side_effect=error_type("synthetic flock failure"),
+                ), mock.patch.object(
+                    self.runtime.os,
+                    "close",
+                    wraps=real_close,
+                ) as close, self.assertRaisesRegex(
+                    ValueError, "review_result_root_invalid"
+                ):
+                    self.runtime._allocate_review_result_file(
+                        2_000_000_000.0
+                    )
+                close.assert_called_once()
+                self.assertEqual(list(root.iterdir()), [])
+
+            real_flock = self.runtime.fcntl.flock
+            for error_type in (OSError, RuntimeError):
+                lock_descriptors: list[int] = []
+                failed = False
+
+                def record_flock(descriptor: int, operation: int) -> None:
+                    lock_descriptors.append(descriptor)
+                    real_flock(descriptor, operation)
+
+                def fail_lock_close(descriptor: int) -> None:
+                    nonlocal failed
+                    if (
+                        not failed
+                        and lock_descriptors
+                        and descriptor == lock_descriptors[-1]
+                    ):
+                        failed = True
+                        raise error_type("synthetic lock close failure")
+                    real_close(descriptor)
+
+                with self.subTest(
+                    close_target="lock",
+                    error=error_type.__name__,
+                ), mock.patch.object(
+                    self.runtime.fcntl,
+                    "flock",
+                    side_effect=record_flock,
+                ), mock.patch.object(
+                    self.runtime.os,
+                    "close",
+                    side_effect=fail_lock_close,
+                ):
+                    closed_lock_result = (
+                        self.runtime._allocate_review_result_file(
+                            2_000_000_000.0
+                        )
+                    )
+                self.assertEqual(len(lock_descriptors), 1)
+                assert_descriptor_closed(lock_descriptors[0])
+                self.assertTrue(
+                    self.runtime.delete_bound_review_result(
+                        closed_lock_result
+                    )
+                )
+
+            for interrupt_type in (KeyboardInterrupt, SystemExit):
+                lock_descriptors = []
+                failed = False
+
+                def record_flock(descriptor: int, operation: int) -> None:
+                    lock_descriptors.append(descriptor)
+                    real_flock(descriptor, operation)
+
+                def interrupt_lock_close(descriptor: int) -> None:
+                    nonlocal failed
+                    if (
+                        not failed
+                        and lock_descriptors
+                        and descriptor == lock_descriptors[-1]
+                    ):
+                        failed = True
+                        raise interrupt_type()
+                    real_close(descriptor)
+
+                with self.subTest(
+                    close_target="lock",
+                    interrupt=interrupt_type.__name__,
+                ), mock.patch.object(
+                    self.runtime.fcntl,
+                    "flock",
+                    side_effect=record_flock,
+                ), mock.patch.object(
+                    self.runtime.os,
+                    "close",
+                    side_effect=interrupt_lock_close,
+                ), self.assertRaises(interrupt_type):
+                    self.runtime._allocate_review_result_file(
+                        2_000_000_000.0
+                    )
+                self.assertEqual(len(lock_descriptors), 1)
+                assert_descriptor_closed(lock_descriptors[0])
+                created = list(root.iterdir())
+                self.assertEqual(len(created), 1)
+                created[0].unlink()
+
+            for interrupt_type in (KeyboardInterrupt, SystemExit):
+                with self.subTest(
+                    allocation_operation="flock",
+                    interrupt=interrupt_type.__name__,
+                ), mock.patch.object(
+                    self.runtime.fcntl,
+                    "flock",
+                    side_effect=interrupt_type(),
+                ), mock.patch.object(
+                    self.runtime.os,
+                    "close",
+                    wraps=real_close,
+                ) as close, self.assertRaises(interrupt_type):
+                    self.runtime._allocate_review_result_file(
+                        2_000_000_000.0
+                    )
+                close.assert_called_once()
+                self.assertEqual(list(root.iterdir()), [])
+
+            for interrupt_type in (KeyboardInterrupt, SystemExit):
+                with self.subTest(
+                    allocation_operation="fchmod",
+                    interrupt=interrupt_type.__name__,
+                ), mock.patch.object(
+                    self.runtime.os,
+                    "fchmod",
+                    side_effect=interrupt_type(),
+                ), self.assertRaises(interrupt_type):
+                    self.runtime._allocate_review_result_file(
+                        2_000_000_000.0
+                    )
+                self.assertEqual(list(root.iterdir()), [])
+
+            with mock.patch.object(
+                self.runtime,
+                "fsync_directory",
+                side_effect=RuntimeError(
+                    "synthetic directory fsync failure"
+                ),
+            ), self.assertRaisesRegex(
+                ValueError, "review_result_file_invalid"
+            ):
+                self.runtime._allocate_review_result_file(
+                    2_000_000_000.0
+                )
+            self.assertEqual(list(root.iterdir()), [])
+
+            def replace_then_fail(_root: Path) -> None:
+                created = next(root.iterdir())
+                created.unlink()
+                created.write_bytes(b"foreign")
+                created.chmod(0o600)
+                raise RuntimeError("synthetic post-create fsync failure")
+
+            with mock.patch.object(
+                self.runtime,
+                "fsync_directory",
+                side_effect=replace_then_fail,
+            ), self.assertRaisesRegex(
+                ValueError, "review_result_file_invalid"
+            ):
+                self.runtime._allocate_review_result_file(
+                    2_000_000_000.0
+                )
+            replacements = list(root.iterdir())
+            self.assertEqual(len(replacements), 1)
+            self.assertEqual(replacements[0].read_bytes(), b"foreign")
+            replacements[0].unlink()
+
+        with mock.patch.object(
+            Path,
+            "resolve",
+            side_effect=ValueError("synthetic resolve failure"),
+        ), self.assertRaisesRegex(
+            ValueError, "review_result_parent_invalid"
+        ):
+            self.runtime.review_result_root()
+
+    def test_cleanup_reads_at_most_201_entries_and_refuses_saturation(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        with mock.patch.object(
+            self.runtime,
+            "REVIEW_RESULT_PARENT",
+            self.result_parent,
+        ):
+            root = self.runtime.review_result_root()
+            for index in range(200):
+                path = root / f"result-{index:032x}.json"
+                path.write_bytes(b"")
+                path.chmod(0o600)
+                recent_ns = int(now * 1_000_000_000)
+                os.utime(path, ns=(recent_ns, recent_ns))
+            result = self.runtime.cleanup_review_results(
+                now
+            )
+            self.assertEqual(result["result_scan_entries"], 200)
+            extra = root / f"result-{200:032x}.json"
+            extra.write_bytes(b"")
+            extra.chmod(0o600)
+            os.utime(extra, ns=(recent_ns, recent_ns))
+            inspected = 0
+            real_scandir = os.scandir
+
+            def counted_scandir(path: object):
+                iterator = real_scandir(path)
+
+                class Counted:
+                    def __enter__(self):
+                        iterator.__enter__()
+                        return self
+
+                    def __exit__(self, *args: object):
+                        return iterator.__exit__(*args)
+
+                    def __iter__(self):
+                        return self
+
+                    def __next__(self):
+                        nonlocal inspected
+                        value = next(iterator)
+                        inspected += 1
+                        return value
+
+                return Counted()
+
+            with mock.patch.object(
+                self.runtime.os,
+                "scandir",
+                side_effect=counted_scandir,
+            ), self.assertRaisesRegex(
+                ValueError, "review_result_namespace_saturated"
+            ):
+                self.runtime.cleanup_review_results(now)
+        self.assertEqual(inspected, 201)
+
+        class BrokenScan:
+            def __init__(self, error: BaseException):
+                self.error = error
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args: object):
+                return False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise self.error
+
+        for error_type in (OSError, RuntimeError):
+            with self.subTest(
+                scan_error=error_type.__name__
+            ), mock.patch.object(
+                self.runtime,
+                "REVIEW_RESULT_PARENT",
+                self.result_parent,
+            ), mock.patch.object(
+                self.runtime.os,
+                "scandir",
+                return_value=BrokenScan(
+                    error_type("synthetic scan failure")
+                ),
+            ), self.assertRaisesRegex(
+                ValueError, "review_result_root_invalid"
+            ):
+                self.runtime.cleanup_review_results(now)
+
+        for interrupt_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(
+                scan_interrupt=interrupt_type.__name__
+            ), mock.patch.object(
+                self.runtime,
+                "REVIEW_RESULT_PARENT",
+                self.result_parent,
+            ), mock.patch.object(
+                self.runtime.os,
+                "scandir",
+                return_value=BrokenScan(interrupt_type()),
+            ), self.assertRaises(interrupt_type):
+                self.runtime.cleanup_review_results(now)
+
+        with mock.patch.object(
+            self.runtime,
+            "REVIEW_RESULT_PARENT",
+            self.result_parent,
+        ):
+            root = self.runtime.review_result_root()
+            for path in root.iterdir():
+                path.unlink()
+            for index in range(199):
+                path = root / f"result-{index:032x}.json"
+                path.write_bytes(b"")
+                path.chmod(0o600)
+            real_bounded = self.runtime._bounded_review_result_paths
+            rendezvous = threading.Barrier(2)
+
+            def synchronized_paths(result_root: Path):
+                paths = real_bounded(result_root)
+                try:
+                    rendezvous.wait(timeout=0.25)
+                except threading.BrokenBarrierError:
+                    pass
+                return paths
+
+            def allocate() -> object:
+                try:
+                    return self.runtime._allocate_review_result_file(now)
+                except ValueError as error:
+                    return str(error)
+
+            with mock.patch.object(
+                self.runtime,
+                "_bounded_review_result_paths",
+                side_effect=synchronized_paths,
+            ), ThreadPoolExecutor(max_workers=2) as executor:
+                outcomes = list(executor.map(lambda _index: allocate(), range(2)))
+            successes = [
+                outcome
+                for outcome in outcomes
+                if isinstance(outcome, self.runtime.BoundReviewResult)
+            ]
+            failures = [
+                outcome for outcome in outcomes if isinstance(outcome, str)
+            ]
+            self.assertEqual(len(successes), 1)
+            self.assertEqual(
+                failures, ["review_result_namespace_saturated"]
+            )
+            self.assertEqual(len(list(root.iterdir())), 200)
+
+    def test_cleanup_deletes_only_old_safe_single_link_results(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        with mock.patch.object(
+            self.runtime,
+            "REVIEW_RESULT_PARENT",
+            self.result_parent,
+        ):
+            root = self.runtime.review_result_root()
+            old_safe = root / f"result-{'1' * 32}.json"
+            old_safe.write_bytes(b"old")
+            old_safe.chmod(0o600)
+            old_unsafe = root / f"result-{'2' * 32}.json"
+            old_unsafe.write_bytes(b"unsafe")
+            old_unsafe.chmod(0o644)
+            recent = root / f"result-{'3' * 32}.json"
+            recent.write_bytes(b"recent")
+            recent.chmod(0o600)
+            old_ns = int((now - 3_601) * 1_000_000_000)
+            os.utime(old_safe, ns=(old_ns, old_ns))
+            os.utime(old_unsafe, ns=(old_ns, old_ns))
+            recent_ns = int((now - 3_599) * 1_000_000_000)
+            os.utime(recent, ns=(recent_ns, recent_ns))
+            real_lstat = os.lstat
+
+            def failing_result_lstat(error: BaseException):
+                def fail(
+                    path: object,
+                    *args: object,
+                    **kwargs: object,
+                ):
+                    if Path(path).parent == root:
+                        raise error
+                    return real_lstat(path, *args, **kwargs)
+
+                return fail
+
+            for error_type in (OSError, RuntimeError):
+                with self.subTest(
+                    lstat_error=error_type.__name__
+                ), mock.patch.object(
+                    self.runtime.os,
+                    "lstat",
+                    side_effect=failing_result_lstat(
+                        error_type("synthetic lstat failure")
+                    ),
+                ):
+                    preserved = self.runtime.cleanup_review_results(
+                        now
+                    )
+                self.assertEqual(
+                    (
+                        preserved["result_files_deleted"],
+                        preserved["result_files_preserved"],
+                    ),
+                    (0, 3),
+                )
+            for interrupt_type in (KeyboardInterrupt, SystemExit):
+                with self.subTest(
+                    lstat_interrupt=interrupt_type.__name__
+                ), mock.patch.object(
+                    self.runtime.os,
+                    "lstat",
+                    side_effect=failing_result_lstat(interrupt_type()),
+                ), self.assertRaises(interrupt_type):
+                    self.runtime.cleanup_review_results(now)
+            result = self.runtime.cleanup_review_results(now)
+        self.assertEqual(result["result_files_deleted"], 1)
+        self.assertFalse(old_safe.exists())
+        self.assertEqual(old_unsafe.read_bytes(), b"unsafe")
+        self.assertEqual(recent.read_bytes(), b"recent")
+
+    def test_exact_identity_delete_preserves_a_swapped_replacement(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        with mock.patch.object(
+            self.runtime,
+            "REVIEW_RESULT_PARENT",
+            self.result_parent,
+        ):
+            allocated = self.runtime._allocate_review_result_file(now)
+            allocated.path.unlink()
+            allocated.path.write_bytes(b"foreign")
+            allocated.path.chmod(0o600)
+            removed = self.runtime.delete_bound_review_result(allocated)
+        self.assertFalse(removed)
+        self.assertEqual(allocated.path.read_bytes(), b"foreign")
+        allocated.path.unlink()
+
+        with mock.patch.object(
+            self.runtime,
+            "REVIEW_RESULT_PARENT",
+            self.result_parent,
+        ):
+            root = self.runtime.review_result_root()
+            real_lstat = os.lstat
+
+            def failing_result_lstat(error: BaseException):
+                def fail(
+                    path: object,
+                    *args: object,
+                    **kwargs: object,
+                ):
+                    if Path(path).parent == root:
+                        raise error
+                    return real_lstat(path, *args, **kwargs)
+
+                return fail
+
+            for error_type in (OSError, RuntimeError):
+                allocated = self.runtime._allocate_review_result_file(
+                    now
+                )
+                with self.subTest(
+                    unlink_error=error_type.__name__
+                ), mock.patch.object(
+                    self.runtime.os,
+                    "unlink",
+                    side_effect=error_type(
+                        "synthetic unlink failure"
+                    ),
+                ):
+                    self.assertFalse(
+                        self.runtime.delete_bound_review_result(
+                            allocated
+                        )
+                    )
+                self.assertTrue(allocated.path.exists())
+                allocated.path.unlink()
+
+                allocated = self.runtime._allocate_review_result_file(
+                    now
+                )
+                with self.subTest(
+                    lstat_error=error_type.__name__
+                ), mock.patch.object(
+                    self.runtime.os,
+                    "lstat",
+                    side_effect=failing_result_lstat(
+                        error_type("synthetic lstat failure")
+                    ),
+                ):
+                    self.assertFalse(
+                        self.runtime.delete_bound_review_result(
+                            allocated
+                        )
+                    )
+                self.assertTrue(allocated.path.exists())
+                allocated.path.unlink()
+
+            for interrupt_type in (KeyboardInterrupt, SystemExit):
+                allocated = self.runtime._allocate_review_result_file(
+                    now
+                )
+                with self.subTest(
+                    unlink_interrupt=interrupt_type.__name__
+                ), mock.patch.object(
+                    self.runtime.os,
+                    "unlink",
+                    side_effect=interrupt_type(),
+                ), self.assertRaises(interrupt_type):
+                    self.runtime.delete_bound_review_result(allocated)
+                self.assertTrue(allocated.path.exists())
+                allocated.path.unlink()
+
+            allocated = self.runtime._allocate_review_result_file(now)
+            with mock.patch.object(
+                self.runtime,
+                "fsync_directory",
+                side_effect=RuntimeError(
+                    "synthetic directory fsync failure"
+                ),
+            ):
+                self.assertFalse(
+                    self.runtime.delete_bound_review_result(allocated)
+                )
+            self.assertFalse(allocated.path.exists())

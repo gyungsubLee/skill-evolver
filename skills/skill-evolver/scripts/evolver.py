@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional, Sequence, TypedDict
@@ -49,6 +50,374 @@ POLICY_MAX_BYTES = 8_192
 RESULT_SCHEMA_INSTRUCTIONS_MAX_BYTES = 8_192
 CLAIM_CONTRACT_OVERHEAD_MAX_BYTES = 8_192
 FIXED_MUTABLE_SKILL_ROOTS = (Path("/Users/igyeongseob/.codex/skills"),)
+
+REVIEW_RESULT_PARENT = Path("/private/tmp")
+REVIEW_RESULT_PREFIX = "skill-evolver-review-results-"
+REVIEW_RESULT_NAME = re.compile(r"\Aresult-[0-9a-f]{32}\.json\Z")
+REVIEW_RESULT_MAX_BYTES = 262_144
+REVIEW_RESULT_MAX_FILES = 200
+REVIEW_RESULT_SCAN_MAX = 201
+REVIEW_RESULT_TTL_SECONDS = 3_600
+REVIEW_BATCH_AUDIT_TTL_SECONDS = 90 * 86_400
+
+
+@dataclass(frozen=True)
+class BoundReviewResult:
+    batch_id: int
+    path: Path
+    basename: str
+    device: int
+    inode: int
+    encoded: bytes
+
+
+def review_contract_key(batch_id: int) -> str:
+    if type(batch_id) is not int or batch_id < 1:
+        raise ValueError("invalid_review_batch_id")
+    return f"review.batch.{batch_id}.contract"
+
+
+def review_result_key(batch_id: int) -> str:
+    if type(batch_id) is not int or batch_id < 1:
+        raise ValueError("invalid_review_batch_id")
+    return f"review.batch.{batch_id}.result"
+
+
+def review_audit_key(batch_id: int) -> str:
+    if type(batch_id) is not int or batch_id < 1:
+        raise ValueError("invalid_review_batch_id")
+    return f"review.batch.{batch_id}.audit"
+
+
+def review_result_root() -> Path:
+    parent = REVIEW_RESULT_PARENT
+    if not isinstance(parent, Path):
+        raise ValueError("review_result_parent_invalid")
+    try:
+        resolved_parent = parent.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError("review_result_parent_invalid") from None
+    if resolved_parent != parent:
+        raise ValueError("review_result_parent_invalid")
+    root = parent / f"{REVIEW_RESULT_PREFIX}{os.getuid()}"
+    try:
+        os.mkdir(root, 0o700)
+    except FileExistsError:
+        pass
+    except (OSError, RuntimeError):
+        raise ValueError("review_result_root_invalid") from None
+    try:
+        root_is_symlink = root.is_symlink()
+        resolved = root.resolve(strict=True)
+        info = os.stat(resolved, follow_symlinks=False)
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError("review_result_root_invalid") from None
+    if (
+        root_is_symlink
+        or resolved != root
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise ValueError("review_result_root_invalid")
+    return root
+
+
+def _close_review_descriptor(descriptor: int) -> None:
+    try:
+        os.close(descriptor)
+    except BaseException:
+        try:
+            os.closerange(descriptor, descriptor + 1)
+        except BaseException:
+            pass
+        raise
+
+
+@contextmanager
+def _locked_review_result_root():
+    root = review_result_root()
+    descriptor: Optional[int] = None
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(str(root), flags)
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            raise ValueError("review_result_root_invalid")
+        # ponytail: cooperative same-UID and write-before-delete are the ceiling;
+        # upgrade to descriptor-relative/quarantine deletion for hostile races.
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+    except ValueError:
+        if descriptor is not None:
+            try:
+                _close_review_descriptor(descriptor)
+            except (OSError, RuntimeError):
+                pass
+        raise
+    except (OSError, RuntimeError):
+        if descriptor is not None:
+            try:
+                _close_review_descriptor(descriptor)
+            except (OSError, RuntimeError):
+                pass
+        raise ValueError("review_result_root_invalid") from None
+    except BaseException:
+        if descriptor is not None:
+            try:
+                _close_review_descriptor(descriptor)
+            except (OSError, RuntimeError):
+                pass
+        raise
+    try:
+        yield root
+    finally:
+        try:
+            _close_review_descriptor(descriptor)
+        except (OSError, RuntimeError):
+            pass
+
+
+def _bounded_review_result_paths(root: Path) -> list[Path]:
+    paths: list[Path] = []
+    inspected = 0
+    try:
+        with os.scandir(root) as entries:
+            iterator = iter(entries)
+            while True:
+                try:
+                    entry = next(iterator)
+                except StopIteration:
+                    break
+                inspected += 1
+                if inspected >= REVIEW_RESULT_SCAN_MAX:
+                    raise ValueError(
+                        "review_result_namespace_saturated"
+                    )
+                paths.append(Path(entry.path))
+    except ValueError:
+        raise
+    except (OSError, RuntimeError):
+        raise ValueError("review_result_root_invalid") from None
+    return paths
+
+
+def _safe_review_result_info(
+    path: Path,
+    root: Optional[Path] = None,
+) -> Optional[os.stat_result]:
+    if not isinstance(path, Path):
+        return None
+    if root is None:
+        root = review_result_root()
+    if (
+        path.parent != root
+        or REVIEW_RESULT_NAME.fullmatch(path.name) is None
+    ):
+        return None
+    try:
+        info = os.lstat(path)
+    except (OSError, RuntimeError):
+        return None
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_nlink != 1
+    ):
+        return None
+    return info
+
+
+def _delete_bound_review_result_unlocked(
+    opened: BoundReviewResult,
+    root: Path,
+) -> bool:
+    if not isinstance(opened, BoundReviewResult):
+        return False
+    if (
+        not isinstance(opened.path, Path)
+        or not isinstance(opened.basename, str)
+        or type(opened.device) is not int
+        or opened.device < 0
+        or type(opened.inode) is not int
+        or opened.inode < 0
+        or opened.path.name != opened.basename
+        or opened.path.parent != root
+        or REVIEW_RESULT_NAME.fullmatch(opened.basename) is None
+    ):
+        return False
+    try:
+        info = _safe_review_result_info(opened.path, root)
+    except ValueError:
+        return False
+    if (
+        info is None
+        or (info.st_dev, info.st_ino)
+        != (opened.device, opened.inode)
+    ):
+        return False
+    try:
+        os.unlink(opened.path)
+        fsync_directory(opened.path.parent)
+    except (OSError, RuntimeError):
+        return False
+    return True
+
+
+def delete_bound_review_result(opened: BoundReviewResult) -> bool:
+    try:
+        with _locked_review_result_root() as root:
+            return _delete_bound_review_result_unlocked(opened, root)
+    except ValueError:
+        return False
+
+
+def cleanup_review_results(now: float) -> dict[str, int]:
+    with _locked_review_result_root() as root:
+        paths = _bounded_review_result_paths(root)
+        deleted = preserved = 0
+        cutoff_ns = int(
+            (now - REVIEW_RESULT_TTL_SECONDS) * 1_000_000_000
+        )
+        for path in paths:
+            info = _safe_review_result_info(path, root)
+            if info is None or info.st_mtime_ns > cutoff_ns:
+                preserved += 1
+                continue
+            opened = BoundReviewResult(
+                batch_id=0,
+                path=path,
+                basename=path.name,
+                device=info.st_dev,
+                inode=info.st_ino,
+                encoded=b"",
+            )
+            if _delete_bound_review_result_unlocked(opened, root):
+                deleted += 1
+            else:
+                preserved += 1
+        return {
+            "result_scan_entries": len(paths),
+            "result_files_deleted": deleted,
+            "result_files_preserved": preserved,
+            "result_scan_saturated": 0,
+        }
+
+
+def _allocate_review_result_file(now: float) -> BoundReviewResult:
+    with _locked_review_result_root() as root:
+        return _allocate_review_result_file_unlocked(now, root)
+
+
+def _allocate_review_result_file_unlocked(
+    now: float,
+    root: Path,
+) -> BoundReviewResult:
+    if len(_bounded_review_result_paths(root)) >= REVIEW_RESULT_MAX_FILES:
+        raise ValueError("review_result_namespace_saturated")
+
+    def discard(
+        path: Path,
+        descriptor: Optional[int] = None,
+        info: Optional[os.stat_result] = None,
+    ) -> None:
+        if descriptor is not None:
+            try:
+                _close_review_descriptor(descriptor)
+            except (OSError, RuntimeError):
+                pass
+        if info is not None:
+            _delete_bound_review_result_unlocked(
+                BoundReviewResult(
+                    batch_id=0,
+                    path=path,
+                    basename=path.name,
+                    device=info.st_dev,
+                    inode=info.st_ino,
+                    encoded=b"",
+                ),
+                root,
+            )
+            return
+        try:
+            os.unlink(path)
+        except (OSError, RuntimeError):
+            pass
+
+    for _attempt in range(32):
+        basename = f"result-{secrets.token_hex(16)}.json"
+        path = root / basename
+        try:
+            descriptor = os.open(
+                str(path),
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_NONBLOCK
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+        except FileExistsError:
+            continue
+        except (OSError, RuntimeError):
+            raise ValueError("review_result_file_invalid") from None
+        info: Optional[os.stat_result] = None
+        try:
+            os.fchmod(descriptor, 0o600)
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_nlink != 1
+                or info.st_size != 0
+            ):
+                raise ValueError("review_result_file_invalid")
+            os.fsync(descriptor)
+        except ValueError:
+            discard(path, descriptor, info)
+            raise
+        except (OSError, RuntimeError):
+            discard(path, descriptor, info)
+            raise ValueError("review_result_file_invalid") from None
+        except BaseException:
+            discard(path, descriptor, info)
+            raise
+        try:
+            _close_review_descriptor(descriptor)
+        except (OSError, RuntimeError):
+            discard(path, info=info)
+            raise ValueError("review_result_file_invalid") from None
+        except BaseException:
+            discard(path, info=info)
+            raise
+        try:
+            fsync_directory(root)
+        except (OSError, RuntimeError):
+            discard(path, info=info)
+            raise ValueError("review_result_file_invalid") from None
+        except BaseException:
+            discard(path, info=info)
+            raise
+        return BoundReviewResult(
+            batch_id=0,
+            path=path,
+            basename=basename,
+            device=info.st_dev,
+            inode=info.st_ino,
+            encoded=b"",
+        )
+    raise ValueError("review_result_allocation_collision")
+
 
 REVIEW_RUNTIME_FIXED = {
     "review_batch_sessions": REVIEW_BATCH_SESSIONS_MAX,
