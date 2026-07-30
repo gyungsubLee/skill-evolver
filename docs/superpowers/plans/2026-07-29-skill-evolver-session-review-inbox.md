@@ -15,6 +15,9 @@ implementation plans linked below.
 - Phase 4 keeps SQLite schema v1, the standard library and the single-file
   runtime. It does not change a Hook, invoke a model from Python, mutate an
   installed skill or claim attribution quality.
+- Phase 4 implementation is not complete until plan 4 commits
+  `docs/release-reports/review-inbox.json`; that report authorizes only the
+  Phase 5 read-only quality sample.
 
 ## Ordered implementation plans
 
