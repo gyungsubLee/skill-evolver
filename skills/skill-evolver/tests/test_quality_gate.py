@@ -26,40 +26,28 @@ class ProspectiveQualityEpochTests(CandidateBatchFixture):
         epoch_id: str,
         now: float,
     ) -> str:
-        epoch = self.runtime.load_quality_epoch(
-            self.connection, epoch_id
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            epoch = self.runtime.load_quality_epoch(
+                self.connection, epoch_id
+            )
+            self.runtime._invalidate_quality_epoch(
+                self.connection,
+                epoch,
+                "quality_provenance_drift",
+                now,
+            )
+            self.connection.commit()
+        except BaseException:
+            self.connection.rollback()
+            raise
+        result = self.runtime.gate_quality_epoch(
+            self.connection,
+            self.installation,
+            epoch_id,
+            now + 1,
         )
-        body = {
-            "schema_version": 1,
-            "epoch_id": epoch_id,
-            "decision": "INVALID",
-        }
-        digest = self.runtime.sha256_json(body)
-        terminal = {
-            **epoch,
-            "state": "invalid",
-            "invalid_reason": "quality_provenance_drift",
-            "invalidated_at": self.runtime.iso_utc(now),
-            "terminal": {
-                "body": body,
-                "report_digest": digest,
-            },
-            "ended_at": self.runtime.iso_utc(now),
-        }
-        self.connection.execute(
-            "UPDATE metadata SET value=? WHERE key=?",
-            (
-                self.runtime.canonical_json_bytes(terminal).decode(
-                    "utf-8"
-                ),
-                self.runtime.quality_epoch_key(epoch_id),
-            ),
-        )
-        self.connection.execute(
-            "DELETE FROM metadata WHERE key=?",
-            (self.runtime.QUALITY_ACTIVE_EPOCH_KEY,),
-        )
-        return digest
+        return str(result["report_digest"])
 
     def test_open_is_prospective_and_pins_provenance(self) -> None:
         now = 2_000_000_000.0
@@ -2259,4 +2247,1035 @@ class QualityLabelTests(CandidateBatchFixture):
                 self.connection, "Q-001", 1
             ),
             payloads[1],
+        )
+
+
+class QualityTerminalGateTests(CandidateBatchFixture):
+    def seal_distinct_sample(
+        self, now: float = 2_000_000_000.0
+    ) -> tuple[dict[str, object], int]:
+        self.runtime.open_quality_epoch(
+            self.connection,
+            self.installation,
+            now,
+            predecessor=None,
+        )
+        claims = []
+        for offset, count, suffix in (
+            (1, 3, "-a"),
+            (3, 3, "-b"),
+            (5, 3, "-c"),
+            (7, 1, "-d"),
+        ):
+            claim = self.claim(count, now + offset)
+            result_path = self.write_result(
+                claim,
+                self.result_payload(
+                    claim,
+                    distinct=True,
+                    locator_suffix=suffix,
+                ),
+            )
+            self.commit(claim, result_path, now + offset + 1)
+            claims.append(claim)
+        sealed = self.runtime.seal_quality_epoch(
+            self.connection, self.installation, now + 9
+        )
+        self.assertEqual(sealed["sealed"]["candidate_count"], 10)
+        return sealed, int(claims[0]["batch_id"])
+
+    def label_sample(
+        self,
+        now: float = 2_000_000_000.0,
+        *,
+        worthy: int = 5,
+        misattributed: int = 2,
+        adopted: int = 0,
+    ) -> None:
+        self.seal_distinct_sample(now)
+        for candidate_id in range(1, 11):
+            display = self.runtime.display_id("C", candidate_id)
+            prepared = self.runtime.prepare_quality_label(
+                self.connection,
+                self.installation,
+                display,
+                now + 10 + candidate_id,
+            )
+            self.runtime.commit_quality_label(
+                self.connection,
+                self.installation,
+                display,
+                str(prepared["epoch_id"]),
+                str(prepared["seal_digest"]),
+                str(prepared["subject_digest"]),
+                {
+                    "evaluation_worthy": candidate_id <= worthy,
+                    "target_correct": (
+                        candidate_id > misattributed
+                    ),
+                    "external_content_adoption": (
+                        candidate_id <= adopted
+                    ),
+                },
+                now + 11 + candidate_id,
+            )
+
+    def test_gate_refuses_valid_collecting_and_incomplete_sealed(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        self.runtime.open_quality_epoch(
+            self.connection,
+            self.installation,
+            now,
+            predecessor=None,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "quality_epoch_not_sealed"
+        ):
+            self.runtime.gate_quality_epoch(
+                self.connection,
+                self.installation,
+                "Q-001",
+                now + 1,
+            )
+        self.assertEqual(
+            self.runtime.load_quality_epoch(
+                self.connection, "Q-001"
+            )["state"],
+            "collecting",
+        )
+
+        for offset, count, suffix in (
+            (2, 3, "-a"),
+            (4, 3, "-b"),
+            (6, 3, "-c"),
+            (8, 1, "-d"),
+        ):
+            claim = self.claim(count, now + offset)
+            result_path = self.write_result(
+                claim,
+                self.result_payload(
+                    claim,
+                    distinct=True,
+                    locator_suffix=suffix,
+                ),
+            )
+            self.commit(claim, result_path, now + offset + 1)
+        self.runtime.seal_quality_epoch(
+            self.connection, self.installation, now + 10
+        )
+        with self.assertRaisesRegex(
+            ValueError, "quality_labels_incomplete"
+        ):
+            self.runtime.gate_quality_epoch(
+                self.connection,
+                self.installation,
+                "Q-001",
+                now + 11,
+            )
+        self.assertEqual(
+            self.runtime.load_quality_epoch(
+                self.connection, "Q-001"
+            )["state"],
+            "sealed",
+        )
+
+    def test_quality_gate_parser_handler_passes_exact_boundaries_and_replays(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        self.label_sample(now, worthy=5, misattributed=2)
+        parser = self.runtime.build_parser()
+        args = parser.parse_args(
+            [
+                "quality-gate",
+                "--installation",
+                str(
+                    self.installation.data_root
+                    / "installation.json"
+                ),
+                "Q-001",
+            ]
+        )
+        action = next(
+            item
+            for item in parser._actions
+            if isinstance(
+                item, self.runtime.argparse._SubParsersAction
+            )
+        )
+        options = {
+            option
+            for item in action.choices["quality-gate"]._actions
+            for option in item.option_strings
+        }
+        output = io.BytesIO()
+        stdout = mock.Mock()
+        stdout.buffer = output
+
+        self.assertEqual(options, {"-h", "--help", "--installation"})
+        self.assertEqual(args.epoch_id, "Q-001")
+        self.assertIs(args.handler, self.runtime.cmd_quality_gate)
+        with mock.patch.object(
+            self.runtime.time, "time", return_value=now + 30
+        ), mock.patch.object(self.runtime.sys, "stdout", stdout):
+            self.assertEqual(args.handler(args), 0)
+
+        first = json.loads(output.getvalue())
+        body = first["body"]
+        self.assertEqual(
+            set(first), {"body", "report_digest"}
+        )
+        self.assertEqual(
+            set(body),
+            {
+                "schema_version",
+                "epoch_id",
+                "decision",
+                "invalid_reason",
+                "evaluated_at",
+                "next_action",
+                "provenance",
+                "lineage",
+                "sample",
+                "metrics",
+                "thresholds",
+                "checks",
+                "observation_set_digest",
+                "label_set_digest",
+                "attestation",
+            },
+        )
+        self.assertEqual(body["decision"], "PASS")
+        self.assertIsNone(body["invalid_reason"])
+        self.assertEqual(
+            body["evaluated_at"], self.runtime.iso_utc(now + 21)
+        )
+        self.assertEqual(
+            body["next_action"],
+            "begin_phase_6_evaluate_runner_spike",
+        )
+        self.assertEqual(
+            set(body["provenance"]),
+            {
+                "phase4_report_digest",
+                "runtime_digest",
+                "quality_contract_digest",
+                "policy_digest",
+                "transcript_adapter_digest",
+                "catalog_adapter_digest",
+            },
+        )
+        self.assertNotIn(
+            "identity_key_fingerprint", body["provenance"]
+        )
+        self.assertEqual(
+            body["lineage"],
+            {
+                "entries": [],
+                "digest": self.runtime.sha256_json([]),
+            },
+        )
+        self.assertEqual(
+            body["sample"],
+            {
+                "distinct_session_count": 10,
+                "candidate_count": 10,
+                "attested_label_count": 10,
+                "batch_count": 4,
+            },
+        )
+        self.assertEqual(
+            body["metrics"],
+            {
+                "evaluation_worthy_candidates": 5,
+                "target_misattributions": 2,
+                "external_content_adoption_incidents": 0,
+            },
+        )
+        self.assertEqual(
+            body["thresholds"],
+            {
+                "minimum_distinct_sessions": 10,
+                "minimum_candidate_count": 1,
+                "evaluation_worthy_numerator": 1,
+                "evaluation_worthy_denominator": 2,
+                "misattribution_numerator": 1,
+                "misattribution_denominator": 5,
+                "external_content_adoption_maximum": 0,
+            },
+        )
+        self.assertTrue(all(body["checks"].values()))
+        self.assertEqual(
+            body["attestation"],
+            "user_attested_not_identity_proven",
+        )
+        self.assertEqual(
+            first["report_digest"], self.runtime.sha256_json(body)
+        )
+        self.assertEqual(
+            json.loads(
+                self.runtime.canonical_json_bytes(body)
+            ),
+            body,
+        )
+        private_keys = {
+            "session_ref",
+            "candidate_id",
+            "target_identity",
+            "classification",
+            "problem_summary",
+            "proposal_summary",
+            "validation_plan",
+            "risk_level",
+            "evidence",
+            "path",
+            "owner",
+            "record",
+            "transcript",
+        }
+
+        def keys(value: object) -> set[str]:
+            if type(value) is dict:
+                return set(value) | {
+                    nested
+                    for item in value.values()
+                    for nested in keys(item)
+                }
+            if type(value) is list:
+                return {
+                    nested for item in value for nested in keys(item)
+                }
+            return set()
+
+        self.assertFalse(keys(body) & private_keys)
+        encoded = self.runtime.canonical_json_bytes(body)
+        for private_value in (
+            b"C-001",
+            b"A completion claim survived",
+            b"Require fresh successful evidence",
+        ):
+            self.assertNotIn(private_value, encoded)
+        before = list(
+            self.connection.execute(
+                "SELECT key,value FROM metadata ORDER BY key"
+            )
+        )
+        replay = self.runtime.gate_quality_epoch(
+            self.connection,
+            self.installation,
+            "Q-001",
+            now + 200,
+        )
+        after = list(
+            self.connection.execute(
+                "SELECT key,value FROM metadata ORDER BY key"
+            )
+        )
+        self.assertEqual(replay, first)
+        self.assertEqual(after, before)
+        self.assertIsNone(
+            self.connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (self.runtime.QUALITY_ACTIVE_EPOCH_KEY,),
+            ).fetchone()
+        )
+
+    def test_expired_collecting_epoch_terminalizes_invalid_before_seal(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        epoch = self.runtime.open_quality_epoch(
+            self.connection,
+            self.installation,
+            now,
+            predecessor=None,
+        )
+        result = self.runtime.gate_quality_epoch(
+            self.connection,
+            self.installation,
+            "Q-001",
+            self.runtime.parse_iso_utc(
+                str(epoch["collection_expires_at"])
+            ),
+        )
+
+        self.assertEqual(result["body"]["decision"], "INVALID")
+        self.assertEqual(
+            result["body"]["invalid_reason"],
+            "quality_collection_expired",
+        )
+        self.assertEqual(
+            self.runtime.load_quality_epoch(
+                self.connection, "Q-001"
+            )["state"],
+            "invalid",
+        )
+
+    def test_provenance_invalid_precedes_missing_labels(self) -> None:
+        now = 2_000_000_000.0
+        self.seal_distinct_sample(now)
+        epoch = self.runtime.load_quality_epoch(
+            self.connection, "Q-001"
+        )
+        provenance = {
+            name: epoch[name]
+            for name in self.runtime.QUALITY_PROVENANCE_FIELDS
+        }
+        provenance["runtime_digest"] = "0" * 64
+
+        with mock.patch.object(
+            self.runtime,
+            "current_quality_provenance",
+            return_value=provenance,
+        ):
+            result = self.runtime.gate_quality_epoch(
+                self.connection,
+                self.installation,
+                "Q-001",
+                now + 10,
+            )
+
+        self.assertEqual(result["body"]["decision"], "INVALID")
+        self.assertEqual(
+            result["body"]["invalid_reason"],
+            "quality_provenance_drift",
+        )
+
+    def test_worthy_one_unit_below_half_fails(self) -> None:
+        now = 2_000_000_000.0
+        self.label_sample(now, worthy=4, misattributed=2)
+
+        result = self.runtime.gate_quality_epoch(
+            self.connection,
+            self.installation,
+            "Q-001",
+            now + 30,
+        )
+
+        self.assertEqual(result["body"]["decision"], "FAIL")
+        self.assertEqual(
+            result["body"]["metrics"][
+                "evaluation_worthy_candidates"
+            ],
+            4,
+        )
+        self.assertFalse(
+            result["body"]["checks"][
+                "evaluation_worthy_ratio"
+            ]
+        )
+        self.assertEqual(
+            result["body"]["next_action"],
+            "open_changed_quality_epoch",
+        )
+
+    def test_misattribution_one_unit_above_one_fifth_fails(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        self.label_sample(now, worthy=5, misattributed=3)
+
+        result = self.runtime.gate_quality_epoch(
+            self.connection,
+            self.installation,
+            "Q-001",
+            now + 30,
+        )
+
+        self.assertEqual(result["body"]["decision"], "FAIL")
+        self.assertEqual(
+            result["body"]["metrics"]["target_misattributions"],
+            3,
+        )
+        self.assertFalse(
+            result["body"]["checks"][
+                "target_misattribution_ratio"
+            ]
+        )
+
+    def test_any_external_content_adoption_fails(self) -> None:
+        now = 2_000_000_000.0
+        self.label_sample(
+            now, worthy=5, misattributed=2, adopted=1
+        )
+
+        result = self.runtime.gate_quality_epoch(
+            self.connection,
+            self.installation,
+            "Q-001",
+            now + 30,
+        )
+
+        self.assertEqual(result["body"]["decision"], "FAIL")
+        self.assertEqual(
+            result["body"]["metrics"][
+                "external_content_adoption_incidents"
+            ],
+            1,
+        )
+        self.assertFalse(
+            result["body"]["checks"][
+                "external_content_adoption"
+            ]
+        )
+
+    def test_subject_drift_invalidates_complete_labels(self) -> None:
+        now = 2_000_000_000.0
+        self.label_sample(now)
+        self.connection.execute(
+            """
+            UPDATE candidates SET proposal_summary=?
+            WHERE id=1
+            """,
+            ("A changed proposal after attestation.",),
+        )
+
+        result = self.runtime.gate_quality_epoch(
+            self.connection,
+            self.installation,
+            "Q-001",
+            now + 30,
+        )
+
+        self.assertEqual(result["body"]["decision"], "INVALID")
+        self.assertEqual(
+            result["body"]["invalid_reason"],
+            "quality_candidate_subject_changed",
+        )
+
+    def test_sealed_observation_corruption_terminalizes_invalid(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        _sealed, first_batch_id = self.seal_distinct_sample(now)
+        self.connection.execute(
+            "UPDATE metadata SET value='{}' WHERE key=?",
+            (
+                self.runtime.quality_observation_key(
+                    "Q-001", first_batch_id
+                ),
+            ),
+        )
+
+        result = self.runtime.gate_quality_epoch(
+            self.connection,
+            self.installation,
+            "Q-001",
+            now + 10,
+        )
+
+        self.assertEqual(result["body"]["decision"], "INVALID")
+        self.assertEqual(
+            result["body"]["invalid_reason"],
+            "quality_source_corrupt",
+        )
+
+    def test_sealed_expiry_invalidates_before_missing_labels(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        sealed, _ = self.seal_distinct_sample(now)
+        expires_at = sealed["sealed"]["label_expires_at"]
+
+        result = self.runtime.gate_quality_epoch(
+            self.connection,
+            self.installation,
+            "Q-001",
+            self.runtime.parse_iso_utc(str(expires_at)),
+        )
+
+        self.assertEqual(result["body"]["decision"], "INVALID")
+        self.assertEqual(
+            result["body"]["invalid_reason"],
+            "quality_label_expired",
+        )
+        for name in (
+            "source_complete",
+            "provenance_current",
+            "subject_current",
+        ):
+            self.assertFalse(result["body"]["checks"][name])
+
+    def test_identified_seal_corruption_terminalizes_invalid(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        self.seal_distinct_sample(now)
+        epoch = self.runtime.load_quality_epoch(
+            self.connection, "Q-001"
+        )
+        epoch["sealed"]["seal_digest"] = "0" * 64
+        self.connection.execute(
+            "UPDATE metadata SET value=? WHERE key=?",
+            (
+                self.runtime.canonical_json_bytes(epoch).decode(
+                    "utf-8"
+                ),
+                self.runtime.quality_epoch_key("Q-001"),
+            ),
+        )
+
+        result = self.runtime.gate_quality_epoch(
+            self.connection,
+            self.installation,
+            "Q-001",
+            now + 10,
+        )
+
+        self.assertEqual(result["body"]["decision"], "INVALID")
+        self.assertEqual(
+            result["body"]["invalid_reason"],
+            "quality_source_corrupt",
+        )
+        stored = self.runtime.load_quality_epoch(
+            self.connection, "Q-001"
+        )
+        self.assertEqual(stored["state"], "invalid")
+        self.assertIsNone(stored["sealed"])
+
+    def test_terminal_report_is_semantically_bound_to_epoch(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        self.label_sample(now)
+        self.runtime.gate_quality_epoch(
+            self.connection,
+            self.installation,
+            "Q-001",
+            now + 30,
+        )
+        epoch = self.runtime.load_quality_epoch(
+            self.connection, "Q-001"
+        )
+        body = epoch["terminal"]["body"]
+        body["provenance"]["runtime_digest"] = "0" * 64
+        epoch["terminal"]["report_digest"] = (
+            self.runtime.sha256_json(body)
+        )
+        self.connection.execute(
+            "UPDATE metadata SET value=? WHERE key=?",
+            (
+                self.runtime.canonical_json_bytes(epoch).decode(
+                    "utf-8"
+                ),
+                self.runtime.quality_epoch_key("Q-001"),
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "invalid_quality_epoch"
+        ):
+            self.runtime.gate_quality_epoch(
+                self.connection,
+                self.installation,
+                "Q-001",
+                now + 31,
+            )
+
+    def test_terminal_replay_cannot_produce_competing_decision(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        self.label_sample(now)
+        first = self.runtime.gate_quality_epoch(
+            self.connection,
+            self.installation,
+            "Q-001",
+            now + 30,
+        )
+        self.connection.execute(
+            "DELETE FROM metadata WHERE key=?",
+            (self.runtime.quality_label_key("Q-001", 1),),
+        )
+
+        replay = self.runtime.gate_quality_epoch(
+            self.connection,
+            self.installation,
+            "Q-001",
+            now
+            + self.runtime.QUALITY_SEALED_TTL_SECONDS
+            + 100,
+        )
+
+        self.assertEqual(replay, first)
+        self.assertEqual(replay["body"]["decision"], "PASS")
+
+    def test_maintenance_deletes_quality_observations_with_audits(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        self.label_sample(now)
+        self.runtime.gate_quality_epoch(
+            self.connection,
+            self.installation,
+            "Q-001",
+            now + 30,
+        )
+        observations = (
+            self.runtime.quality_observation_inventory(
+                self.connection, "Q-001"
+            )
+        )
+        batch_ids = [
+            int(item["batch_id"]) for item in observations
+        ]
+        self.assertEqual(len(batch_ids), 4)
+
+        result = self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            now
+            + 9
+            + self.runtime.REVIEW_BATCH_AUDIT_TTL_SECONDS,
+        )
+
+        self.assertEqual(result["quality_observations_deleted"], 4)
+        self.assertEqual(
+            self.runtime.quality_observation_inventory(
+                self.connection, "Q-001"
+            ),
+            [],
+        )
+        for batch_id in batch_ids:
+            self.assertIsNone(
+                self.connection.execute(
+                    "SELECT value FROM metadata WHERE key=?",
+                    (self.runtime.review_audit_key(batch_id),),
+                ).fetchone()
+            )
+            self.assertIsNone(
+                self.connection.execute(
+                    "SELECT id FROM review_batches WHERE id=?",
+                    (batch_id,),
+                ).fetchone()
+            )
+
+    def test_maintenance_deletes_expired_orphan_observation(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        self.label_sample(now)
+        self.runtime.gate_quality_epoch(
+            self.connection,
+            self.installation,
+            "Q-001",
+            now + 30,
+        )
+        observation = (
+            self.runtime.quality_observation_inventory(
+                self.connection, "Q-001"
+            )[0]
+        )
+        batch_id = int(observation["batch_id"])
+        self.connection.execute(
+            "DELETE FROM metadata WHERE key=?",
+            (self.runtime.review_audit_key(batch_id),),
+        )
+        self.connection.execute(
+            "DELETE FROM review_batches WHERE id=?",
+            (batch_id,),
+        )
+
+        result = self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            self.runtime.parse_iso_utc(
+                str(observation["finished_at"])
+            )
+            + self.runtime.REVIEW_BATCH_AUDIT_TTL_SECONDS,
+        )
+
+        self.assertEqual(result["quality_observations_deleted"], 1)
+        self.assertIsNone(
+            self.connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (
+                    self.runtime.quality_observation_key(
+                        "Q-001", batch_id
+                    ),
+                ),
+            ).fetchone()
+        )
+
+    def test_maintenance_replaces_180_day_private_data_with_tombstone(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        self.label_sample(now)
+        terminal = self.runtime.gate_quality_epoch(
+            self.connection,
+            self.installation,
+            "Q-001",
+            now + 30,
+        )
+        boundary = (
+            now + 30 + self.runtime.QUALITY_PRIVATE_TTL_SECONDS
+        )
+
+        self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            boundary - 1,
+        )
+        before = json.loads(
+            self.connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (self.runtime.quality_epoch_key("Q-001"),),
+            ).fetchone()["value"]
+        )
+        self.assertEqual(before["state"], "passed")
+
+        result = self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            boundary,
+        )
+        row = self.connection.execute(
+            "SELECT value FROM metadata WHERE key=?",
+            (self.runtime.quality_epoch_key("Q-001"),),
+        ).fetchone()
+        tombstone = json.loads(row["value"])
+
+        self.assertEqual(result["quality_epochs_tombstoned"], 1)
+        self.assertEqual(result["quality_labels_deleted"], 10)
+        self.assertEqual(
+            set(tombstone),
+            {
+                "schema_version",
+                "epoch_id",
+                "terminal_state",
+                "terminal_report_digest",
+                "ended_at",
+                "predecessor_digest",
+            },
+        )
+        self.assertEqual(tombstone["schema_version"], 1)
+        self.assertEqual(tombstone["epoch_id"], "Q-001")
+        self.assertEqual(tombstone["terminal_state"], "passed")
+        self.assertEqual(
+            tombstone["terminal_report_digest"],
+            terminal["report_digest"],
+        )
+        self.assertEqual(
+            tombstone["ended_at"], self.runtime.iso_utc(now + 30)
+        )
+        self.assertEqual(
+            tombstone["predecessor_digest"],
+            self.runtime.sha256_json(None),
+        )
+        self.assertEqual(
+            list(
+                self.connection.execute(
+                    """
+                    SELECT key FROM metadata
+                    WHERE key GLOB 'quality.epoch.Q-001.label.*'
+                       OR key GLOB 'quality.epoch.Q-001.batch.*'
+                    """
+                )
+            ),
+            [],
+        )
+        with self.assertRaisesRegex(
+            ValueError, "quality_terminal_body_expired"
+        ):
+            self.runtime.gate_quality_epoch(
+                self.connection,
+                self.installation,
+                "Q-001",
+                boundary + 1,
+            )
+        repeated = self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            boundary + 1,
+        )
+        self.assertEqual(repeated["quality_epochs_tombstoned"], 0)
+        self.assertEqual(
+            json.loads(
+                self.connection.execute(
+                    "SELECT value FROM metadata WHERE key=?",
+                    (self.runtime.quality_epoch_key("Q-001"),),
+                ).fetchone()["value"]
+            ),
+            tombstone,
+        )
+
+    def test_passed_tombstone_keeps_lineage_and_active_successor(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        self.label_sample(now)
+        terminal = self.runtime.gate_quality_epoch(
+            self.connection,
+            self.installation,
+            "Q-001",
+            now + 30,
+        )
+        boundary = (
+            now + 30 + self.runtime.QUALITY_PRIVATE_TTL_SECONDS
+        )
+        self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            boundary,
+        )
+
+        opened = self.runtime.open_quality_epoch(
+            self.connection,
+            self.installation,
+            boundary + 1,
+            predecessor=(
+                f"Q-001@{terminal['report_digest']}"
+            ),
+        )
+        repeated = self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            boundary + 2,
+        )
+
+        self.assertEqual(opened["epoch_id"], "Q-002")
+        self.assertEqual(
+            opened["predecessor"],
+            {
+                "epoch_id": "Q-001",
+                "terminal_state": "passed",
+                "terminal_report_digest": terminal[
+                    "report_digest"
+                ],
+            },
+        )
+        self.assertEqual(repeated["quality_epochs_tombstoned"], 0)
+        self.assertEqual(
+            self.runtime.active_quality_epoch(
+                self.connection
+            )["epoch_id"],
+            "Q-002",
+        )
+
+    def test_stale_ungated_invalid_epoch_is_tombstoned_fail_closed(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        epoch = self.runtime.open_quality_epoch(
+            self.connection,
+            self.installation,
+            now,
+            predecessor=None,
+        )
+        expired_at = self.runtime.parse_iso_utc(
+            str(epoch["collection_expires_at"])
+        )
+
+        result = self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            expired_at + self.runtime.QUALITY_PRIVATE_TTL_SECONDS,
+        )
+        tombstone = self.runtime.load_quality_epoch_record(
+            self.connection, "Q-001"
+        )
+
+        self.assertEqual(result["quality_epochs_tombstoned"], 1)
+        self.assertEqual(tombstone["terminal_state"], "invalid")
+        self.assertIsNone(
+            self.connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (self.runtime.QUALITY_ACTIVE_EPOCH_KEY,),
+            ).fetchone()
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "quality_predecessor_private_lineage_expired",
+        ):
+            self.runtime.open_quality_epoch(
+                self.connection,
+                self.installation,
+                expired_at
+                + self.runtime.QUALITY_PRIVATE_TTL_SECONDS
+                + 1,
+                predecessor=(
+                    f"Q-001@"
+                    f"{tombstone['terminal_report_digest']}"
+                ),
+            )
+
+    def test_invalid_predecessor_retention_waits_for_active_successor(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        first = self.runtime.open_quality_epoch(
+            self.connection,
+            self.installation,
+            now,
+            predecessor=None,
+        )
+        first_expiry = self.runtime.parse_iso_utc(
+            str(first["collection_expires_at"])
+        )
+        terminal = self.runtime.gate_quality_epoch(
+            self.connection,
+            self.installation,
+            "Q-001",
+            first_expiry,
+        )
+        current = self.runtime.current_quality_provenance(
+            self.installation
+        )
+        second_started = (
+            first_expiry
+            + self.runtime.QUALITY_PRIVATE_TTL_SECONDS
+            - 86_400
+        )
+        changed = {**current, "runtime_digest": "1" * 64}
+        with mock.patch.object(
+            self.runtime,
+            "current_quality_provenance",
+            return_value=changed,
+        ):
+            second = self.runtime.open_quality_epoch(
+                self.connection,
+                self.installation,
+                second_started,
+                predecessor=(
+                    f"Q-001@{terminal['report_digest']}"
+                ),
+            )
+
+        result = self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            first_expiry
+            + self.runtime.QUALITY_PRIVATE_TTL_SECONDS,
+        )
+        first_record = self.runtime.load_quality_epoch_record(
+            self.connection, "Q-001"
+        )
+        second_terminal = self.runtime.gate_quality_epoch(
+            self.connection,
+            self.installation,
+            "Q-002",
+            self.runtime.parse_iso_utc(
+                str(second["collection_expires_at"])
+            ),
+        )
+
+        self.assertEqual(result["quality_epochs_tombstoned"], 0)
+        self.assertEqual(first_record["state"], "invalid")
+        self.assertEqual(
+            second_terminal["body"]["lineage"]["entries"][0][
+                "invalid_reason"
+            ],
+            "quality_collection_expired",
         )

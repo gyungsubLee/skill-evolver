@@ -13558,6 +13558,7 @@ class ReviewSurfaceTests(CandidateBatchFixture):
                 "quality-seal",
                 "quality-label",
                 "quality-status",
+                "quality-gate",
                 "catalog-inspect",
                 "inspect",
                 "defer",
