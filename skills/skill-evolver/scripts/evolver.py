@@ -2587,9 +2587,7 @@ def _classify_transcript_object(
                 output, installation
             )
         ]
-    if evidence_eligible:
-        raise _transcript_error("unsupported_transcript")
-    return []
+    raise _transcript_error("unsupported_transcript")
 
 
 def _parse_jsonl_records(

@@ -1747,6 +1747,21 @@ class FrozenTranscriptFailureTests(FrozenTranscriptTestCase):
             retryable=False,
         )
 
+    def test_unknown_context_response_item_is_terminal(self) -> None:
+        session_id = "unknown-context-response-item"
+        header = self.header(session_id)
+        unknown = (
+            b'{"type":"response_item","payload":{"type":"future_message",'
+            b'"content":"unsupported"}}\n'
+        )
+        self.assert_transcript_error(
+            [header, unknown, self.message(b"valid delta")],
+            reviewed_boundary=len(header) + len(unknown),
+            session_id=session_id,
+            code="unsupported_transcript",
+            retryable=False,
+        )
+
     def test_structured_tool_output_is_terminal(self) -> None:
         for label, output in (
             (
