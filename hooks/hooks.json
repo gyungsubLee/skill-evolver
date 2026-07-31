@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/usr/bin/python3 -I \"$PLUGIN_ROOT/skills/skill-evolver/scripts/evolver.py\" enqueue-stop --installation \"/Users/igyeongseob/.codex/skill-evolver/installation.json\"",
+            "command": "/usr/bin/python3 -I \"$PLUGIN_ROOT/skills/skill-evolver/scripts/evolver.py\" enqueue-stop --installation \"/Users/igyeongseob/.codex/skill-evolver/installation.json\" --plugin-data \"$PLUGIN_DATA\"",
             "timeout": 2
           }
         ]

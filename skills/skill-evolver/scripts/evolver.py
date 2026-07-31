@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Mapping, Optional, Sequence, TypedDict
 from urllib.parse import quote
 
-VERSION = "skill-evolver 0.1.0"
+VERSION = "skill-evolver 0.1.1"
 SCHEMA_VERSION = 1
 MAX_HOOK_BYTES = 65_536
 SQLITE_INTEGER_MAX = 9_223_372_036_854_775_807
@@ -13818,13 +13818,15 @@ def build_parser() -> argparse.ArgumentParser:
     init.set_defaults(handler=cmd_init)
     enqueue = commands.add_parser("enqueue-stop")
     add_installation_argument(enqueue)
-    enqueue.add_argument("--plugin-data")
+    enqueue.add_argument("--plugin-data", required=True)
     enqueue.set_defaults(handler=cmd_enqueue_stop)
     maintain = commands.add_parser("maintain")
     add_installation_argument(maintain)
+    maintain.add_argument("--plugin-data", required=True)
     maintain.set_defaults(handler=cmd_maintain)
     status = commands.add_parser("status")
     add_installation_argument(status)
+    status.add_argument("--plugin-data", required=True)
     status.set_defaults(handler=cmd_status)
 
     review_claim = commands.add_parser("review-claim")

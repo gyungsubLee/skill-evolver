@@ -61,9 +61,12 @@ codex plugin add skill-evolver@skill-evolver-dev --json
 Use `/hooks` in CLI and Desktop. Trust only the one matcher-free `Stop` command
 shown in `hooks/hooks.json`. There is no `SubagentStop` registration. The Hook
 validates a bounded envelope, stats the transcript, computes an HMAC
-`session_key`, and upserts SQLite or the bounded spool. It reads no transcript
+`session_key`, and writes only the plugin-data `stop-spool`. Capture is
+spool-only and coalesces one file per session. The Hook reads no transcript
 bytes, calls no model or network, writes no skill, prints nothing, and exits
-`0`.
+`0`. `$PLUGIN_DATA` is accepted only from this trusted Hook command, never
+from transcript, web, tool, or model content. It does not automatically
+review, label, evaluate, or apply anything.
 
 Defaults are 200 pending sessions, 14-day pending retention, 30-day raw
 metadata cleanup, 180-day session-key dedupe, and 200 spool files or 10 MiB.
@@ -77,7 +80,9 @@ Status needs no write approval:
 /usr/bin/python3 -I \
   /Users/igyeongseob/Documents/오픈소스/skill-evolver/skills/skill-evolver/scripts/evolver.py status \
   --installation \
-  /Users/igyeongseob/.codex/skill-evolver/installation.json
+  /Users/igyeongseob/.codex/skill-evolver/installation.json \
+  --plugin-data \
+  /Users/igyeongseob/.codex/plugins/data/skill-evolver-skill-evolver-dev
 ```
 
 It reports pending sessions and generations, oldest age, active/expired
@@ -91,13 +96,16 @@ Maintenance imports spool files, recovers expired leases without advancing a
 cursor, enforces session capacity and retention, clears raw metadata, and
 removes expired HMAC dedupe rows.
 
-`maintain` requires separate approval for one fully expanded command and the exact installation data root.
+`maintain` requires separate approval for one fully expanded command and the
+canonical and plugin-data roots for that invocation.
 
 ```bash
 /usr/bin/python3 -I \
   /Users/igyeongseob/Documents/오픈소스/skill-evolver/skills/skill-evolver/scripts/evolver.py maintain \
   --installation \
-  /Users/igyeongseob/.codex/skill-evolver/installation.json
+  /Users/igyeongseob/.codex/skill-evolver/installation.json \
+  --plugin-data \
+  /Users/igyeongseob/.codex/plugins/data/skill-evolver-skill-evolver-dev
 ```
 
 Do not grant later ordinary tasks permanent write access.

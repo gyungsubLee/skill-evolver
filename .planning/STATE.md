@@ -22,10 +22,12 @@ See: `.planning/PROJECT.md` (updated 2026-07-27)
 
 Phase: 5 of 11 (Read-only Quality Gate)
 Plan: 0 of 1 in current phase
-Status: Implementation and boundary verification complete; production epoch
-`Q-001` is COLLECTING at 0/10 distinct real sessions
-Last activity: 2026-07-30 — Phase 5 quality-gate implementation, independent
-reviews, 443-test suite, plugin installation and production `Q-001` open complete
+Status: The `0.1.0` production capture assumption regressed; `0.1.1` routes
+capture through plugin data. `Q-001` must terminalize as provenance drift; it
+is not terminal yet, and Phase 5 remains blocked from Phase 6 until a
+successor epoch passes.
+Last activity: 2026-07-31 — `0.1.1` plugin-data capture release surfaces
+prepared; live plugin activation remains a separate task
 
 Progress: [████░░░░░░] 36%
 
@@ -46,7 +48,8 @@ Progress: [████░░░░░░] 36%
 | 4. Review and Inbox | 1/1 | Not recorded | Not recorded |
 
 **Recent Trend:** Four sequential phase gates recorded; Phase 2, Phase 3 and
-Phase 4 are PASS; Phase 5 mechanics are verified and its real cohort is open
+Phase 4 are PASS; the `0.1.0` production capture assumption regressed and
+Phase 5 is blocked pending `Q-001` provenance rollover and a successor PASS
 
 ## Accumulated Context
 
@@ -70,13 +73,19 @@ Phase 4 are PASS; Phase 5 mechanics are verified and its real cohort is open
 - Review, evaluation and mutation remain explicit-only; apply/undo require external TTY and complete digest/hash.
 - Phase 5 labels are user-entered only in a user-controlled external terminal;
   the agent must not enter or infer them, including through a PTY.
-- `Q-001` opened at `2026-07-30T10:15:35Z`; only distinct meaningful Codex
-  tasks captured after plugin activation count as real quality evidence.
+- The `0.1.0` production capture assumption regressed. Release `0.1.1`
+  routes Stop capture through the pinned plugin-data root.
+- `Q-001` opened at `2026-07-30T10:15:35Z` must terminalize as provenance
+  drift before another quality epoch can begin. It is not terminal yet, and no
+  successor epoch exists yet.
 
 ### Pending Todos
 
-- Collect at least 10 distinct meaningful real Codex sessions in `Q-001`.
-- Explicitly review the collected sessions in bounded batches and seal `Q-001`.
+- Terminalize `Q-001` as provenance drift after the `0.1.1` rollover.
+- Open a successor epoch, then collect at least 10 distinct meaningful real
+  Codex sessions in that epoch.
+- Explicitly review the successor epoch's collected sessions in bounded batches
+  and seal it.
 - Have the user attest every sealed candidate in an external terminal, then run
   the terminal quality gate and commit its content-addressed PASS report.
 - Keep Runner, Prepare, Evaluate and Apply disabled until `QUALITY-01` passes.
@@ -87,9 +96,9 @@ Phase 4 are PASS; Phase 5 mechanics are verified and its real cohort is open
 - Phase 4 PASS proves deterministic mechanics and safety only; candidate quality remains unmeasured until Phase 5.
 - Phase 5 cannot use fixtures, subagents, repeated generations in this task, or
   empty generated tasks as substitutes for 10 distinct real sessions.
-- Production status at `2026-07-30T10:17:31Z` is `pending_sessions=0`,
-  `last_hook_success_at=null`; `Q-001` is `COLLECTING` with 0 sessions,
-  0 candidates and 0 labels.
+- `Q-001` is pending required terminalization as provenance drift, not a
+  terminal quality result. A successor epoch does not exist yet, and Phase 6
+  remains blocked until that successor passes.
 - The original Phase 1 `FAIL` and superseded turn-level Review plan remain immutable historical evidence.
 
 ## Deferred Items
@@ -101,7 +110,8 @@ Phase 4 are PASS; Phase 5 mechanics are verified and its real cohort is open
 
 ## Session Continuity
 
-Last session: 2026-07-30
-Stopped at: Phase 5 mechanics complete; Q-001 awaits distinct post-install real
-Codex tasks before bounded review, sealing, external-terminal labels and gate
+Last session: 2026-07-31
+Stopped at: `0.1.1` routes capture through plugin data; Q-001 must terminalize
+as provenance drift before a successor can collect real Codex tasks, be
+reviewed, sealed, labeled in an external terminal, and pass the gate
 Resume file: None

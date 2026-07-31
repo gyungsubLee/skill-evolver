@@ -1477,6 +1477,9 @@ class SessionCaptureTests(unittest.TestCase):
                 "enqueue-stop",
                 "--installation",
                 str(self.installation_path),
+                "--plugin-data",
+                "/Users/igyeongseob/.codex/plugins/data/"
+                "skill-evolver-skill-evolver-dev",
             ],
             input=json.dumps(payload).encode(),
             stdout=subprocess.PIPE,
@@ -1520,18 +1523,27 @@ class SessionCaptureTests(unittest.TestCase):
                 "enqueue-stop",
                 "--installation",
                 str(self.installation_path),
+                "--plugin-data",
+                "/Users/igyeongseob/.codex/plugins/data/"
+                "skill-evolver-skill-evolver-dev",
                 stdin=json.dumps(self.payload).encode(),
             ),
             run_isolated(
                 "enqueue-stop",
                 "--installation",
                 "/missing/installation.json",
+                "--plugin-data",
+                "/Users/igyeongseob/.codex/plugins/data/"
+                "skill-evolver-skill-evolver-dev",
                 stdin=b"{",
             ),
             run_isolated(
                 "enqueue-stop",
                 "--installation",
                 str(self.installation_path),
+                "--plugin-data",
+                "/Users/igyeongseob/.codex/plugins/data/"
+                "skill-evolver-skill-evolver-dev",
                 stdin=b"x" * 65_537,
             ),
         )
@@ -1578,14 +1590,20 @@ class ProductionSurfaceTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(manifest["version"], "0.1.0")
+        self.assertEqual(manifest["version"], "0.1.1")
         self.assertEqual(set(hooks["hooks"]), {"Stop"})
         self.assertNotIn("matcher", hooks["hooks"]["Stop"][0])
         self.assertIn(" enqueue-stop ", command)
+        self.assertIn(' --plugin-data "$PLUGIN_DATA"', command)
         self.assertNotIn("probe-", command)
         self.assertEqual(
             runtime["installation"],
             "/Users/igyeongseob/.codex/skill-evolver/installation.json",
+        )
+        self.assertEqual(
+            runtime["plugin_data"],
+            "/Users/igyeongseob/.codex/plugins/data/"
+            "skill-evolver-skill-evolver-dev",
         )
         self.assertNotIn(
             "Status and `maintain` are unavailable in this release",
@@ -1594,9 +1612,10 @@ class ProductionSurfaceTests(unittest.TestCase):
         self.assertIn("- No argument or `status`: run", skill)
         self.assertIn("- `maintain`: show the exact", skill)
         self.assertIn("Status is read-only", skill)
-        self.assertIn("exact command and global data root", skill)
         self.assertIn("No persistent writable-root grant", skill)
         self.assertIn("Never invoke after an ordinary task", skill)
+        self.assertIn("stop-spool", skill)
+        self.assertIn("canonical and plugin-data roots", skill)
         self.assertNotIn("SubagentStop", json.dumps(hooks))
 
     def test_readme_uses_v2_gate_and_scoped_mutation_approval(self) -> None:
@@ -4572,12 +4591,46 @@ class MaintenanceStatusTests(unittest.TestCase):
         self.assertFalse(status["spool"]["scan_saturated"])
 
     def test_parser_exposes_exact_status_and_maintain_commands(self) -> None:
+        plugin_data = (
+            "/Users/igyeongseob/.codex/plugins/data/"
+            "skill-evolver-skill-evolver-dev"
+        )
+        enqueue = self.runtime.build_parser().parse_args(
+            [
+                "enqueue-stop",
+                "--installation",
+                str(self.installation_path),
+                "--plugin-data",
+                plugin_data,
+            ]
+        )
         status = self.runtime.build_parser().parse_args(
-            ["status", "--installation", str(self.installation_path)]
+            [
+                "status",
+                "--installation",
+                str(self.installation_path),
+                "--plugin-data",
+                plugin_data,
+            ]
         )
         maintain = self.runtime.build_parser().parse_args(
-            ["maintain", "--installation", str(self.installation_path)]
+            [
+                "maintain",
+                "--installation",
+                str(self.installation_path),
+                "--plugin-data",
+                plugin_data,
+            ]
         )
+        for command in ("enqueue-stop", "status", "maintain"):
+            with self.subTest(command=command), self.assertRaises(SystemExit):
+                self.runtime.build_parser().parse_args(
+                    [command, "--installation", str(self.installation_path)]
+                )
+        self.assertEqual(enqueue.plugin_data, plugin_data)
+        self.assertEqual(status.plugin_data, plugin_data)
+        self.assertEqual(maintain.plugin_data, plugin_data)
+        self.assertIs(enqueue.handler, self.runtime.cmd_enqueue_stop)
         self.assertIs(status.handler, self.runtime.cmd_status)
         self.assertIs(maintain.handler, self.runtime.cmd_maintain)
 

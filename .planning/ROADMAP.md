@@ -2,7 +2,7 @@
 
 ## Overview
 
-Skill Evolver는 Phase 1 Feasibility `FAIL`을 Phase 2의 session-level 계약으로 수정해 amended gate `PASS`를 확보했고, Phase 3에서 bounded Runtime Queue를 구현했다. 이제 explicit Review/Inbox를 구현한 뒤 quality, runner, immutable evaluation, manual apply/versioning, undo/recovery와 hardening gate를 순서대로 통과한다.
+Skill Evolver는 Phase 1 Feasibility `FAIL`을 Phase 2의 session-level 계약으로 수정해 amended gate `PASS`를 확보했고, Phase 3에서 bounded Runtime Queue를 구현했다. `0.1.0`의 production capture assumption은 regressed 되었고 `0.1.1`은 capture를 plugin data로 route한다. `Q-001` must terminalize as provenance drift before a successor epoch can pass Phase 5; Phase 6 remains blocked until then. 이제 explicit Review/Inbox를 구현한 뒤 quality, runner, immutable evaluation, manual apply/versioning, undo/recovery와 hardening gate를 순서대로 통과한다.
 
 ## Phases
 
@@ -28,7 +28,7 @@ Skill Evolver는 Phase 1 Feasibility `FAIL`을 Phase 2의 session-level 계약�
 | Phase 2 amended Feasibility | Phase 3 Runtime Queue | Phase 2에 머물며 설계·probe 수정; Runtime Queue 차단 |
 | Phase 3 Runtime Queue | Phase 4 Review/Inbox | Phase 3 수정; Review 미진입 |
 | Phase 4 Review/Inbox | Phase 5 Quality Gate | Phase 4 수정; Quality sample 미진입 |
-| Phase 5 Read-only Quality | Phase 6 Runner Spike | Phase 4 transcript adapter 또는 review policy 수정 |
+| Phase 5 Read-only Quality | A successor epoch passes before Phase 6 Runner Spike | Phase 4 transcript adapter 또는 review policy 수정 |
 | Phase 6 Runner Spike | Phase 7 Prepare | Prepare/Evaluate 명령 비활성 유지 |
 | Phase 7 Prepare | Phase 8 Evaluation | immutable artifact/spec 수정 후 재준비 |
 | Phase 8 Evaluation | Phase 9 Apply | candidate와 installed target을 유지하고 Apply 비활성 |
@@ -112,7 +112,10 @@ Plans:
 **Depends on**: Phase 4
 **Requirements**: QUALITY-01
 **Entry Gate**: Review/Inbox suite passes with zero target-skill writes
-**Gate Result**: **COLLECTING** — production epoch `Q-001`, 0/10 distinct real sessions as of 2026-07-30
+**Gate Result**: **BLOCKED** — the `0.1.0` production capture assumption
+regressed; `0.1.1` routes capture through plugin data. `Q-001` must
+terminalize as provenance drift, is not terminal yet, and no successor epoch
+exists yet. Phase 6 remains blocked until a successor epoch passes.
 **Failure Route**: Phase 4 transcript adapter 또는 improvement policy로 돌아간다.
 **Success Criteria** (what must be TRUE):
   1. 개발자가 최소 10 sessions 또는 30 review items에 대한 complete label set을 확인할 수 있다.
@@ -231,7 +234,7 @@ Plans:
 | 2. Session-Level Capture Design Amendment | 1/1 | Complete (gate PASS) | 2026-07-29 |
 | 3. Runtime Queue | 1/1 | Complete (gate PASS) | 2026-07-29 |
 | 4. Review and Inbox | 1/1 | Complete (gate PASS) | 2026-07-30 |
-| 5. Read-only Quality Gate | 0/1 | In progress — Q-001 collecting 0/10 real sessions (current) | - |
+| 5. Read-only Quality Gate | 0/1 | Blocked — Q-001 pending provenance-drift terminalization; successor epoch must pass | - |
 | 6. Evaluate Runner Spike | 0/1 | Not started | - |
 | 7. Evaluate Prepare | 0/1 | Not started | - |
 | 8. Evaluate Execution | 0/1 | Not started | - |
