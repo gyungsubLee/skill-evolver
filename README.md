@@ -58,6 +58,15 @@ codex plugin marketplace add \
 codex plugin add skill-evolver@skill-evolver-dev --json
 ```
 
+Before the first trusted `Stop`, create the exact private plugin-data root
+once. The Hook creates only its dedicated `stop-spool/` child and fails closed
+when this parent is absent or not mode `0700`.
+
+```bash
+mkdir -m 700 -p \
+  /Users/igyeongseob/.codex/plugins/data/skill-evolver-skill-evolver-dev
+```
+
 Use `/hooks` in CLI and Desktop. Trust only the one matcher-free `Stop` command
 shown in `hooks/hooks.json`. There is no `SubagentStop` registration. The Hook
 validates a bounded envelope, stats the transcript, computes an HMAC
@@ -87,8 +96,9 @@ Status needs no write approval:
 
 It reports pending sessions and generations, oldest age, active/expired
 leases, binding failures, excluded/expired counts, raw spool files,
-HMAC/schema-verified spool files, bytes/overflow, last successful Hook time,
-and raw-metadata cleanup health. `spool.files` is diagnostic inventory;
+HMAC/schema-verified spool files, bytes/overflow, the last Hook observation
+accepted into the canonical queue, and raw-metadata cleanup health.
+`spool.files` is diagnostic inventory;
 `spool.verified_files` is the capture proof. Status opens SQLite in read-only
 mode, never imports or cleans the spool, and never opens a transcript.
 

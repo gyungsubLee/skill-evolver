@@ -906,6 +906,8 @@ git commit -m "release(skill-evolver): activate plugin data capture"
 - Expected plugin-data root:
   `/Users/igyeongseob/.codex/plugins/data/skill-evolver-skill-evolver-dev`
 - Expected successor quality epoch: `Q-002`
+- One-time bootstrap: the exact plugin-data root must already exist as a
+  user-owned mode-`0700` directory. The Hook creates only `stop-spool/`.
 
 - [x] **Step 1: Refresh the installed plugin**
 
@@ -925,13 +927,20 @@ Recorded 2026-07-31: the `0.1.2` Hook bytes are unchanged from the already
 trusted matcher-free plugin Hook, and its existing trust entry remains; no
 trusted hash was written manually.
 
-- [ ] **Step 3: Run one new meaningful Desktop task**
+- [x] **Step 3: Run one new meaningful Desktop task**
 
 The task must be a genuinely new Desktop session after `0.1.2` activation. Do
 not substitute a fixture, subagent, CLI process, repeated generation, or the
 missed `0.1.0` session.
 
-- [ ] **Step 4: Verify ingress before import**
+Recorded 2026-07-31: agent-created work was correctly classified as a
+subagent and excluded. A fresh user-origin Desktop task completed after
+activation. The first production attempt exposed that Codex supplied the
+plugin-data locator without pre-creating its directory; the exact pinned root
+was then initialized once as mode `0700`. A later meaningful user-origin
+Desktop task supplied the required production capture.
+
+- [x] **Step 4: Verify ingress before import**
 
 Run the read-only status command with both literal locators. Expected:
 
@@ -949,11 +958,21 @@ The exact byte count and raw `files` inventory may vary. One `verified_files`
 entry proves durable, authenticated Hook capture; it is not yet a canonical
 pending session.
 
-- [ ] **Step 5: Import once under explicit approval**
+Recorded 2026-07-31 before import: read-only status reported
+`pending_sessions=0`, `spool.files=2`, `spool.verified_files=2`, and
+`spool.bytes=1482`.
+
+- [x] **Step 5: Import once under explicit approval**
 
 Run one fully expanded `maintain` command approved for the canonical and
 plugin-data roots. Expected: `spool_imported >= 1`, then read-only status shows
 the ingress file removed and at least one canonical pending session.
+
+Recorded 2026-07-31: the separately approved command reported
+`spool_imported=2`, zero invalid, expired, duplicate, preserved, or saturated
+spool entries. The immediate read-only status reported
+`pending_sessions=2`, `pending_generations=2`, `spool.files=0`, and
+`spool.verified_files=0`.
 
 - [x] **Step 6: Roll the quality epoch forward**
 
@@ -973,7 +992,7 @@ Recorded 2026-07-31: `Q-001` terminalized `INVALID` for
 `2759c55fcc9262ef7ae83b55eb30b95466e932ce6621761dd305fa0d80a51bc1`;
 `Q-002` opened from that exact predecessor and reports `COLLECTING`.
 
-- [ ] **Step 7: Record production evidence**
+- [x] **Step 7: Record production evidence**
 
 Update `.planning/STATE.md` and `.planning/ROADMAP.md` with the actual plugin
 version, real capture/import counts, `Q-001` terminal digest and `Q-002`
@@ -987,3 +1006,7 @@ git commit -m "docs(skill-evolver): record plugin data capture proof"
 Do not claim Phase 5 complete. The next work remains collection of ten distinct
 meaningful sessions in `Q-002`, explicit bounded review, user-only labels and
 the quality gate.
+
+Recorded 2026-07-31: `.planning/STATE.md` and `.planning/ROADMAP.md` now carry
+the capture/import counts above. `Q-002` remains `COLLECTING`; no quality label
+or Phase 6 authorization was inferred from the production proof.
