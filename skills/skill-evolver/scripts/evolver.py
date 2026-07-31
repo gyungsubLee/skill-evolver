@@ -2108,7 +2108,7 @@ def transcript_adapter_contract(
 ) -> dict[str, object]:
     return {
         "schema_version": 1,
-        "format": "current-codex-jsonl-v1",
+        "format": "codex-rollout-jsonl-v2",
         "boundary": "half-open",
         "session_binding": "session-meta-hmac",
         "text_encoding": "strict-utf-8",
@@ -2170,11 +2170,18 @@ def transcript_adapter_contract(
                 "compacted",
                 "event_msg",
                 "inter_agent_communication_metadata",
+                "response_item/additional_tools",
                 "response_item/agent_message",
+                "response_item/compaction",
+                "response_item/compaction_trigger",
+                "response_item/context_compaction",
+                "response_item/custom_tool_call",
                 "response_item/function_call",
+                "response_item/local_shell_call",
                 "response_item/reasoning",
                 "response_item/tool_search_call",
                 "response_item/tool_search_output",
+                "response_item/web_search_call",
                 "tool_search_call",
                 "tool_search_output",
                 "turn_context",
@@ -2202,11 +2209,18 @@ TRANSCRIPT_IGNORED_TYPES = frozenset(
 )
 RESPONSE_ITEM_IGNORED_TYPES = frozenset(
     {
+        "additional_tools",
         "agent_message",
+        "compaction",
+        "compaction_trigger",
+        "context_compaction",
+        "custom_tool_call",
         "function_call",
+        "local_shell_call",
         "reasoning",
         "tool_search_call",
         "tool_search_output",
+        "web_search_call",
     }
 )
 OWNER_TOKEN_RECORD_TEXT = re.compile(
@@ -2478,6 +2492,29 @@ def _message_texts(payload: Mapping[str, object]) -> list[str]:
     return texts
 
 
+def _tool_output_texts(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [_validated_transcript_text(value)]
+    if not isinstance(value, list):
+        raise _transcript_error("unsupported_transcript")
+    texts: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise _transcript_error("unsupported_transcript")
+        item_type = item.get("type")
+        if item_type == "input_text":
+            texts.append(
+                _validated_transcript_text(item.get("text"))
+            )
+        elif item_type == "encrypted_content":
+            _validated_transcript_text(
+                item.get("encrypted_content")
+            )
+        else:
+            raise _transcript_error("unsupported_transcript")
+    return texts
+
+
 def _classify_transcript_object(
     value: object,
     installation: Installation,
@@ -2536,25 +2573,18 @@ def _classify_transcript_object(
         "function_call_output",
         "custom_tool_call_output",
     }:
-        output_value = payload.get("output")
-        if not isinstance(output_value, str):
-            if evidence_eligible:
-                raise _transcript_error("unsupported_transcript")
-            return []
-        output = _validated_transcript_text(output_value)
-        if _contains_ready_review_claim_output(
-            output, installation
-        ):
-            return []
-        output = _redact_transcript_record_text(output)
         return [
             TranscriptRecord(
                 source_kind="tool_output",
-                text=output,
+                text=_redact_transcript_record_text(output),
                 evidence_eligible=evidence_eligible,
                 scope=scope,
                 byte_start=byte_start,
                 byte_end=byte_end,
+            )
+            for output in _tool_output_texts(payload.get("output"))
+            if not _contains_ready_review_claim_output(
+                output, installation
             )
         ]
     if evidence_eligible:
