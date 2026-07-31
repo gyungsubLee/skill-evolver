@@ -12066,10 +12066,29 @@ def run_maintenance(
     installation: Installation,
     config: Config,
     now: float,
+    *,
+    capture_installation: Optional[Installation] = None,
 ) -> dict[str, int]:
     if connection.in_transaction:
         raise ValueError("active_transaction")
-    counts = import_spool(connection, installation, config, now)
+    sources = [capture_installation or installation]
+    if sources[0].spool != installation.spool:
+        sources.append(installation)
+    counts = {
+        "spool_imported": 0,
+        "spool_duplicates": 0,
+        "spool_invalid_deleted": 0,
+        "spool_expired": 0,
+        "spool_preserved": 0,
+        "spool_scan_saturated": 0,
+    }
+    for source in sources:
+        imported = import_spool(connection, source, config, now)
+        for name, value in imported.items():
+            if name == "spool_scan_saturated":
+                counts[name] = max(counts[name], value)
+            else:
+                counts[name] += value
     result_files: list[BoundReviewResult] = []
     connection.execute("BEGIN IMMEDIATE")
     try:
@@ -13186,6 +13205,8 @@ def run_maintenance(
 
 
 def spool_inventory(installation: Installation) -> tuple[int, int, bool]:
+    if not installation.spool.is_dir():
+        return 0, 0, False
     count = total = 0
     paths, saturated = bounded_spool_paths(
         installation, DEFAULTS["spool_limit_files"]
@@ -13309,6 +13330,7 @@ def queue_status(
         },
         "binding_failures": binding_failures,
         "spool": {
+            "available": installation.spool.is_dir(),
             "files": spool_files,
             "bytes": spool_bytes,
             "scan_saturated": spool_saturated,
@@ -13413,10 +13435,26 @@ def cmd_enqueue_stop(args: argparse.Namespace) -> int:
 def cmd_maintain(args: argparse.Namespace) -> int:
     installation = load_installation(Path(args.installation))
     config = load_config(installation)
+    plugin_data = load_review_runtime().plugin_data
+    expected_plugin_data = (
+        installation.data_root.parent
+        / "plugins/data/skill-evolver-skill-evolver-dev"
+    )
+    capture = (
+        plugin_spool_installation(
+            installation, plugin_data, create=True
+        )
+        if plugin_data == expected_plugin_data
+        else installation
+    )
     connection = open_database(installation)
     try:
         result = run_maintenance(
-            connection, installation, config, time.time()
+            connection,
+            installation,
+            config,
+            time.time(),
+            capture_installation=capture,
         )
     finally:
         connection.close()
@@ -13426,9 +13464,21 @@ def cmd_maintain(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     installation = load_installation(Path(args.installation))
+    plugin_data = load_review_runtime().plugin_data
+    expected_plugin_data = (
+        installation.data_root.parent
+        / "plugins/data/skill-evolver-skill-evolver-dev"
+    )
+    capture = (
+        plugin_spool_installation(
+            installation, plugin_data, create=False
+        )
+        if plugin_data == expected_plugin_data
+        else installation
+    )
     connection = open_database(installation, read_only=True)
     try:
-        result = queue_status(connection, installation, time.time())
+        result = queue_status(connection, capture, time.time())
     finally:
         connection.close()
     write_json_stdout(result)

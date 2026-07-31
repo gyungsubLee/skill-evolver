@@ -2517,6 +2517,175 @@ class MaintenanceStatusTests(unittest.TestCase):
         assert event is not None
         return event
 
+    def capture_installation(self):
+        plugin_data = (
+            self.installation.data_root.parent
+            / "plugins/data/skill-evolver-skill-evolver-dev"
+        )
+        plugin_data.mkdir(mode=0o700, parents=True)
+        spool = plugin_data / "stop-spool"
+        spool.mkdir(mode=0o700)
+        return replace(self.installation, spool=spool)
+
+    def test_maintenance_imports_plugin_data_spool_idempotently(
+        self,
+    ) -> None:
+        capture = self.capture_installation()
+        event = replace(
+            self.event("plugin-session"),
+            observed_at_ns=2_000_000_000_000_000_000,
+        )
+        key = self.runtime.session_key(
+            self.installation, event.session_id
+        )
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                capture,
+                self.runtime_config,
+                event,
+                key,
+                2_000_000_000.0,
+                coalesce=True,
+            )
+        )
+        source = next(capture.spool.glob("*.json"))
+        replay = source.read_bytes()
+        connection = self.runtime.open_database(self.installation)
+        first = self.runtime.run_maintenance(
+            connection,
+            self.installation,
+            self.runtime_config,
+            2_000_000_001.0,
+            capture_installation=capture,
+        )
+        source.write_bytes(replay)
+        source.chmod(0o600)
+        second = self.runtime.run_maintenance(
+            connection,
+            self.installation,
+            self.runtime_config,
+            2_000_000_002.0,
+            capture_installation=capture,
+        )
+        rows = connection.execute(
+            "SELECT COUNT(*) FROM review_items"
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(first["spool_imported"], 1)
+        self.assertEqual(second["spool_imported"], 0)
+        self.assertEqual(second["spool_duplicates"], 1)
+        self.assertEqual(rows, 1)
+        self.assertEqual(list(capture.spool.glob("*.json")), [])
+
+    def test_status_reports_unimported_plugin_data_capture_read_only(
+        self,
+    ) -> None:
+        capture = self.capture_installation()
+        event = self.event("unimported-plugin-session")
+        key = self.runtime.session_key(
+            self.installation, event.session_id
+        )
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                capture,
+                self.runtime_config,
+                event,
+                key,
+                2_000_000_000.0,
+                coalesce=True,
+            )
+        )
+        database_before = self.installation.database.read_bytes()
+        spool_before = {
+            path.name: path.read_bytes()
+            for path in capture.spool.iterdir()
+            if path.is_file()
+        }
+        connection = self.runtime.open_database(
+            self.installation, read_only=True
+        )
+        with mock.patch.object(
+            self.runtime,
+            "import_spool",
+            side_effect=AssertionError("status import"),
+        ), mock.patch.object(
+            self.runtime,
+            "run_maintenance",
+            side_effect=AssertionError("status mutation"),
+        ):
+            status = self.runtime.queue_status(
+                connection, capture, 2_000_000_001.0
+            )
+        connection.close()
+        self.assertEqual(status["pending_sessions"], 0)
+        self.assertEqual(status["spool"]["files"], 1)
+        self.assertTrue(status["spool"]["available"])
+        self.assertEqual(
+            self.installation.database.read_bytes(), database_before
+        )
+        self.assertEqual(
+            {
+                path.name: path.read_bytes()
+                for path in capture.spool.iterdir()
+                if path.is_file()
+            },
+            spool_before,
+        )
+
+    def test_raw_transcript_content_is_never_persisted_in_ingress_or_database(
+        self,
+    ) -> None:
+        sentinel = b"transcript-body-private-7e8c0ff27da5453b"
+        self.transcript.write_bytes(sentinel)
+        capture = self.capture_installation()
+        runtime = replace(
+            self.runtime.load_review_runtime(),
+            plugin_data=capture.spool.parent,
+        )
+        payload = {
+            "hook_event_name": "Stop",
+            "session_id": "public-privacy-session",
+            "cwd": str(self.workspace),
+            "transcript_path": str(self.transcript),
+        }
+        stdin = mock.Mock()
+        stdin.buffer.read.return_value = json.dumps(payload).encode()
+        with mock.patch.object(
+            self.runtime, "load_review_runtime", return_value=runtime
+        ), mock.patch.object(
+            self.runtime.sys, "stdin", stdin
+        ), mock.patch.object(
+            self.runtime, "write_json_stdout"
+        ):
+            self.assertEqual(
+                self.runtime.cmd_enqueue_stop(
+                    Namespace(
+                        installation=str(self.installation_path),
+                        plugin_data=str(capture.spool.parent),
+                    )
+                ),
+                0,
+            )
+            self.assertEqual(
+                self.runtime.cmd_maintain(
+                    Namespace(installation=str(self.installation_path))
+                ),
+                0,
+            )
+        connection = self.runtime.open_database(
+            self.installation, read_only=True
+        )
+        rows = connection.execute(
+            "SELECT COUNT(*) FROM review_items"
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(rows, 1)
+        self.assertEqual(list(capture.spool.glob("*.json")), [])
+        for root in (self.installation.data_root, capture.spool.parent):
+            for path in root.rglob("*"):
+                if path.is_file() and not path.is_symlink():
+                    self.assertNotIn(sentinel, path.read_bytes(), path)
+
     def test_status_command_opens_read_only_immediately_after_init(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn(
@@ -2533,16 +2702,44 @@ class MaintenanceStatusTests(unittest.TestCase):
         spool_entries_before = sorted(
             path.name for path in self.installation.spool.iterdir()
         )
-        process = run_isolated(
-            "status",
-            "--installation",
-            str(self.installation_path),
+        plugin_data = (
+            self.installation.data_root.parent
+            / "plugins/data/skill-evolver-skill-evolver-dev"
         )
-        self.assertEqual(process.returncode, 0)
-        self.assertEqual(process.stderr, b"")
-        status = json.loads(process.stdout)
+        runtime = replace(
+            self.runtime.load_review_runtime(), plugin_data=plugin_data
+        )
+        open_database = self.runtime.open_database
+        read_only_modes: list[bool] = []
+
+        def tracked_open_database(
+            installation, *, read_only: bool = False
+        ):
+            read_only_modes.append(read_only)
+            return open_database(installation, read_only=read_only)
+
+        captured: list[dict[str, object]] = []
+        with mock.patch.object(
+            self.runtime, "load_review_runtime", return_value=runtime
+        ), mock.patch.object(
+            self.runtime,
+            "open_database",
+            side_effect=tracked_open_database,
+        ), mock.patch.object(
+            self.runtime,
+            "write_json_stdout",
+            side_effect=captured.append,
+        ):
+            result = self.runtime.cmd_status(
+                Namespace(installation=str(self.installation_path))
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(read_only_modes, [True])
+        status = captured[0]
         self.assertEqual(status["pending_sessions"], 0)
         self.assertEqual(status["spool"]["files"], 0)
+        self.assertFalse(status["spool"]["available"])
+        self.assertFalse(plugin_data.exists())
         self.assertEqual(
             self.installation.database.read_bytes(),
             database_before,
@@ -2605,6 +2802,49 @@ class MaintenanceStatusTests(unittest.TestCase):
         self.assertEqual(
             outside.read_text(encoding="utf-8"),
             '{"private":"do-not-follow"}\n',
+        )
+
+    def test_maintenance_drains_plugin_and_legacy_spools(self) -> None:
+        now = 2_000_000_000.0
+        capture = self.capture_installation()
+        for installation, session_id in (
+            (capture, "plugin-spool-session"),
+            (self.installation, "legacy-spool-session"),
+        ):
+            event = replace(
+                self.event(session_id),
+                observed_at_ns=int(now * 1_000_000_000),
+            )
+            key = self.runtime.session_key(
+                self.installation, event.session_id
+            )
+            self.assertTrue(
+                self.runtime.spool_session_stop(
+                    installation,
+                    self.runtime_config,
+                    event,
+                    key,
+                    now,
+                    coalesce=True,
+                )
+            )
+        connection = self.runtime.open_database(self.installation)
+        result = self.runtime.run_maintenance(
+            connection,
+            self.installation,
+            self.runtime_config,
+            now + 1,
+            capture_installation=capture,
+        )
+        rows = connection.execute(
+            "SELECT COUNT(*) FROM review_items"
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(result["spool_imported"], 2)
+        self.assertEqual(rows, 2)
+        self.assertEqual(list(capture.spool.glob("*.json")), [])
+        self.assertEqual(
+            list(self.installation.spool.glob("*.json")), []
         )
 
     def test_spool_import_is_bounded_and_does_not_read_transcripts(self) -> None:
@@ -4216,6 +4456,7 @@ class MaintenanceStatusTests(unittest.TestCase):
         self,
     ) -> None:
         now = 2_000_000_000.0
+        capture = self.capture_installation()
         event = self.event()
         key = self.runtime.session_key(self.installation, event.session_id)
         connection = self.runtime.open_database(self.installation)
@@ -4227,10 +4468,10 @@ class MaintenanceStatusTests(unittest.TestCase):
             (key,),
         )
         connection.close()
-        waiting = self.installation.spool / "waiting.json"
+        waiting = capture.spool / "waiting.json"
         waiting.write_text("{}\n", encoding="utf-8")
         waiting.chmod(0o600)
-        overflow = self.installation.spool / "overflow.events"
+        overflow = capture.spool / "overflow.events"
         overflow.write_bytes(
             b"1\n" * (self.runtime.MAX_OVERFLOW_EVENT_BYTES // 2 - 1)
             + b"1"
@@ -4242,13 +4483,14 @@ class MaintenanceStatusTests(unittest.TestCase):
             self.installation, read_only=True
         )
         status = self.runtime.queue_status(
-            read_only, self.installation, now + 10
+            read_only, capture, now + 10
         )
         read_only.close()
         self.assertEqual(status["pending_sessions"], 1)
         self.assertEqual(status["pending_generations"], 1)
         self.assertEqual(status["generation_count_total"], 3)
         self.assertEqual(status["leases"], {"active": 0, "expired": 0})
+        self.assertTrue(status["spool"]["available"])
         self.assertEqual(status["spool"]["files"], 1)
         self.assertEqual(status["spool"]["bytes"], waiting.stat().st_size)
         self.assertEqual(status["spool"]["overflow_total"], 32_767)
@@ -4256,6 +4498,10 @@ class MaintenanceStatusTests(unittest.TestCase):
         self.assertTrue(waiting.exists())
 
         captured: list[dict[str, object]] = []
+        runtime = replace(
+            self.runtime.load_review_runtime(),
+            plugin_data=capture.spool.parent,
+        )
         with mock.patch.object(
             self.runtime,
             "run_maintenance",
@@ -4264,6 +4510,8 @@ class MaintenanceStatusTests(unittest.TestCase):
             self.runtime,
             "import_spool",
             side_effect=AssertionError("status import"),
+        ), mock.patch.object(
+            self.runtime, "load_review_runtime", return_value=runtime
         ), mock.patch.object(
             self.runtime,
             "write_json_stdout",
@@ -4274,6 +4522,8 @@ class MaintenanceStatusTests(unittest.TestCase):
             )
         self.assertEqual(result, 0)
         self.assertEqual(captured[0]["pending_sessions"], 1)
+        self.assertEqual(captured[0]["spool"]["files"], 1)
+        self.assertTrue(captured[0]["spool"]["available"])
         self.assertTrue(waiting.exists())
 
     def test_status_reports_bounded_partial_inventory_when_saturated(
