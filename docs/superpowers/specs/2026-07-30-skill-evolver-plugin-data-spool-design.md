@@ -147,7 +147,7 @@ and never block the completed task.
 
 ### 6.2 Explicit import
 
-`maintain` and the existing explicit review entry path:
+`maintain` is the only ingress import entry path:
 
 1. open the canonical database with the existing explicit approval;
 2. scan the pinned ingress spool within existing entry and byte bounds;
@@ -167,9 +167,9 @@ object. It does not add spool files to `pending_sessions`, because multiple
 files may converge to one session after import.
 
 `last_hook_success_at` continues to mean “accepted into the canonical queue.”
-Before import, a non-zero spool count is the durable proof that automatic
-capture succeeded. This avoids mutating the canonical database merely to report
-Hook health.
+Before import, `spool.verified_files >= 1` is the durable proof that automatic
+capture succeeded; the raw spool count is diagnostic inventory only. This
+avoids mutating the canonical database merely to report Hook health.
 
 If plugin data is absent, status reports an empty spool plus a bounded
 availability indicator; it does not create directories. The Hook may create
