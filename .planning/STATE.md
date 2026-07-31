@@ -24,9 +24,10 @@ Phase: 5 of 11 (Read-only Quality Gate)
 Plan: 0 of 1 in current phase
 Status: `0.1.2` is installed with source/cache digest parity. `Q-001`
 terminalized `INVALID` for provenance drift and `Q-002` is `COLLECTING`.
-Phase 5 remains blocked from Phase 6 until `Q-002` passes.
-Last activity: 2026-07-31 — installed `0.1.2`, terminalized `Q-001`, and
-opened `Q-002`; a fresh post-activation Desktop capture/import proof remains
+Two authenticated Desktop Stop captures were imported into the canonical
+queue. Phase 5 remains blocked from Phase 6 until `Q-002` passes.
+Last activity: 2026-07-31 — initialized the exact mode-`0700` plugin-data
+root, verified two ingress files, and imported both into the canonical queue
 
 Progress: [████░░░░░░] 36%
 
@@ -48,7 +49,8 @@ Progress: [████░░░░░░] 36%
 
 **Recent Trend:** Four sequential phase gates recorded; Phase 2, Phase 3 and
 Phase 4 are PASS; the `0.1.0` production capture assumption regressed and
-Phase 5 is blocked pending a production-proven `Q-002` sample and successor
+the `0.1.2` plugin-data path now has real Desktop capture/import proof. Phase
+5 remains blocked pending the complete `Q-002` sample, labels and successor
 PASS
 
 ## Accumulated Context
@@ -81,12 +83,17 @@ PASS
   digest `2759c55fcc9262ef7ae83b55eb30b95466e932ce6621761dd305fa0d80a51bc1`.
 - `Q-002` opened from that exact predecessor digest at
   `2026-07-31T01:36:39Z` and is `COLLECTING` with no synthetic carryover.
+- In this rollout Codex supplied the plugin-data locator without pre-creating
+  its directory. The exact pinned root was initialized once as a user-owned
+  mode-`0700` directory; the Hook remains fail-closed for an absent or unsafe
+  root.
+- Production read-only status then proved two authenticated ingress files
+  with `pending_sessions=0` and `spool.verified_files=2`. One separately
+  approved maintenance invocation imported both; immediate post-import status
+  reported `pending_sessions=2`, `pending_generations=2`, and an empty spool.
 
 ### Pending Todos
 
-- Run one fresh meaningful Desktop task loaded after `0.1.2`, prove
-  `spool.verified_files >= 1`, and import it once through explicit
-  maintenance.
 - Collect at least 10 distinct meaningful real Codex sessions in `Q-002`.
 - Explicitly review the successor epoch's collected sessions in bounded batches
   and seal it.
@@ -100,9 +107,9 @@ PASS
 - Phase 4 PASS proves deterministic mechanics and safety only; candidate quality remains unmeasured until Phase 5.
 - Phase 5 cannot use fixtures, subagents, repeated generations in this task, or
   empty generated tasks as substitutes for 10 distinct real sessions.
-- `Q-002` exists and is collecting, but no post-activation Desktop ingress
-  proof or real quality observation has been recorded yet. Phase 6 remains
-  blocked until `Q-002` passes.
+- `Q-002` has production-proven Desktop ingress and two imported pending
+  sessions, but no complete real quality sample or human label set yet. Phase
+  6 remains blocked until `Q-002` passes.
 - The original Phase 1 `FAIL` and superseded turn-level Review plan remain immutable historical evidence.
 
 ## Deferred Items
@@ -115,7 +122,7 @@ PASS
 ## Session Continuity
 
 Last session: 2026-07-31
-Stopped at: `0.1.2` installed and `Q-002` collecting; next prove one fresh
-Desktop ingress/import, then collect real Codex tasks for bounded review,
+Stopped at: `0.1.2` Desktop ingress/import proved with two sessions and
+`Q-002` collecting; next collect real Codex tasks for bounded review,
 external-terminal labels, and the quality gate
 Resume file: None

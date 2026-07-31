@@ -115,9 +115,11 @@ Plans:
 **Gate Result**: **BLOCKED** — installed `0.1.2` routes capture through plugin
 data. `Q-001` terminalized `INVALID` for provenance drift with report digest
 `2759c55fcc9262ef7ae83b55eb30b95466e932ce6621761dd305fa0d80a51bc1`;
-`Q-002` is `COLLECTING`. A fresh post-activation Desktop ingress/import proof
-and the real quality sample remain. Phase 6 stays blocked until `Q-002`
-passes.
+`Q-002` is `COLLECTING`. Production proof on 2026-07-31 observed two
+authenticated ingress files with `pending_sessions=0`, imported both in one
+approved maintenance invocation, and then observed `pending_sessions=2`,
+`pending_generations=2`, and an empty spool. The complete real quality sample
+and labels remain. Phase 6 stays blocked until `Q-002` passes.
 **Failure Route**: Phase 4 transcript adapter 또는 improvement policy로 돌아간다.
 **Success Criteria** (what must be TRUE):
   1. 개발자가 최소 10 sessions 또는 30 review items에 대한 complete label set을 확인할 수 있다.
