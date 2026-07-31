@@ -1762,6 +1762,57 @@ class FrozenTranscriptFailureTests(FrozenTranscriptTestCase):
             retryable=False,
         )
 
+    def test_invalid_bounded_context_shapes_are_terminal(self) -> None:
+        cases = (
+            (
+                "unknown-outer-evidence",
+                {
+                    "type": "future_record",
+                    "payload": {"content": "unsupported"},
+                },
+            ),
+            (
+                "non-dict-response-payload",
+                {
+                    "type": "response_item",
+                    "payload": "unsupported",
+                },
+            ),
+            (
+                "unsupported-message-role",
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "tool",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "unsupported",
+                            }
+                        ],
+                    },
+                },
+            ),
+        )
+        for label, invalid_value in cases:
+            with self.subTest(label=label):
+                session_id = f"bounded-context-{label}"
+                header = self.header(session_id)
+                invalid = (
+                    json.dumps(
+                        invalid_value, separators=(",", ":")
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+                self.assert_transcript_error(
+                    [header, invalid, self.message(b"valid delta")],
+                    reviewed_boundary=len(header) + len(invalid),
+                    session_id=session_id,
+                    code="unsupported_transcript",
+                    retryable=False,
+                )
+
     def test_structured_tool_output_is_terminal(self) -> None:
         for label, output in (
             (
@@ -1797,6 +1848,13 @@ class FrozenTranscriptFailureTests(FrozenTranscriptTestCase):
             (
                 "not-a-list",
                 {"type": "input_text", "text": "not-a-list"},
+            ),
+            (
+                "cross-fragment-owner-token",
+                [
+                    {"type": "input_text", "text": "owner_token="},
+                    {"type": "input_text", "text": "a" * 64},
+                ],
             ),
         ):
             session_id = f"structured-tool-output-{label}"
@@ -2277,6 +2335,14 @@ class FrozenTranscriptBoundedReadTests(FrozenTranscriptTestCase):
         ready_claim_output = self.runtime.canonical_json_bytes(
             ready_claim
         ).decode()
+        ready_prefix, marker, ready_suffix = (
+            ready_claim_output.partition('"owner_token"')
+        )
+        self.assertEqual(marker, '"owner_token"')
+        split_ready_claim_fragments = (
+            f'{ready_prefix}"owner_',
+            f'token"{ready_suffix}',
+        )
         framed_ready_claim_output = (
             "Chunk ID: deadbeef\n"
             "Wall time: 0.125 seconds\n"
@@ -2316,8 +2382,14 @@ class FrozenTranscriptBoundedReadTests(FrozenTranscriptTestCase):
             ),
             response_line(
                 {
-                    "type": "function_call_output",
-                    "output": ready_claim_output,
+                    "type": "custom_tool_call_output",
+                    "output": [
+                        {
+                            "type": "input_text",
+                            "text": fragment,
+                        }
+                        for fragment in split_ready_claim_fragments
+                    ],
                 }
             ),
             response_line(
@@ -2424,6 +2496,7 @@ class FrozenTranscriptBoundedReadTests(FrozenTranscriptTestCase):
                 ready_session_ref,
                 ready_record_ref,
                 "private prior review output",
+                *split_ready_claim_fragments,
             ):
                 self.assertNotIn(private, exported_text)
             self.assertIn(unrelated_hash, exported_text)
@@ -2433,6 +2506,9 @@ class FrozenTranscriptBoundedReadTests(FrozenTranscriptTestCase):
                     "version": 1,
                     "ready_review_claim_tool_output": (
                         "direct-or-final-output-suffix-v1-strict-owner-hmac"
+                    ),
+                    "structured_text_security": (
+                        "concatenated-scan-before-fragment-export-v1"
                     ),
                 },
             )

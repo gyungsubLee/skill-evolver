@@ -276,6 +276,7 @@ before changing production behavior.
   `_tool_output_texts(value: object) -> list[str]`
 - Modifies: `_classify_transcript_object(...)`
 - Modifies: `transcript_adapter_contract(...)`
+- Reuses: `_contains_evidence_shape(...)`
 
 - [ ] **Step 1: Extend only the exact known metadata allowlist**
 
@@ -338,27 +339,41 @@ function and custom-tool output.
 In the `function_call_output` / `custom_tool_call_output` branch:
 
 1. Call `_tool_output_texts(payload.get("output"))`.
-2. Remove any raw decoded text that is a ready-review-claim output.
-3. Apply `_redact_transcript_record_text(...)` to each remaining text.
-4. Build one `TranscriptRecord(source_kind="tool_output", ...)` per remaining
-   redacted text.
-5. Preserve `evidence_eligible`, `scope`, and byte boundaries exactly.
+2. Join the validated raw fragments without a separator.
+3. If any raw fragment or the joined raw text is a valid bound
+   ready-review-claim output, exclude the whole response item.
+4. Apply `_redact_transcript_record_text(...)` to every raw fragment.
+5. Join the redacted fragments without a separator and fail terminally as
+   `unsupported_transcript` if the owner-token regex still matches.
+6. Otherwise build one
+   `TranscriptRecord(source_kind="tool_output", ...)` per redacted fragment.
+7. Preserve `evidence_eligible`, `scope`, and byte boundaries exactly.
 
 Do not silently ignore an invalid context-only structured output: an
 unsupported response item inside the bounded transcript is a compatibility
-failure regardless of whether it can become evidence.
+failure regardless of whether it can become evidence. Unknown outer records
+with an evidence shape, non-dict response-item payloads, and unsupported
+message roles are likewise terminal in both context and delta.
 
 - [ ] **Step 4: Publish adapter contract v2**
 
-Change only:
+Keep:
 
 ```python
 "format": "codex-rollout-jsonl-v2",
 ```
 
-and the exact sorted `recognized.ignore` list locked in Task 1. Keep schema
-version, source kinds, limits, redaction, relocation, and exclusion contracts
-unchanged.
+and the exact sorted `recognized.ignore` list locked in Task 1. Add this
+exact `record_exclusion` field:
+
+```python
+"structured_text_security": (
+    "concatenated-scan-before-fragment-export-v1"
+),
+```
+
+Keep schema version, source kinds, limits, redaction, and relocation
+contracts unchanged.
 
 - [ ] **Step 5: Run focused tests and verify GREEN**
 

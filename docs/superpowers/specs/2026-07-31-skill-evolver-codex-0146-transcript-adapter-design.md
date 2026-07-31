@@ -136,6 +136,14 @@ The adapter accepts a string exactly as before. For an array:
   non-list/non-string body makes the session terminally
   `unsupported_transcript`.
 
+All plaintext fragments in one tool-output response item form one security
+boundary. Before exporting any fragment, the adapter scans each raw fragment
+and their separator-free concatenation for a valid bound ready-review claim;
+any match excludes the entire response item. It then redacts each fragment
+individually and scans the separator-free concatenation again. A remaining
+owner token crossed a fragment boundary, so the session fails closed as
+`unsupported_transcript`.
+
 This avoids silently converting multimodal evidence into an incomplete text
 review. Existing transcript byte, record, UTF-8, evidence-shape and envelope
 limits continue to apply.

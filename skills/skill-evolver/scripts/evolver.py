@@ -2124,6 +2124,9 @@ def transcript_adapter_contract(
             "ready_review_claim_tool_output": (
                 "direct-or-final-output-suffix-v1-strict-owner-hmac"
             ),
+            "structured_text_security": (
+                "concatenated-scan-before-fragment-export-v1"
+            ),
         },
         "read_past_frozen_to": False,
         "context": "bounded-reverse-complete-records",
@@ -2525,7 +2528,7 @@ def _classify_transcript_object(
     byte_end: int,
 ) -> list[TranscriptRecord]:
     if not isinstance(value, dict):
-        if evidence_eligible:
+        if evidence_eligible or _contains_evidence_shape(value):
             raise _transcript_error("unsupported_transcript")
         return []
     record_type = value.get("type")
@@ -2538,13 +2541,11 @@ def _classify_transcript_object(
     if record_type in TRANSCRIPT_IGNORED_TYPES:
         return []
     if record_type != "response_item":
-        if evidence_eligible and _contains_evidence_shape(value):
+        if _contains_evidence_shape(value):
             raise _transcript_error("unsupported_transcript")
         return []
     if not isinstance(payload, dict):
-        if evidence_eligible:
-            raise _transcript_error("unsupported_transcript")
-        return []
+        raise _transcript_error("unsupported_transcript")
     item_type = payload.get("type")
     if item_type in RESPONSE_ITEM_IGNORED_TYPES:
         return []
@@ -2554,9 +2555,7 @@ def _classify_transcript_object(
         if role in {"developer", "system"}:
             return []
         if role not in {"user", "assistant"}:
-            if evidence_eligible and _contains_evidence_shape(payload):
-                raise _transcript_error("unsupported_transcript")
-            return []
+            raise _transcript_error("unsupported_transcript")
         source_kind = "user_direct" if role == "user" else "assistant"
         return [
             TranscriptRecord(
@@ -2573,19 +2572,31 @@ def _classify_transcript_object(
         "function_call_output",
         "custom_tool_call_output",
     }:
+        raw_outputs = _tool_output_texts(payload.get("output"))
+        combined_raw = "".join(raw_outputs)
+        if any(
+            _contains_ready_review_claim_output(
+                output, installation
+            )
+            for output in (*raw_outputs, combined_raw)
+        ):
+            return []
+        outputs = [
+            _redact_transcript_record_text(output)
+            for output in raw_outputs
+        ]
+        if OWNER_TOKEN_RECORD_TEXT.search("".join(outputs)):
+            raise _transcript_error("unsupported_transcript")
         return [
             TranscriptRecord(
                 source_kind="tool_output",
-                text=_redact_transcript_record_text(output),
+                text=output,
                 evidence_eligible=evidence_eligible,
                 scope=scope,
                 byte_start=byte_start,
                 byte_end=byte_end,
             )
-            for output in _tool_output_texts(payload.get("output"))
-            if not _contains_ready_review_claim_output(
-                output, installation
-            )
+            for output in outputs
         ]
     raise _transcript_error("unsupported_transcript")
 
