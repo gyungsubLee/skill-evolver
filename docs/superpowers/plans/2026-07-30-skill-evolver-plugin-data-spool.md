@@ -907,16 +907,23 @@ git commit -m "release(skill-evolver): activate plugin data capture"
   `/Users/igyeongseob/.codex/plugins/data/skill-evolver-skill-evolver-dev`
 - Expected successor quality epoch: `Q-002`
 
-- [ ] **Step 1: Refresh the installed plugin**
+- [x] **Step 1: Refresh the installed plugin**
 
 Run the exact local marketplace/plugin refresh command and verify `codex plugin
 list --json` reports `0.1.2`. Do not edit the cache directly.
 
-- [ ] **Step 2: Review the changed Hook trust**
+Recorded 2026-07-31: `codex plugin add` installed `0.1.2`; the cached
+executable, Hook and runtime-reference digests equal their source digests.
+
+- [x] **Step 2: Review the changed Hook trust**
 
 Use Codex `/hooks` and trust only the matcher-free `Stop` command whose
 `--plugin-data` value is `"$PLUGIN_DATA"`. Do not write a trusted hash directly
 into `config.toml`.
+
+Recorded 2026-07-31: the `0.1.2` Hook bytes are unchanged from the already
+trusted matcher-free plugin Hook, and its existing trust entry remains; no
+trusted hash was written manually.
 
 - [ ] **Step 3: Run one new meaningful Desktop task**
 
@@ -948,7 +955,7 @@ Run one fully expanded `maintain` command approved for the canonical and
 plugin-data roots. Expected: `spool_imported >= 1`, then read-only status shows
 the ingress file removed and at least one canonical pending session.
 
-- [ ] **Step 6: Roll the quality epoch forward**
+- [x] **Step 6: Roll the quality epoch forward**
 
 Run separately approved `quality-seal` and `quality-gate Q-001` commands. The
 first must invalidate empty `Q-001` with
@@ -960,6 +967,11 @@ construct `Q-001@` followed immediately by those exact 64 lowercase
 hexadecimal characters in current-turn memory, and use that complete value in
 one separately approved `quality-open --predecessor` command. Verify read-only
 `quality-status` reports `Q-002` as `COLLECTING` with zero synthetic carryover.
+
+Recorded 2026-07-31: `Q-001` terminalized `INVALID` for
+`quality_provenance_drift` with report digest
+`2759c55fcc9262ef7ae83b55eb30b95466e932ce6621761dd305fa0d80a51bc1`;
+`Q-002` opened from that exact predecessor and reports `COLLECTING`.
 
 - [ ] **Step 7: Record production evidence**
 

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Skill Evolver는 Phase 1 Feasibility `FAIL`을 Phase 2의 session-level 계약으로 수정해 amended gate `PASS`를 확보했고, Phase 3에서 bounded Runtime Queue를 구현했다. `0.1.0`의 production capture assumption은 regressed 되었고 `0.1.2`는 capture를 plugin data로 route한다. `Q-001` must terminalize as provenance drift before a successor epoch can pass Phase 5; Phase 6 remains blocked until then. 이제 explicit Review/Inbox를 구현한 뒤 quality, runner, immutable evaluation, manual apply/versioning, undo/recovery와 hardening gate를 순서대로 통과한다.
+Skill Evolver는 Phase 1 Feasibility `FAIL`을 Phase 2의 session-level 계약으로 수정해 amended gate `PASS`를 확보했고, Phase 3에서 bounded Runtime Queue를 구현했다. `0.1.0`의 production capture assumption은 regressed 되었고 설치된 `0.1.2`는 capture를 plugin data로 route한다. `Q-001`은 provenance drift로 terminal `INVALID` 처리됐고 `Q-002`가 실제 sample을 수집 중이다. Phase 6은 `Q-002`가 Phase 5를 통과할 때까지 차단된다. 이제 explicit Review/Inbox를 구현한 뒤 quality, runner, immutable evaluation, manual apply/versioning, undo/recovery와 hardening gate를 순서대로 통과한다.
 
 ## Phases
 
@@ -112,10 +112,12 @@ Plans:
 **Depends on**: Phase 4
 **Requirements**: QUALITY-01
 **Entry Gate**: Review/Inbox suite passes with zero target-skill writes
-**Gate Result**: **BLOCKED** — the `0.1.0` production capture assumption
-regressed; `0.1.2` routes capture through plugin data. `Q-001` must
-terminalize as provenance drift, is not terminal yet, and no successor epoch
-exists yet. Phase 6 remains blocked until a successor epoch passes.
+**Gate Result**: **BLOCKED** — installed `0.1.2` routes capture through plugin
+data. `Q-001` terminalized `INVALID` for provenance drift with report digest
+`2759c55fcc9262ef7ae83b55eb30b95466e932ce6621761dd305fa0d80a51bc1`;
+`Q-002` is `COLLECTING`. A fresh post-activation Desktop ingress/import proof
+and the real quality sample remain. Phase 6 stays blocked until `Q-002`
+passes.
 **Failure Route**: Phase 4 transcript adapter 또는 improvement policy로 돌아간다.
 **Success Criteria** (what must be TRUE):
   1. 개발자가 최소 10 sessions 또는 30 review items에 대한 complete label set을 확인할 수 있다.

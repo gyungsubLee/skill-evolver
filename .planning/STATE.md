@@ -22,12 +22,11 @@ See: `.planning/PROJECT.md` (updated 2026-07-27)
 
 Phase: 5 of 11 (Read-only Quality Gate)
 Plan: 0 of 1 in current phase
-Status: The `0.1.0` production capture assumption regressed; `0.1.2` routes
-capture through plugin data. `Q-001` must terminalize as provenance drift; it
-is not terminal yet, and Phase 5 remains blocked from Phase 6 until a
-successor epoch passes.
-Last activity: 2026-07-31 — `0.1.2` plugin-data capture release surfaces
-prepared; live plugin activation remains a separate task
+Status: `0.1.2` is installed with source/cache digest parity. `Q-001`
+terminalized `INVALID` for provenance drift and `Q-002` is `COLLECTING`.
+Phase 5 remains blocked from Phase 6 until `Q-002` passes.
+Last activity: 2026-07-31 — installed `0.1.2`, terminalized `Q-001`, and
+opened `Q-002`; a fresh post-activation Desktop capture/import proof remains
 
 Progress: [████░░░░░░] 36%
 
@@ -49,7 +48,8 @@ Progress: [████░░░░░░] 36%
 
 **Recent Trend:** Four sequential phase gates recorded; Phase 2, Phase 3 and
 Phase 4 are PASS; the `0.1.0` production capture assumption regressed and
-Phase 5 is blocked pending `Q-001` provenance rollover and a successor PASS
+Phase 5 is blocked pending a production-proven `Q-002` sample and successor
+PASS
 
 ## Accumulated Context
 
@@ -75,15 +75,19 @@ Phase 5 is blocked pending `Q-001` provenance rollover and a successor PASS
   the agent must not enter or infer them, including through a PTY.
 - The `0.1.0` production capture assumption regressed. Release `0.1.2`
   routes Stop capture through the pinned plugin-data root.
-- `Q-001` opened at `2026-07-30T10:15:35Z` must terminalize as provenance
-  drift before another quality epoch can begin. It is not terminal yet, and no
-  successor epoch exists yet.
+- Installed plugin `0.1.2` reports source/cache executable digest
+  `3cb3f1f611c0a7b07b62e4390bc7dc4b607fd8ee1444fc6a700c1c664f570d22`.
+- `Q-001` terminalized `INVALID` for `quality_provenance_drift` with report
+  digest `2759c55fcc9262ef7ae83b55eb30b95466e932ce6621761dd305fa0d80a51bc1`.
+- `Q-002` opened from that exact predecessor digest at
+  `2026-07-31T01:36:39Z` and is `COLLECTING` with no synthetic carryover.
 
 ### Pending Todos
 
-- Terminalize `Q-001` as provenance drift after the `0.1.2` rollover.
-- Open a successor epoch, then collect at least 10 distinct meaningful real
-  Codex sessions in that epoch.
+- Run one fresh meaningful Desktop task loaded after `0.1.2`, prove
+  `spool.verified_files >= 1`, and import it once through explicit
+  maintenance.
+- Collect at least 10 distinct meaningful real Codex sessions in `Q-002`.
 - Explicitly review the successor epoch's collected sessions in bounded batches
   and seal it.
 - Have the user attest every sealed candidate in an external terminal, then run
@@ -96,9 +100,9 @@ Phase 5 is blocked pending `Q-001` provenance rollover and a successor PASS
 - Phase 4 PASS proves deterministic mechanics and safety only; candidate quality remains unmeasured until Phase 5.
 - Phase 5 cannot use fixtures, subagents, repeated generations in this task, or
   empty generated tasks as substitutes for 10 distinct real sessions.
-- `Q-001` is pending required terminalization as provenance drift, not a
-  terminal quality result. A successor epoch does not exist yet, and Phase 6
-  remains blocked until that successor passes.
+- `Q-002` exists and is collecting, but no post-activation Desktop ingress
+  proof or real quality observation has been recorded yet. Phase 6 remains
+  blocked until `Q-002` passes.
 - The original Phase 1 `FAIL` and superseded turn-level Review plan remain immutable historical evidence.
 
 ## Deferred Items
@@ -111,7 +115,7 @@ Phase 5 is blocked pending `Q-001` provenance rollover and a successor PASS
 ## Session Continuity
 
 Last session: 2026-07-31
-Stopped at: `0.1.2` routes capture through plugin data; Q-001 must terminalize
-as provenance drift before a successor can collect real Codex tasks, be
-reviewed, sealed, labeled in an external terminal, and pass the gate
+Stopped at: `0.1.2` installed and `Q-002` collecting; next prove one fresh
+Desktop ingress/import, then collect real Codex tasks for bounded review,
+external-terminal labels, and the quality gate
 Resume file: None
