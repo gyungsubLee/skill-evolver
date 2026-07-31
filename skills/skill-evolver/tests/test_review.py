@@ -684,6 +684,15 @@ class FrozenTranscriptTestCase(unittest.TestCase):
             TEST_ROOT / "fixtures/review-current-layout.jsonl"
         ).read_bytes().splitlines(keepends=True)
 
+    def response_item(self, payload: dict[str, object]) -> bytes:
+        return (
+            json.dumps(
+                {"type": "response_item", "payload": payload},
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+
     def capture_and_claim(
         self,
         lines: list[bytes],
@@ -1738,6 +1747,77 @@ class FrozenTranscriptFailureTests(FrozenTranscriptTestCase):
             retryable=False,
         )
 
+    def test_structured_tool_output_is_terminal(self) -> None:
+        for label, output in (
+            (
+                "image",
+                [
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,AA==",
+                    }
+                ],
+            ),
+            (
+                "audio",
+                [
+                    {
+                        "type": "input_audio",
+                        "audio_url": "data:audio/wav;base64,AA==",
+                    }
+                ],
+            ),
+            (
+                "future-content",
+                [{"type": "future_content", "text": "unknown"}],
+            ),
+            (
+                "non-string-text",
+                [{"type": "input_text", "text": 7}],
+            ),
+            (
+                "non-string-encrypted-content",
+                [{"type": "encrypted_content", "encrypted_content": 7}],
+            ),
+            (
+                "not-a-list",
+                {"type": "input_text", "text": "not-a-list"},
+            ),
+        ):
+            session_id = f"structured-tool-output-{label}"
+            with self.subTest(label=label):
+                header = self.header(session_id)
+                self.assert_transcript_error(
+                    [
+                        header,
+                        self.response_item(
+                            {
+                                "type": "custom_tool_call_output",
+                                "call_id": "call-1",
+                                "output": output,
+                            }
+                        ),
+                    ],
+                    reviewed_boundary=len(header),
+                    session_id=session_id,
+                    code="unsupported_transcript",
+                    retryable=False,
+                )
+
+    def test_image_generation_call_is_terminal(self) -> None:
+        session_id = "image-generation-call"
+        header = self.header(session_id)
+        self.assert_transcript_error(
+            [
+                header,
+                self.response_item({"type": "image_generation_call"}),
+            ],
+            reviewed_boundary=len(header),
+            session_id=session_id,
+            code="unsupported_transcript",
+            retryable=False,
+        )
+
     def test_compiled_byte_limit_overrides_hostile_config(self) -> None:
         def exact_message(total: int) -> bytes:
             prefix = (
@@ -2028,6 +2108,34 @@ class FrozenTranscriptBoundedReadTests(FrozenTranscriptTestCase):
     def test_transcript_adapter_digest_is_static(self) -> None:
         adapter_contract = self.runtime.transcript_adapter_contract(
             self.review
+        )
+        self.assertEqual(
+            adapter_contract["format"], "codex-rollout-jsonl-v2"
+        )
+        self.assertEqual(
+            adapter_contract["recognized"]["ignore"],
+            [
+                "agent_message",
+                "compacted",
+                "event_msg",
+                "inter_agent_communication_metadata",
+                "response_item/additional_tools",
+                "response_item/agent_message",
+                "response_item/compaction",
+                "response_item/compaction_trigger",
+                "response_item/context_compaction",
+                "response_item/custom_tool_call",
+                "response_item/function_call",
+                "response_item/local_shell_call",
+                "response_item/reasoning",
+                "response_item/tool_search_call",
+                "response_item/tool_search_output",
+                "response_item/web_search_call",
+                "tool_search_call",
+                "tool_search_output",
+                "turn_context",
+                "world_state",
+            ],
         )
         self.assertEqual(
             adapter_contract["text_encoding"], "strict-utf-8"
@@ -2328,6 +2436,150 @@ class FrozenTranscriptBoundedReadTests(FrozenTranscriptTestCase):
 
 
 class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
+    def test_response_items_export_textual_tool_session(self) -> None:
+        session_id = "response-item-tool-session"
+        owner_token = "a" * 64
+        header = (
+            b'{"type":"session_meta","payload":{"session_id":"'
+            + session_id.encode("utf-8")
+            + b'"}}\n'
+        )
+        records = [
+            self.response_item(
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "inspect status"}
+                    ],
+                }
+            ),
+            self.response_item(
+                {
+                    "type": "custom_tool_call",
+                    "status": "completed",
+                    "call_id": "call-1",
+                    "name": "exec",
+                    "input": "{}",
+                }
+            ),
+            self.response_item(
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-1",
+                    "output": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                f"owner_token={owner_token} "
+                                "pending_sessions=2"
+                            ),
+                        },
+                        {
+                            "type": "encrypted_content",
+                            "encrypted_content": "opaque",
+                        },
+                    ],
+                }
+            ),
+            self.response_item(
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "status checked"}
+                    ],
+                }
+            ),
+        ]
+        connection, _, frozen = self.capture_and_claim(
+            [header, *records],
+            reviewed_boundary=len(header),
+            session_id=session_id,
+        )
+        try:
+            exported = self.runtime.read_frozen_transcript(
+                self.installation,
+                frozen,
+                self.config,
+                self.review,
+            )
+        finally:
+            connection.close()
+        self.assertEqual(
+            [(record.source_kind, record.text) for record in exported.records],
+            [
+                ("user_direct", "inspect status"),
+                (
+                    "tool_output",
+                    "owner_token=[REDACTED:owner-token] pending_sessions=2",
+                ),
+                ("assistant", "status checked"),
+            ],
+        )
+        self.assertTrue(
+            all(owner_token not in record.text for record in exported.records)
+        )
+
+    def test_response_item_control_records_are_ignored(self) -> None:
+        session_id = "response-item-control-records"
+        header = (
+            b'{"type":"session_meta","payload":{"session_id":"'
+            + session_id.encode("utf-8")
+            + b'"}}\n'
+        )
+        records = [
+            self.response_item(
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "before"}],
+                }
+            ),
+            *[
+                self.response_item({"type": item_type})
+                for item_type in (
+                    "additional_tools",
+                    "agent_message",
+                    "reasoning",
+                    "function_call",
+                    "custom_tool_call",
+                    "local_shell_call",
+                    "tool_search_call",
+                    "tool_search_output",
+                    "web_search_call",
+                    "compaction",
+                    "context_compaction",
+                    "compaction_trigger",
+                )
+            ],
+            self.response_item(
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "after"}],
+                }
+            ),
+        ]
+        connection, _, frozen = self.capture_and_claim(
+            [header, *records],
+            reviewed_boundary=len(header),
+            session_id=session_id,
+        )
+        try:
+            exported = self.runtime.read_frozen_transcript(
+                self.installation,
+                frozen,
+                self.config,
+                self.review,
+            )
+        finally:
+            connection.close()
+        self.assertEqual(
+            [(record.source_kind, record.text) for record in exported.records],
+            [("user_direct", "before"), ("assistant", "after")],
+        )
+
     def test_half_open_delta_reverse_context_and_provenance(self) -> None:
         context_end = sum(len(line) for line in self.fixture_lines[:4])
         connection, transcript, frozen = self.capture_and_claim(
