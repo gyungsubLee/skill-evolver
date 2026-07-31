@@ -11632,10 +11632,8 @@ def spool_session_stop(
             config.spool_limit_bytes, HARD_LIMITS["spool_limit_bytes"]
         )
         files: list[Path] = []
-        scanned_total = 0
         with os.scandir(installation.spool) as entries:
             for scanned, entry in enumerate(entries, start=1):
-                scanned_total = scanned
                 # Admit 200 payloads plus the lock/overflow sidecars; the next
                 # entry proves attacker-inflated inventory and ends the scan.
                 if scanned >= MAX_SPOOL_SCAN_ENTRIES:
@@ -11644,9 +11642,6 @@ def spool_session_stop(
                 if not entry.name.endswith(".json"):
                     continue
                 files.append(Path(entry.path))
-        if scanned_total + 1 >= MAX_SPOOL_SCAN_ENTRIES:
-            record_spool_overflow(installation)
-            return False
         total = 0
         for path in files:
             if path.is_symlink():

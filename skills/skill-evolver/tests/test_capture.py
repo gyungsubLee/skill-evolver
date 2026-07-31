@@ -852,6 +852,196 @@ class SessionCaptureTests(unittest.TestCase):
         )
         self.assertEqual(payload.read_bytes(), before)
 
+    def test_plugin_ingress_replaces_at_full_payload_cap_with_sidecars(
+        self,
+    ) -> None:
+        plugin_data, runtime = self.plugin_runtime()
+        with mock.patch.object(
+            self.runtime, "load_review_runtime", return_value=runtime
+        ):
+            bound = self.runtime.plugin_spool_installation(
+                self.installation, plugin_data, create=True
+            )
+        event = self.runtime.parse_session_stop(
+            json.dumps(self.payload).encode(),
+            bound,
+            self.runtime_config,
+        )
+        assert event is not None
+        key = self.runtime.session_key(bound, event.session_id)
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                bound,
+                self.runtime_config,
+                event,
+                key,
+                time.time(),
+                coalesce=True,
+            )
+        )
+        for index in range(
+            self.runtime.HARD_LIMITS["spool_limit_files"] - 1
+        ):
+            filler = bound.spool / f"filler-{index:03d}.json"
+            filler.write_bytes(b"")
+            filler.chmod(0o600)
+        overflow = bound.spool / "overflow.events"
+        overflow.write_bytes(b"1\n")
+        overflow.chmod(0o600)
+        before_overflow = overflow.read_bytes()
+        replacement = replace(
+            event,
+            observed_at_ns=event.observed_at_ns + 1,
+            transcript_size=event.transcript_size + 1,
+        )
+
+        spooled = self.runtime.spool_session_stop(
+            bound,
+            self.runtime_config,
+            replacement,
+            key,
+            time.time(),
+            coalesce=True,
+        )
+
+        self.assertTrue(spooled)
+        self.assertEqual(
+            len(list(bound.spool.glob("*.json"))),
+            self.runtime.HARD_LIMITS["spool_limit_files"],
+        )
+        self.assertEqual(len(list(bound.spool.iterdir())), 202)
+        self.assertEqual(overflow.read_bytes(), before_overflow)
+
+    def test_plugin_ingress_equal_timestamp_larger_boundary_replaces(
+        self,
+    ) -> None:
+        plugin_data, runtime = self.plugin_runtime()
+        with mock.patch.object(
+            self.runtime, "load_review_runtime", return_value=runtime
+        ):
+            bound = self.runtime.plugin_spool_installation(
+                self.installation, plugin_data, create=True
+            )
+        event = self.runtime.parse_session_stop(
+            json.dumps(self.payload).encode(),
+            bound,
+            self.runtime_config,
+        )
+        assert event is not None
+        key = self.runtime.session_key(bound, event.session_id)
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                bound,
+                self.runtime_config,
+                event,
+                key,
+                time.time(),
+                coalesce=True,
+            )
+        )
+        payload = next(bound.spool.glob("*.json"))
+        before = payload.read_bytes()
+
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                bound,
+                self.runtime_config,
+                replace(event, transcript_size=event.transcript_size + 1),
+                key,
+                time.time(),
+                coalesce=True,
+            )
+        )
+        self.assertNotEqual(payload.read_bytes(), before)
+
+    def test_plugin_ingress_equal_timestamp_different_identity_does_not_replace(
+        self,
+    ) -> None:
+        plugin_data, runtime = self.plugin_runtime()
+        with mock.patch.object(
+            self.runtime, "load_review_runtime", return_value=runtime
+        ):
+            bound = self.runtime.plugin_spool_installation(
+                self.installation, plugin_data, create=True
+            )
+        event = self.runtime.parse_session_stop(
+            json.dumps(self.payload).encode(),
+            bound,
+            self.runtime_config,
+        )
+        assert event is not None
+        key = self.runtime.session_key(bound, event.session_id)
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                bound,
+                self.runtime_config,
+                event,
+                key,
+                time.time(),
+                coalesce=True,
+            )
+        )
+        payload = next(bound.spool.glob("*.json"))
+        before = payload.read_bytes()
+
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                bound,
+                self.runtime_config,
+                replace(
+                    event,
+                    transcript_inode=event.transcript_inode + 1,
+                    transcript_size=event.transcript_size + 1,
+                ),
+                key,
+                time.time(),
+                coalesce=True,
+            )
+        )
+        self.assertEqual(payload.read_bytes(), before)
+
+    def test_plugin_ingress_equal_timestamp_same_boundary_does_not_replace(
+        self,
+    ) -> None:
+        plugin_data, runtime = self.plugin_runtime()
+        with mock.patch.object(
+            self.runtime, "load_review_runtime", return_value=runtime
+        ):
+            bound = self.runtime.plugin_spool_installation(
+                self.installation, plugin_data, create=True
+            )
+        event = self.runtime.parse_session_stop(
+            json.dumps(self.payload).encode(),
+            bound,
+            self.runtime_config,
+        )
+        assert event is not None
+        key = self.runtime.session_key(bound, event.session_id)
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                bound,
+                self.runtime_config,
+                event,
+                key,
+                time.time(),
+                coalesce=True,
+            )
+        )
+        payload = next(bound.spool.glob("*.json"))
+        before = payload.read_bytes()
+
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                bound,
+                self.runtime_config,
+                event,
+                key,
+                time.time(),
+                coalesce=True,
+            )
+        )
+        self.assertEqual(payload.read_bytes(), before)
+
     def test_missing_turn_id_uses_exact_session_hmac(self) -> None:
         event = self.runtime.parse_session_stop(
             json.dumps(self.payload).encode(),
