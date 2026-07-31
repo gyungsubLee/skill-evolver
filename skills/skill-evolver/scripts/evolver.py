@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Mapping, Optional, Sequence, TypedDict
 from urllib.parse import quote
 
-VERSION = "skill-evolver 0.1.1"
+VERSION = "skill-evolver 0.1.2"
 SCHEMA_VERSION = 1
 MAX_HOOK_BYTES = 65_536
 SQLITE_INTEGER_MAX = 9_223_372_036_854_775_807
@@ -68,6 +68,9 @@ FIXED_PLUGIN_DATA_ROOT = Path(
     "skill-evolver-skill-evolver-dev"
 )
 PLUGIN_STOP_SPOOL_NAME = "stop-spool"
+SPOOL_WRITER_TEMP_NAME = re.compile(
+    r"\A\.spool-write-[0-9a-f]{32}\.tmp\Z"
+)
 
 REVIEW_RESULT_PARENT = Path("/private/tmp")
 REVIEW_RESULT_PREFIX = "skill-evolver-review-results-"
@@ -8450,7 +8453,7 @@ def load_review_runtime() -> ReviewRuntime:
         type(payload["schema_version"]) is not int
         or payload["schema_version"] != 1
         or type(payload["version"]) is not str
-        or payload["version"] != "0.1.1"
+        or payload["version"] != "0.1.2"
         or type(payload["installation"]) is not str
         or payload["installation"]
         != "/Users/igyeongseob/.codex/skill-evolver/installation.json"
@@ -8508,28 +8511,66 @@ def plugin_spool_installation(
     ):
         raise ValueError("invalid_plugin_data")
     spool = plugin_data / PLUGIN_STOP_SPOOL_NAME
-    if not plugin_data.exists():
-        if create:
-            raise ValueError("invalid_plugin_data")
-        return replace(installation, spool=spool)
     try:
-        root = private_directory(plugin_data)
-    except (FileNotFoundError, OSError, ValueError):
+        parent_descriptor = os.open(
+            str(plugin_data),
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except FileNotFoundError:
+        if not create:
+            return replace(installation, spool=spool)
         raise ValueError("invalid_plugin_data") from None
-    if plugin_data != root:
-        raise ValueError("invalid_plugin_data")
-    if create:
+    except OSError:
+        raise ValueError("invalid_plugin_data") from None
+    try:
+        parent_info = os.fstat(parent_descriptor)
+        if (
+            not stat.S_ISDIR(parent_info.st_mode)
+            or parent_info.st_uid != os.getuid()
+            or stat.S_IMODE(parent_info.st_mode) != 0o700
+        ):
+            raise ValueError("invalid_plugin_data")
+        created = False
+        if create:
+            try:
+                os.mkdir(
+                    PLUGIN_STOP_SPOOL_NAME,
+                    mode=0o700,
+                    dir_fd=parent_descriptor,
+                )
+                created = True
+            except FileExistsError:
+                pass
         try:
-            spool.mkdir(mode=0o700)
-        except FileExistsError:
-            pass
-    if spool.exists() or spool.is_symlink():
-        try:
-            spool = private_directory(spool)
-        except (OSError, ValueError):
+            spool_descriptor = os.open(
+                PLUGIN_STOP_SPOOL_NAME,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_descriptor,
+            )
+        except FileNotFoundError:
+            if not create:
+                return replace(installation, spool=spool)
             raise ValueError("invalid_plugin_data") from None
-    elif create:
-        raise ValueError("invalid_plugin_data")
+        except OSError:
+            raise ValueError("invalid_plugin_data") from None
+        try:
+            spool_info = os.fstat(spool_descriptor)
+            if (
+                not stat.S_ISDIR(spool_info.st_mode)
+                or spool_info.st_uid != os.getuid()
+                or stat.S_IMODE(spool_info.st_mode) != 0o700
+            ):
+                raise ValueError("invalid_plugin_data")
+            if created:
+                os.fsync(parent_descriptor)
+        finally:
+            os.close(spool_descriptor)
+    finally:
+        os.close(parent_descriptor)
     return replace(installation, spool=spool)
 
 
@@ -11551,17 +11592,56 @@ MAX_SPOOL_SCAN_ENTRIES = 203
 MAX_SPOOL_FUTURE_SKEW_SECONDS = 300
 
 
-def record_spool_overflow(installation: Installation) -> None:
-    path = installation.spool / "overflow.events"
+def open_spool_directories(installation: Installation) -> tuple[int, int]:
+    parent_descriptor = os.open(
+        str(installation.spool.parent),
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        parent_info = os.fstat(parent_descriptor)
+        if (
+            not stat.S_ISDIR(parent_info.st_mode)
+            or parent_info.st_uid != os.getuid()
+            or stat.S_IMODE(parent_info.st_mode) != 0o700
+        ):
+            raise ValueError("spool_directory_permissions")
+        spool_descriptor = os.open(
+            installation.spool.name,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+        try:
+            spool_info = os.fstat(spool_descriptor)
+            if (
+                not stat.S_ISDIR(spool_info.st_mode)
+                or spool_info.st_uid != os.getuid()
+                or stat.S_IMODE(spool_info.st_mode) != 0o700
+            ):
+                raise ValueError("spool_directory_permissions")
+            return parent_descriptor, spool_descriptor
+        except BaseException:
+            os.close(spool_descriptor)
+            raise
+    except BaseException:
+        os.close(parent_descriptor)
+        raise
+
+
+def _record_spool_overflow(spool_descriptor: int) -> None:
     try:
         descriptor = os.open(
-            str(path),
+            "overflow.events",
             os.O_WRONLY
             | os.O_APPEND
             | os.O_CREAT
             | os.O_NONBLOCK
             | getattr(os, "O_NOFOLLOW", 0),
             0o600,
+            dir_fd=spool_descriptor,
         )
     except OSError as error:
         if error.errno == errno.ENXIO:
@@ -11593,6 +11673,17 @@ def record_spool_overflow(installation: Installation) -> None:
         os.close(descriptor)
 
 
+def record_spool_overflow(installation: Installation) -> None:
+    parent_descriptor, spool_descriptor = open_spool_directories(
+        installation
+    )
+    try:
+        _record_spool_overflow(spool_descriptor)
+    finally:
+        os.close(spool_descriptor)
+        os.close(parent_descriptor)
+
+
 def acquire_spool_lock(
     descriptor: int, timeout_seconds: float = 0.05
 ) -> bool:
@@ -11608,6 +11699,40 @@ def acquire_spool_lock(
             time.sleep(min(0.005, remaining))
 
 
+def atomic_write_spool(
+    spool_descriptor: int, destination: str, value: bytes
+) -> None:
+    temporary = f".spool-write-{secrets.token_hex(16)}.tmp"
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=spool_descriptor,
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(
+            temporary,
+            destination,
+            src_dir_fd=spool_descriptor,
+            dst_dir_fd=spool_descriptor,
+        )
+        os.fsync(spool_descriptor)
+    except BaseException:
+        try:
+            os.unlink(temporary, dir_fd=spool_descriptor)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def spool_session_stop(
     installation: Installation,
     config: Config,
@@ -11619,78 +11744,102 @@ def spool_session_stop(
 ) -> bool:
     if type(event.observed_at_ns) is not int or event.observed_at_ns < 0:
         raise ValueError("invalid_observed_at_ns")
+    parent_descriptor, spool_descriptor = open_spool_directories(
+        installation
+    )
     try:
-        lock = open_locked_spool(installation)
-    except BlockingIOError:
-        record_spool_overflow(installation)
-        return False
-    with lock:
-        file_limit = min(
-            config.spool_limit_files, HARD_LIMITS["spool_limit_files"]
-        )
-        byte_limit = min(
-            config.spool_limit_bytes, HARD_LIMITS["spool_limit_bytes"]
-        )
-        files: list[Path] = []
-        with os.scandir(installation.spool) as entries:
-            for scanned, entry in enumerate(entries, start=1):
-                # Admit 200 payloads plus the lock/overflow sidecars; the next
-                # entry proves attacker-inflated inventory and ends the scan.
-                if scanned >= MAX_SPOOL_SCAN_ENTRIES:
-                    record_spool_overflow(installation)
-                    return False
-                if not entry.name.endswith(".json"):
-                    continue
-                files.append(Path(entry.path))
-        total = 0
-        for path in files:
-            if path.is_symlink():
-                raise ValueError("spool_payload_symlink")
-            total += private_file(path).stat().st_size
-        encoded = (
-            canonical_json_bytes(
-                spooled_stop_payload(installation, event, key, config)
-            )
-            + b"\n"
-        )
-        destination = installation.spool / (
-            f"session-{key}.json"
-            if coalesce
-            else f"{time.time_ns()}-{os.getpid()}-{secrets.token_hex(4)}.json"
-        )
-        replaced_size = 0
-        if coalesce and destination.exists():
-            state, current_encoded, _identity = read_spool_snapshot(
-                destination
-            )
-            if state != "verified" or current_encoded is None:
-                raise ValueError("invalid_spool_payload")
-            current_payload = json.loads(current_encoded.decode("utf-8"))
-            current, current_key, _created, _expires = event_from_spool(
-                current_payload, installation, config, now
-            )
-            if current_key != key:
-                raise ValueError("invalid_spool_session_key")
-            same_identity = (
-                current.transcript_device == event.transcript_device
-                and current.transcript_inode == event.transcript_inode
-            )
-            newer = event.observed_at_ns > current.observed_at_ns or (
-                event.observed_at_ns == current.observed_at_ns
-                and same_identity
-                and event.transcript_size > current.transcript_size
-            )
-            if not newer:
-                return True
-            replaced_size = len(current_encoded)
-        adds_file = destination not in files
-        projected_files = len(files) + int(adds_file)
-        projected_bytes = total - replaced_size + len(encoded)
-        if projected_files > file_limit or projected_bytes > byte_limit:
-            record_spool_overflow(installation)
+        try:
+            lock = open_locked_spool(spool_descriptor)
+        except BlockingIOError:
+            _record_spool_overflow(spool_descriptor)
             return False
-        atomic_write_bytes(destination, encoded)
-        return True
+        with lock:
+            file_limit = min(
+                config.spool_limit_files, HARD_LIMITS["spool_limit_files"]
+            )
+            byte_limit = min(
+                config.spool_limit_bytes, HARD_LIMITS["spool_limit_bytes"]
+            )
+            files: list[str] = []
+            with os.scandir(spool_descriptor) as entries:
+                for scanned, entry in enumerate(entries, start=1):
+                    # Admit 200 payloads plus the lock/overflow sidecars; the
+                    # next entry proves attacker-inflated inventory.
+                    if scanned >= MAX_SPOOL_SCAN_ENTRIES:
+                        _record_spool_overflow(spool_descriptor)
+                        return False
+                    if entry.name.endswith(".json"):
+                        files.append(entry.name)
+            total = 0
+            for name in files:
+                info = os.stat(
+                    name,
+                    dir_fd=spool_descriptor,
+                    follow_symlinks=False,
+                )
+                if stat.S_ISLNK(info.st_mode):
+                    raise ValueError("spool_payload_symlink")
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                ):
+                    raise ValueError("private_file_permissions")
+                total += info.st_size
+            encoded = (
+                canonical_json_bytes(
+                    spooled_stop_payload(installation, event, key, config)
+                )
+                + b"\n"
+            )
+            destination = (
+                f"session-{key}.json"
+                if coalesce
+                else (
+                    f"{time.time_ns()}-{os.getpid()}-"
+                    f"{secrets.token_hex(4)}.json"
+                )
+            )
+            replaced_size = 0
+            if coalesce and destination in files:
+                state, current_encoded, _identity = read_spool_snapshot(
+                    spool_descriptor, destination
+                )
+                if state != "verified" or current_encoded is None:
+                    raise ValueError("invalid_spool_payload")
+                current_payload = json.loads(
+                    current_encoded.decode("utf-8")
+                )
+                current, current_key, _created, _expires = event_from_spool(
+                    current_payload, installation, config, now
+                )
+                if current_key != key:
+                    raise ValueError("invalid_spool_session_key")
+                same_identity = (
+                    current.transcript_device == event.transcript_device
+                    and current.transcript_inode == event.transcript_inode
+                )
+                newer = event.observed_at_ns > current.observed_at_ns or (
+                    event.observed_at_ns == current.observed_at_ns
+                    and same_identity
+                    and event.transcript_size > current.transcript_size
+                )
+                if not newer:
+                    return True
+                replaced_size = len(current_encoded)
+            adds_file = destination not in files
+            projected_files = len(files) + int(adds_file)
+            projected_bytes = total - replaced_size + len(encoded)
+            if projected_files > file_limit or projected_bytes > byte_limit:
+                _record_spool_overflow(spool_descriptor)
+                return False
+            atomic_write_spool(
+                spool_descriptor, destination, encoded
+            )
+            return True
+    finally:
+        os.close(spool_descriptor)
+        os.close(parent_descriptor)
 
 
 def parse_iso_utc(value: str) -> float:
@@ -11825,14 +11974,14 @@ def event_from_spool(
     )
 
 
-def open_locked_spool(installation: Installation):
-    lock_path = installation.spool / ".lock"
+def open_locked_spool(spool_descriptor: int):
     descriptor = os.open(
-        str(lock_path),
+        ".lock",
         os.O_RDWR
         | os.O_CREAT
         | getattr(os, "O_NOFOLLOW", 0),
         0o600,
+        dir_fd=spool_descriptor,
     )
     try:
         info = os.fstat(descriptor)
@@ -11854,26 +12003,31 @@ def open_locked_spool(installation: Installation):
 
 
 def bounded_spool_paths(
-    installation: Installation,
+    spool_descriptor: int,
     maximum_payloads: int,
-) -> tuple[list[Path], bool]:
-    paths: list[Path] = []
-    with os.scandir(installation.spool) as entries:
+) -> tuple[list[str], bool]:
+    paths: list[str] = []
+    with os.scandir(spool_descriptor) as entries:
         for scanned, entry in enumerate(entries, start=1):
             if entry.name.endswith(".json"):
                 if len(paths) >= maximum_payloads:
                     return paths, True
-                paths.append(Path(entry.path))
+                paths.append(entry.name)
             if scanned >= MAX_SPOOL_SCAN_ENTRIES:
                 return paths, True
     return paths, False
 
 
 def read_spool_snapshot(
-    path: Path,
+    spool_descriptor: int,
+    name: str,
 ) -> tuple[str, Optional[bytes], Optional[tuple[int, int]]]:
     try:
-        before = os.lstat(path)
+        before = os.stat(
+            name,
+            dir_fd=spool_descriptor,
+            follow_symlinks=False,
+        )
     except FileNotFoundError:
         return "missing", None, None
     identity = (before.st_dev, before.st_ino)
@@ -11887,10 +12041,11 @@ def read_spool_snapshot(
         return "invalid", None, identity
     try:
         descriptor = os.open(
-            str(path),
+            name,
             os.O_RDONLY
             | os.O_NONBLOCK
             | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=spool_descriptor,
         )
     except FileNotFoundError:
         return "missing", None, None
@@ -11930,27 +12085,75 @@ def read_spool_snapshot(
 
 
 def delete_spool_identity(
-    installation: Installation,
-    path: Path,
+    spool_descriptor: int,
+    name: str,
     identity: tuple[int, int],
 ) -> bool:
-    with open_locked_spool(installation):
+    with open_locked_spool(spool_descriptor):
         try:
-            current = os.lstat(path)
+            current = os.stat(
+                name,
+                dir_fd=spool_descriptor,
+                follow_symlinks=False,
+            )
         except FileNotFoundError:
             return False
         if (current.st_dev, current.st_ino) != identity:
             return False
         try:
             if stat.S_ISDIR(current.st_mode):
-                os.rmdir(path)
+                os.rmdir(name, dir_fd=spool_descriptor)
             else:
-                os.unlink(path)
+                os.unlink(name, dir_fd=spool_descriptor)
         except OSError as error:
             if error.errno in {errno.ENOTEMPTY, errno.EEXIST}:
                 return False
             raise
         return True
+
+
+def cleanup_spool_writer_temps(spool_descriptor: int) -> int:
+    deleted = 0
+    with os.scandir(spool_descriptor) as entries:
+        for scanned, entry in enumerate(entries, start=1):
+            if SPOOL_WRITER_TEMP_NAME.fullmatch(entry.name):
+                try:
+                    before = os.stat(
+                        entry.name,
+                        dir_fd=spool_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    before = None
+                if (
+                    before is not None
+                    and stat.S_ISREG(before.st_mode)
+                    and before.st_uid == os.getuid()
+                    and stat.S_IMODE(before.st_mode) & ~0o600 == 0
+                    and before.st_nlink == 1
+                ):
+                    try:
+                        current = os.stat(
+                            entry.name,
+                            dir_fd=spool_descriptor,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        current = None
+                    if (
+                        current is not None
+                        and (current.st_dev, current.st_ino)
+                        == (before.st_dev, before.st_ino)
+                        and stat.S_ISREG(current.st_mode)
+                        and current.st_uid == os.getuid()
+                        and stat.S_IMODE(current.st_mode) & ~0o600 == 0
+                        and current.st_nlink == 1
+                    ):
+                        os.unlink(entry.name, dir_fd=spool_descriptor)
+                        deleted += 1
+            if scanned >= MAX_SPOOL_SCAN_ENTRIES:
+                break
+    return deleted
 
 
 def import_spool(
@@ -11963,102 +12166,117 @@ def import_spool(
         raise ValueError("active_transaction")
     imported = duplicates = invalid = expired = preserved = 0
     deleted_any = False
-
-    def remove_snapshot(path: Path, identity: tuple[int, int]) -> bool:
-        nonlocal deleted_any
-        removed = delete_spool_identity(installation, path, identity)
-        deleted_any = deleted_any or removed
-        return removed
-
-    with open_locked_spool(installation):
-        paths, saturated = bounded_spool_paths(
-            installation, HARD_LIMITS["spool_limit_files"]
-        )
-    verified: list[
-        tuple[
-            int,
-            str,
-            Path,
-            tuple[int, int],
-            CapturedSessionStop,
-            str,
-            float,
-        ]
-    ] = []
-    for path in paths:
-        with open_locked_spool(installation):
-            state, encoded, identity = read_spool_snapshot(path)
-        if state == "missing":
-            continue
-        assert identity is not None
-        if state == "preserved":
-            preserved += 1
-            continue
-        if state == "invalid":
-            if remove_snapshot(path, identity):
-                invalid += 1
-            else:
-                preserved += 1
-            continue
-        assert encoded is not None
-        try:
-            payload = json.loads(encoded.decode("utf-8"))
-            event, key, created_at, expires_at = event_from_spool(
-                payload, installation, config, now
+    parent_descriptor, spool_descriptor = open_spool_directories(
+        installation
+    )
+    try:
+        def remove_snapshot(
+            name: str, identity: tuple[int, int]
+        ) -> bool:
+            nonlocal deleted_any
+            removed = delete_spool_identity(
+                spool_descriptor, name, identity
             )
-            if now >= expires_at:
-                if remove_snapshot(path, identity):
-                    expired += 1
+            deleted_any = deleted_any or removed
+            return removed
+
+        with open_locked_spool(spool_descriptor):
+            writer_temps_deleted = cleanup_spool_writer_temps(
+                spool_descriptor
+            )
+            deleted_any = deleted_any or writer_temps_deleted > 0
+            paths, saturated = bounded_spool_paths(
+                spool_descriptor, HARD_LIMITS["spool_limit_files"]
+            )
+        verified: list[
+            tuple[
+                int,
+                str,
+                tuple[int, int],
+                CapturedSessionStop,
+                str,
+                float,
+            ]
+        ] = []
+        for name in paths:
+            with open_locked_spool(spool_descriptor):
+                state, encoded, identity = read_spool_snapshot(
+                    spool_descriptor, name
+                )
+            if state == "missing":
+                continue
+            assert identity is not None
+            if state == "preserved":
+                preserved += 1
+                continue
+            if state == "invalid":
+                if remove_snapshot(name, identity):
+                    invalid += 1
                 else:
                     preserved += 1
                 continue
-            verified.append(
-                (
-                    event.observed_at_ns,
-                    path.name,
-                    path,
-                    identity,
-                    event,
-                    key,
-                    created_at,
+            assert encoded is not None
+            try:
+                payload = json.loads(encoded.decode("utf-8"))
+                event, key, created_at, expires_at = event_from_spool(
+                    payload, installation, config, now
                 )
+                if now >= expires_at:
+                    if remove_snapshot(name, identity):
+                        expired += 1
+                    else:
+                        preserved += 1
+                    continue
+                verified.append(
+                    (
+                        event.observed_at_ns,
+                        name,
+                        identity,
+                        event,
+                        key,
+                        created_at,
+                    )
+                )
+            except (
+                KeyError,
+                OverflowError,
+                RecursionError,
+                TypeError,
+                UnicodeError,
+                ValueError,
+                json.JSONDecodeError,
+            ):
+                if remove_snapshot(name, identity):
+                    invalid += 1
+                else:
+                    preserved += 1
+        verified.sort(key=lambda item: (item[0], item[1]))
+        for _, name, identity, event, key, created_at in verified:
+            outcome = upsert_session(
+                connection,
+                event,
+                key,
+                config,
+                created_at,
             )
-        except (
-            KeyError,
-            OverflowError,
-            RecursionError,
-            TypeError,
-            UnicodeError,
-            ValueError,
-            json.JSONDecodeError,
-        ):
-            if remove_snapshot(path, identity):
-                invalid += 1
-            else:
+            imported += int(outcome == "inserted")
+            duplicates += int(outcome != "inserted")
+            if not remove_snapshot(name, identity):
                 preserved += 1
-    verified.sort(key=lambda item: (item[0], item[1]))
-    for _, _, path, identity, event, key, created_at in verified:
-        outcome = upsert_session(
-            connection,
-            event,
-            key,
-            config,
-            created_at,
-        )
-        imported += int(outcome == "inserted")
-        duplicates += int(outcome != "inserted")
-        if not remove_snapshot(path, identity):
-            preserved += 1
-    if deleted_any:
-        fsync_directory(installation.spool)
-    return {
-        "spool_imported": imported,
-        "spool_duplicates": duplicates,
-        "spool_invalid_deleted": invalid,
-        "spool_expired": expired,
-        "spool_preserved": preserved,
-        "spool_scan_saturated": int(saturated),
-    }
+        if deleted_any:
+            os.fsync(spool_descriptor)
+        return {
+            "spool_imported": imported,
+            "spool_duplicates": duplicates,
+            "spool_invalid_deleted": invalid,
+            "spool_expired": expired,
+            "spool_preserved": preserved,
+            "spool_writer_temps_deleted": writer_temps_deleted,
+            "spool_scan_saturated": int(saturated),
+        }
+    finally:
+        os.close(spool_descriptor)
+        os.close(parent_descriptor)
 
 
 def run_maintenance(
@@ -12080,6 +12298,7 @@ def run_maintenance(
         "spool_invalid_deleted": 0,
         "spool_expired": 0,
         "spool_preserved": 0,
+        "spool_writer_temps_deleted": 0,
         "spool_scan_saturated": 0,
     }
     for source in sources:
@@ -13204,26 +13423,78 @@ def run_maintenance(
     }
 
 
-def spool_inventory(installation: Installation) -> tuple[int, int, bool]:
-    if not installation.spool.is_dir():
-        return 0, 0, False
-    count = total = 0
-    paths, saturated = bounded_spool_paths(
-        installation, DEFAULTS["spool_limit_files"]
-    )
-    for path in paths:
+def spool_inventory(
+    installation: Installation,
+    config: Config,
+    now: float,
+) -> tuple[bool, int, int, int, bool, int]:
+    try:
+        parent_descriptor, spool_descriptor = open_spool_directories(
+            installation
+        )
+    except FileNotFoundError:
+        return False, 0, 0, 0, False, 0
+    count = total = verified = 0
+    try:
+        names, saturated = bounded_spool_paths(
+            spool_descriptor, DEFAULTS["spool_limit_files"]
+        )
+        for name in names:
+            try:
+                info = os.stat(
+                    name,
+                    dir_fd=spool_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                continue
+            if (
+                stat.S_ISREG(info.st_mode)
+                and info.st_uid == os.getuid()
+                and stat.S_IMODE(info.st_mode) == 0o600
+            ):
+                count += 1
+                total += info.st_size
+            state, encoded, _identity = read_spool_snapshot(
+                spool_descriptor, name
+            )
+            if state != "verified" or encoded is None:
+                continue
+            try:
+                payload = json.loads(encoded.decode("utf-8"))
+                _event, _key, _created_at, expires_at = event_from_spool(
+                    payload, installation, config, now
+                )
+                verified += int(now < expires_at)
+            except (
+                KeyError,
+                OverflowError,
+                RecursionError,
+                TypeError,
+                UnicodeError,
+                ValueError,
+                json.JSONDecodeError,
+            ):
+                pass
         try:
-            info = os.lstat(path)
-        except OSError:
-            continue
-        if (
-            stat.S_ISREG(info.st_mode)
-            and info.st_uid == os.getuid()
-            and stat.S_IMODE(info.st_mode) == 0o600
-        ):
-            count += 1
-            total += info.st_size
-    return count, total, saturated
+            overflow_info = os.stat(
+                "overflow.events",
+                dir_fd=spool_descriptor,
+                follow_symlinks=False,
+            )
+            overflow_bytes = (
+                overflow_info.st_size
+                if stat.S_ISREG(overflow_info.st_mode)
+                and overflow_info.st_uid == os.getuid()
+                and stat.S_IMODE(overflow_info.st_mode) == 0o600
+                else 0
+            )
+        except FileNotFoundError:
+            overflow_bytes = 0
+        return True, count, total, verified, saturated, overflow_bytes
+    finally:
+        os.close(spool_descriptor)
+        os.close(parent_descriptor)
 
 
 def queue_status(
@@ -13297,21 +13568,17 @@ def queue_status(
             """
         )
     }
-    spool_files, spool_bytes, spool_saturated = spool_inventory(
-        installation
+    config = load_config(installation)
+    (
+        spool_available,
+        spool_files,
+        spool_bytes,
+        spool_verified_files,
+        spool_saturated,
+        overflow_bytes,
+    ) = spool_inventory(
+        installation, config, now
     )
-    overflow_path = installation.spool / "overflow.events"
-    try:
-        overflow_info = os.lstat(overflow_path)
-        overflow_bytes = (
-            overflow_info.st_size
-            if stat.S_ISREG(overflow_info.st_mode)
-            and overflow_info.st_uid == os.getuid()
-            and stat.S_IMODE(overflow_info.st_mode) == 0o600
-            else 0
-        )
-    except FileNotFoundError:
-        overflow_bytes = 0
     oldest = pending["oldest"]
     return {
         "schema_version": SCHEMA_VERSION,
@@ -13330,8 +13597,9 @@ def queue_status(
         },
         "binding_failures": binding_failures,
         "spool": {
-            "available": installation.spool.is_dir(),
+            "available": spool_available,
             "files": spool_files,
+            "verified_files": spool_verified_files,
             "bytes": spool_bytes,
             "scan_saturated": spool_saturated,
             "overflow_total": overflow_bytes // len(OVERFLOW_EVENT),

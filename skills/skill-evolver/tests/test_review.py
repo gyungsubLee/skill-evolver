@@ -13593,14 +13593,30 @@ class ReviewSurfaceTests(CandidateBatchFixture):
             side_effect=AssertionError("transcript opened"),
         ), mock.patch.object(
             self.runtime.time, "time", return_value=now + 2
+        ), mock.patch.object(
+            self.runtime,
+            "load_review_runtime",
+            return_value=replace(
+                self.review_runtime,
+                plugin_data=(
+                    self.installation.data_root.parent
+                    / "plugins/data/skill-evolver-skill-evolver-dev"
+                ),
+            ),
         ):
+            plugin_data = (
+                self.installation.data_root.parent
+                / "plugins/data/skill-evolver-skill-evolver-dev"
+            )
+            plugin_data.mkdir(mode=0o700, parents=True)
             status = self.capture_handler(
                 self.runtime.cmd_status,
                 argparse.Namespace(
                     installation=str(
                         self.installation.data_root
                         / "installation.json"
-                    )
+                    ),
+                    plugin_data=str(plugin_data),
                 ),
             )
             inspected = self.capture_handler(
@@ -13986,13 +14002,17 @@ class ReviewDocumentationTests(unittest.TestCase):
             "defer",
             "resume",
             "reject",
-            "maintain",
         ):
             self.assertIn(
                 f"`{command}` requires separate approval for one fully "
                 "expanded command and the exact installation data root.",
                 text,
             )
+        self.assertIn("- `maintain`: show the exact", text)
+        self.assertIn(
+            "canonical and plugin-data roots for this invocation.",
+            text,
+        )
         for forbidden in (
             "Future `review` is a mutating workflow",
             "current model consumes only the returned envelope during",
@@ -14041,13 +14061,18 @@ class ReviewDocumentationTests(unittest.TestCase):
             "defer",
             "resume",
             "reject",
-            "maintain",
         ):
             self.assertIn(
                 f"`{command}` requires separate approval for one fully "
                 "expanded command and the exact installation data root.",
                 text,
             )
+        self.assertIn(
+            "`maintain` requires separate approval for one fully expanded "
+            "command and the\ncanonical and plugin-data roots for that "
+            "invocation.",
+            text,
+        )
         for forbidden in (
             "Explicit review in the next release",
             "$BATCH_ID",

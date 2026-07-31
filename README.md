@@ -86,15 +86,18 @@ Status needs no write approval:
 ```
 
 It reports pending sessions and generations, oldest age, active/expired
-leases, binding failures, excluded/expired counts, spool files/bytes/overflow,
-last successful Hook time, and raw-metadata cleanup health. It opens SQLite in
-read-only mode, never imports the spool, and never opens a transcript.
+leases, binding failures, excluded/expired counts, raw spool files,
+HMAC/schema-verified spool files, bytes/overflow, last successful Hook time,
+and raw-metadata cleanup health. `spool.files` is diagnostic inventory;
+`spool.verified_files` is the capture proof. Status opens SQLite in read-only
+mode, never imports or cleans the spool, and never opens a transcript.
 
 ## Explicit maintenance
 
-Maintenance imports spool files, recovers expired leases without advancing a
-cursor, enforces session capacity and retention, clears raw metadata, and
-removes expired HMAC dedupe rows.
+Maintenance imports spool files, removes only exact private interrupted-writer
+temps, recovers expired leases without advancing a cursor, enforces session
+capacity and retention, clears raw metadata, and removes expired HMAC dedupe
+rows.
 
 `maintain` requires separate approval for one fully expanded command and the
 canonical and plugin-data roots for that invocation.

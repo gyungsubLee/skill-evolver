@@ -55,7 +55,7 @@ hooks, JSON.
 | `skills/skill-evolver/tests/test_review.py` | Verify the exact runtime-reference contract includes the pinned plugin-data path. |
 | `skills/skill-evolver/references/runtime.json` | Pin the canonical plugin-data locator and release version. |
 | `hooks/hooks.json` | Pass quoted `$PLUGIN_DATA` to the trusted Stop command. |
-| `.codex-plugin/plugin.json` | Publish patch version `0.1.1`. |
+| `.codex-plugin/plugin.json` | Publish patch version `0.1.2`. |
 | `skills/skill-evolver/SKILL.md` | Require literal plugin-data arguments and approval for both mutation roots. |
 | `README.md` | Document ingress, status, maintenance and activation. |
 | `.planning/STATE.md` | Record the corrected capture boundary and quality-epoch rollover. |
@@ -183,7 +183,7 @@ PLUGIN_STOP_SPOOL_NAME = "stop-spool"
 
 Add `plugin_data: Path` to `ReviewRuntime`. Change
 `load_review_runtime()` so its exact key set also requires `plugin_data`, its
-version is `0.1.1`, its value exactly equals
+version is `0.1.2`, its value exactly equals
 `str(FIXED_PLUGIN_DATA_ROOT)`, and the returned object includes:
 
 ```python
@@ -199,7 +199,7 @@ Change `runtime.json` to:
 ```json
 {
   "schema_version": 1,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "installation": "/Users/igyeongseob/.codex/skill-evolver/installation.json",
   "plugin_data": "/Users/igyeongseob/.codex/plugins/data/skill-evolver-skill-evolver-dev",
   "mutable_skill_roots": [
@@ -650,7 +650,7 @@ def test_maintenance_imports_plugin_data_spool_idempotently(self) -> None:
 
 Add `test_status_reports_unimported_plugin_data_capture_read_only`. It must
 snapshot the database and spool bytes, call `queue_status(connection, capture,
-now)`, assert `pending_sessions == 0`, `spool.files == 1`,
+now)`, assert `pending_sessions == 0`, `spool.verified_files == 1`,
 `spool.available is True`, and assert both snapshots are unchanged while
 `import_spool` and `run_maintenance` are patched to fail if called.
 
@@ -783,14 +783,14 @@ git commit -m "feat(skill-evolver): import plugin stop ingress"
   `enqueue-stop --installation PATH --plugin-data "$PLUGIN_DATA"`
 - Public status/maintenance:
   `--plugin-data /Users/igyeongseob/.codex/plugins/data/skill-evolver-skill-evolver-dev`
-- Release version: `0.1.1`
+- Release version: `0.1.2`
 
 - [ ] **Step 1: Write failing public-surface assertions**
 
 In `ProductionSurfaceTests.test_only_main_stop_is_an_automatic_writer`, assert:
 
 ```python
-self.assertEqual(manifest["version"], "0.1.1")
+self.assertEqual(manifest["version"], "0.1.2")
 self.assertIn(' --plugin-data "$PLUGIN_DATA"', command)
 self.assertEqual(
     runtime["plugin_data"],
@@ -824,7 +824,7 @@ Expected: manifest/version/command/parser assertions fail.
 Set:
 
 ```python
-VERSION = "skill-evolver 0.1.1"
+VERSION = "skill-evolver 0.1.2"
 ```
 
 Add required `--plugin-data` arguments to the three parsers. Change the Hook
@@ -834,7 +834,7 @@ command to this exact JSON string:
 "/usr/bin/python3 -I \"$PLUGIN_ROOT/skills/skill-evolver/scripts/evolver.py\" enqueue-stop --installation \"/Users/igyeongseob/.codex/skill-evolver/installation.json\" --plugin-data \"$PLUGIN_DATA\""
 ```
 
-Set `.codex-plugin/plugin.json` version to `0.1.1`.
+Set `.codex-plugin/plugin.json` version to `0.1.2`.
 
 - [ ] **Step 4: Update skill and operator documentation**
 
@@ -850,7 +850,7 @@ Update `SKILL.md` and `README.md` so:
 - no automatic review, label, evaluation or apply is implied.
 
 Update `.planning/STATE.md` and `.planning/ROADMAP.md` to record that the
-`0.1.0` production capture assumption regressed, `0.1.1` routes capture through
+`0.1.0` production capture assumption regressed, `0.1.2` routes capture through
 plugin data, `Q-001` must terminalize as provenance drift, and Phase 5 remains
 blocked from Phase 6 until a successor epoch passes.
 
@@ -910,7 +910,7 @@ git commit -m "release(skill-evolver): activate plugin data capture"
 - [ ] **Step 1: Refresh the installed plugin**
 
 Run the exact local marketplace/plugin refresh command and verify `codex plugin
-list --json` reports `0.1.1`. Do not edit the cache directly.
+list --json` reports `0.1.2`. Do not edit the cache directly.
 
 - [ ] **Step 2: Review the changed Hook trust**
 
@@ -920,7 +920,7 @@ into `config.toml`.
 
 - [ ] **Step 3: Run one new meaningful Desktop task**
 
-The task must be a genuinely new Desktop session after `0.1.1` activation. Do
+The task must be a genuinely new Desktop session after `0.1.2` activation. Do
 not substitute a fixture, subagent, CLI process, repeated generation, or the
 missed `0.1.0` session.
 
@@ -933,13 +933,14 @@ Run the read-only status command with both literal locators. Expected:
   "pending_sessions": 0,
   "spool": {
     "available": true,
-    "files": 1
+    "verified_files": 1
   }
 }
 ```
 
-The exact byte count may vary. One file proves durable Hook capture; it is not
-yet a canonical pending session.
+The exact byte count and raw `files` inventory may vary. One `verified_files`
+entry proves durable, authenticated Hook capture; it is not yet a canonical
+pending session.
 
 - [ ] **Step 5: Import once under explicit approval**
 

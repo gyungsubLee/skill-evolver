@@ -2,7 +2,7 @@
 
 ## Overview
 
-Skill Evolver는 Phase 1 Feasibility `FAIL`을 Phase 2의 session-level 계약으로 수정해 amended gate `PASS`를 확보했고, Phase 3에서 bounded Runtime Queue를 구현했다. `0.1.0`의 production capture assumption은 regressed 되었고 `0.1.1`은 capture를 plugin data로 route한다. `Q-001` must terminalize as provenance drift before a successor epoch can pass Phase 5; Phase 6 remains blocked until then. 이제 explicit Review/Inbox를 구현한 뒤 quality, runner, immutable evaluation, manual apply/versioning, undo/recovery와 hardening gate를 순서대로 통과한다.
+Skill Evolver는 Phase 1 Feasibility `FAIL`을 Phase 2의 session-level 계약으로 수정해 amended gate `PASS`를 확보했고, Phase 3에서 bounded Runtime Queue를 구현했다. `0.1.0`의 production capture assumption은 regressed 되었고 `0.1.2`는 capture를 plugin data로 route한다. `Q-001` must terminalize as provenance drift before a successor epoch can pass Phase 5; Phase 6 remains blocked until then. 이제 explicit Review/Inbox를 구현한 뒤 quality, runner, immutable evaluation, manual apply/versioning, undo/recovery와 hardening gate를 순서대로 통과한다.
 
 ## Phases
 
@@ -113,7 +113,7 @@ Plans:
 **Requirements**: QUALITY-01
 **Entry Gate**: Review/Inbox suite passes with zero target-skill writes
 **Gate Result**: **BLOCKED** — the `0.1.0` production capture assumption
-regressed; `0.1.1` routes capture through plugin data. `Q-001` must
+regressed; `0.1.2` routes capture through plugin data. `Q-001` must
 terminalize as provenance drift, is not terminal yet, and no successor epoch
 exists yet. Phase 6 remains blocked until a successor epoch passes.
 **Failure Route**: Phase 4 transcript adapter 또는 improvement policy로 돌아간다.

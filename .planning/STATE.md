@@ -22,11 +22,11 @@ See: `.planning/PROJECT.md` (updated 2026-07-27)
 
 Phase: 5 of 11 (Read-only Quality Gate)
 Plan: 0 of 1 in current phase
-Status: The `0.1.0` production capture assumption regressed; `0.1.1` routes
+Status: The `0.1.0` production capture assumption regressed; `0.1.2` routes
 capture through plugin data. `Q-001` must terminalize as provenance drift; it
 is not terminal yet, and Phase 5 remains blocked from Phase 6 until a
 successor epoch passes.
-Last activity: 2026-07-31 — `0.1.1` plugin-data capture release surfaces
+Last activity: 2026-07-31 — `0.1.2` plugin-data capture release surfaces
 prepared; live plugin activation remains a separate task
 
 Progress: [████░░░░░░] 36%
@@ -73,7 +73,7 @@ Phase 5 is blocked pending `Q-001` provenance rollover and a successor PASS
 - Review, evaluation and mutation remain explicit-only; apply/undo require external TTY and complete digest/hash.
 - Phase 5 labels are user-entered only in a user-controlled external terminal;
   the agent must not enter or infer them, including through a PTY.
-- The `0.1.0` production capture assumption regressed. Release `0.1.1`
+- The `0.1.0` production capture assumption regressed. Release `0.1.2`
   routes Stop capture through the pinned plugin-data root.
 - `Q-001` opened at `2026-07-30T10:15:35Z` must terminalize as provenance
   drift before another quality epoch can begin. It is not terminal yet, and no
@@ -81,7 +81,7 @@ Phase 5 is blocked pending `Q-001` provenance rollover and a successor PASS
 
 ### Pending Todos
 
-- Terminalize `Q-001` as provenance drift after the `0.1.1` rollover.
+- Terminalize `Q-001` as provenance drift after the `0.1.2` rollover.
 - Open a successor epoch, then collect at least 10 distinct meaningful real
   Codex sessions in that epoch.
 - Explicitly review the successor epoch's collected sessions in bounded batches
@@ -111,7 +111,7 @@ Phase 5 is blocked pending `Q-001` provenance rollover and a successor PASS
 ## Session Continuity
 
 Last session: 2026-07-31
-Stopped at: `0.1.1` routes capture through plugin data; Q-001 must terminalize
+Stopped at: `0.1.2` routes capture through plugin data; Q-001 must terminalize
 as provenance drift before a successor can collect real Codex tasks, be
 reviewed, sealed, labeled in an external terminal, and pass the gate
 Resume file: None

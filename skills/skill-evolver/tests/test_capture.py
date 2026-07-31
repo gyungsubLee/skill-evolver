@@ -97,6 +97,38 @@ class RuntimeStoreTests(unittest.TestCase):
                             installation, rejected, create=False
                         )
 
+    def test_plugin_spool_creation_fsyncs_plugin_data_parent(self) -> None:
+        installation_path = self.runtime.initialize_runtime(
+            self.base / "data", (self.sessions,), self.config
+        )
+        installation = self.runtime.load_installation(installation_path)
+        expected = (
+            installation.data_root.parent
+            / "plugins/data/skill-evolver-skill-evolver-dev"
+        )
+        expected.mkdir(mode=0o700, parents=True)
+        runtime = replace(
+            self.runtime.load_review_runtime(),
+            plugin_data=expected,
+        )
+        synced: list[tuple[int, int]] = []
+
+        def record_fsync(descriptor: int) -> None:
+            info = os.fstat(descriptor)
+            synced.append((info.st_dev, info.st_ino))
+
+        with mock.patch.object(
+            self.runtime, "load_review_runtime", return_value=runtime
+        ), mock.patch.object(
+            self.runtime.os, "fsync", side_effect=record_fsync
+        ):
+            self.runtime.plugin_spool_installation(
+                installation, expected, create=True
+            )
+
+        parent = expected.stat()
+        self.assertIn((parent.st_dev, parent.st_ino), synced)
+
     def test_plugin_spool_rejects_symlink_without_touching_sentinel(
         self,
     ) -> None:
@@ -811,6 +843,86 @@ class SessionCaptureTests(unittest.TestCase):
         payloads = list(bound.spool.glob("*.json"))
         self.assertEqual(len(payloads), 1)
         self.assertNotEqual(payloads[0].read_bytes(), first)
+
+    def test_spool_writer_publishes_mode_0600_under_restrictive_umask(
+        self,
+    ) -> None:
+        event = self.runtime.parse_session_stop(
+            json.dumps(self.payload).encode(),
+            self.installation,
+            self.runtime_config,
+        )
+        assert event is not None
+        key = self.runtime.session_key(
+            self.installation, event.session_id
+        )
+        lock = self.installation.spool / ".lock"
+        lock.write_bytes(b"")
+        lock.chmod(0o600)
+        previous = os.umask(0o777)
+        try:
+            self.assertTrue(
+                self.runtime.spool_session_stop(
+                    self.installation,
+                    self.runtime_config,
+                    event,
+                    key,
+                    time.time(),
+                )
+            )
+        finally:
+            os.umask(previous)
+
+        payload = next(self.installation.spool.glob("*.json"))
+        self.assertEqual(stat.S_IMODE(payload.stat().st_mode), 0o600)
+
+    def test_plugin_ingress_does_not_follow_spool_swapped_after_binding(
+        self,
+    ) -> None:
+        plugin_data, runtime = self.plugin_runtime()
+        with mock.patch.object(
+            self.runtime, "load_review_runtime", return_value=runtime
+        ):
+            bound = self.runtime.plugin_spool_installation(
+                self.installation, plugin_data, create=True
+            )
+        original = plugin_data / "original-stop-spool"
+        bound.spool.rename(original)
+        outside = self.base / "outside-capture"
+        outside.mkdir(mode=0o700)
+        sentinel = outside / "sentinel"
+        sentinel.write_bytes(b"outside-capture")
+        sentinel.chmod(0o600)
+        bound.spool.symlink_to(outside, target_is_directory=True)
+        before = {
+            path.name: path.read_bytes()
+            for path in outside.iterdir()
+        }
+        event = self.runtime.parse_session_stop(
+            json.dumps(self.payload).encode(),
+            bound,
+            self.runtime_config,
+        )
+        assert event is not None
+        key = self.runtime.session_key(bound, event.session_id)
+
+        with self.assertRaises(OSError):
+            self.runtime.spool_session_stop(
+                bound,
+                self.runtime_config,
+                event,
+                key,
+                time.time(),
+                coalesce=True,
+            )
+
+        self.assertEqual(
+            {
+                path.name: path.read_bytes()
+                for path in outside.iterdir()
+            },
+            before,
+        )
 
     def test_plugin_ingress_rejects_stale_replacement(self) -> None:
         plugin_data, runtime = self.plugin_runtime()
@@ -1590,7 +1702,8 @@ class ProductionSurfaceTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(manifest["version"], "0.1.1")
+        self.assertEqual(manifest["version"], "0.1.2")
+        self.assertEqual(runtime["version"], "0.1.2")
         self.assertEqual(set(hooks["hooks"]), {"Stop"})
         self.assertNotIn("matcher", hooks["hooks"]["Stop"][0])
         self.assertIn(" enqueue-stop ", command)
@@ -2600,6 +2713,7 @@ class MaintenanceStatusTests(unittest.TestCase):
         self,
     ) -> None:
         capture = self.capture_installation()
+        now = time.time()
         event = self.event("unimported-plugin-session")
         key = self.runtime.session_key(
             self.installation, event.session_id
@@ -2610,7 +2724,7 @@ class MaintenanceStatusTests(unittest.TestCase):
                 self.runtime_config,
                 event,
                 key,
-                2_000_000_000.0,
+                now,
                 coalesce=True,
             )
         )
@@ -2633,11 +2747,12 @@ class MaintenanceStatusTests(unittest.TestCase):
             side_effect=AssertionError("status mutation"),
         ):
             status = self.runtime.queue_status(
-                connection, capture, 2_000_000_001.0
+                connection, capture, now + 1
             )
         connection.close()
         self.assertEqual(status["pending_sessions"], 0)
         self.assertEqual(status["spool"]["files"], 1)
+        self.assertEqual(status["spool"]["verified_files"], 1)
         self.assertTrue(status["spool"]["available"])
         self.assertEqual(
             self.installation.database.read_bytes(), database_before
@@ -2650,6 +2765,243 @@ class MaintenanceStatusTests(unittest.TestCase):
             },
             spool_before,
         )
+
+    def test_status_counts_only_verified_private_single_link_payloads(
+        self,
+    ) -> None:
+        capture = self.capture_installation()
+        now = time.time()
+        event = self.event("verified-status-session")
+        key = self.runtime.session_key(
+            self.installation, event.session_id
+        )
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                capture,
+                self.runtime_config,
+                event,
+                key,
+                now,
+                coalesce=True,
+            )
+        )
+        malformed = capture.spool / "malformed.json"
+        malformed.write_bytes(b"{not-json\n")
+        malformed.chmod(0o600)
+        outside = self.base / "status-outside.json"
+        outside.write_bytes(next(capture.spool.glob("session-*.json")).read_bytes())
+        outside.chmod(0o600)
+        (capture.spool / "symlinked.json").symlink_to(outside)
+        hardlink_source = self.base / "status-hardlink-source.json"
+        hardlink_source.write_bytes(outside.read_bytes())
+        hardlink_source.chmod(0o600)
+        os.link(hardlink_source, capture.spool / "hardlinked.json")
+
+        def snapshot() -> list[tuple[str, int, int, bytes]]:
+            result: list[tuple[str, int, int, bytes]] = []
+            for path in sorted(capture.spool.iterdir()):
+                info = os.lstat(path)
+                value = (
+                    os.readlink(path).encode()
+                    if stat.S_ISLNK(info.st_mode)
+                    else path.read_bytes()
+                    if stat.S_ISREG(info.st_mode)
+                    else b""
+                )
+                result.append(
+                    (path.name, info.st_mode, info.st_nlink, value)
+                )
+            return result
+
+        database_before = self.installation.database.read_bytes()
+        spool_before = snapshot()
+        connection = self.runtime.open_database(
+            self.installation, read_only=True
+        )
+        status = self.runtime.queue_status(connection, capture, now)
+        connection.close()
+
+        self.assertEqual(status["spool"]["files"], 3)
+        self.assertEqual(status["spool"]["verified_files"], 1)
+        self.assertEqual(
+            self.installation.database.read_bytes(), database_before
+        )
+        self.assertEqual(snapshot(), spool_before)
+
+    def test_maintenance_does_not_follow_spool_swapped_after_binding(
+        self,
+    ) -> None:
+        capture = self.capture_installation()
+        original = capture.spool.with_name("original-stop-spool")
+        capture.spool.rename(original)
+        outside = self.base / "outside-maintenance"
+        outside.mkdir(mode=0o700)
+        sentinel = outside / "sentinel.json"
+        sentinel.write_bytes(b"outside-maintenance")
+        sentinel.chmod(0o600)
+        capture.spool.symlink_to(outside, target_is_directory=True)
+        before = sentinel.stat()
+        connection = self.runtime.open_database(self.installation)
+        try:
+            with self.assertRaises(OSError):
+                self.runtime.import_spool(
+                    connection,
+                    capture,
+                    self.runtime_config,
+                    time.time(),
+                )
+        finally:
+            connection.close()
+
+        after = sentinel.stat()
+        self.assertEqual(sentinel.read_bytes(), b"outside-maintenance")
+        self.assertEqual(
+            (after.st_dev, after.st_ino, after.st_mtime_ns),
+            (before.st_dev, before.st_ino, before.st_mtime_ns),
+        )
+
+    def test_maintenance_removes_only_exact_private_writer_temps(
+        self,
+    ) -> None:
+        exact = [
+            self.installation.spool
+            / f".spool-write-{index:032x}.tmp"
+            for index in range(3)
+        ]
+        for path in exact:
+            path.write_bytes(b"stale")
+            path.chmod(0o600)
+        exact[-1].chmod(0o000)
+        preserved = [
+            self.installation.spool / ".spool-write-short.tmp",
+            self.installation.spool
+            / ".spool-write-0000000000000000000000000000000G.tmp",
+            self.installation.spool
+            / ".spool-write-00000000000000000000000000000002.tmpx",
+        ]
+        for path in preserved:
+            path.write_bytes(b"preserve")
+            path.chmod(0o600)
+        wrong_mode = (
+            self.installation.spool
+            / ".spool-write-00000000000000000000000000000003.tmp"
+        )
+        wrong_mode.write_bytes(b"preserve")
+        wrong_mode.chmod(0o644)
+        hardlink_source = self.base / "writer-temp-hardlink"
+        hardlink_source.write_bytes(b"preserve")
+        hardlink_source.chmod(0o600)
+        hardlinked = (
+            self.installation.spool
+            / ".spool-write-00000000000000000000000000000004.tmp"
+        )
+        os.link(hardlink_source, hardlinked)
+        symlinked = (
+            self.installation.spool
+            / ".spool-write-00000000000000000000000000000005.tmp"
+        )
+        symlinked.symlink_to(hardlink_source)
+
+        connection = self.runtime.open_database(self.installation)
+        result = self.runtime.run_maintenance(
+            connection,
+            self.installation,
+            self.runtime_config,
+            time.time(),
+        )
+        connection.close()
+
+        self.assertEqual(result.get("spool_writer_temps_deleted"), 3)
+        self.assertTrue(all(not path.exists() for path in exact))
+        self.assertTrue(all(path.exists() for path in preserved))
+        self.assertTrue(wrong_mode.exists())
+        self.assertTrue(hardlinked.exists())
+        self.assertTrue(symlinked.is_symlink())
+        self.assertEqual(hardlink_source.read_bytes(), b"preserve")
+
+    def test_maintenance_recovers_scan_full_writer_temp_inventory(
+        self,
+    ) -> None:
+        writer_temps = self.runtime.MAX_SPOOL_SCAN_ENTRIES - 2
+        for index in range(writer_temps):
+            path = (
+                self.installation.spool
+                / f".spool-write-{index:032x}.tmp"
+            )
+            path.write_bytes(b"stale")
+            path.chmod(0o600)
+        unrelated = self.installation.spool / "unrelated"
+        unrelated.write_bytes(b"preserve")
+        unrelated.chmod(0o600)
+
+        connection = self.runtime.open_database(self.installation)
+        result = self.runtime.import_spool(
+            connection,
+            self.installation,
+            self.runtime_config,
+            time.time(),
+        )
+        connection.close()
+
+        self.assertEqual(
+            result.get("spool_writer_temps_deleted"),
+            writer_temps,
+        )
+        self.assertEqual(result["spool_scan_saturated"], 0)
+        self.assertEqual(unrelated.read_bytes(), b"preserve")
+        self.assertEqual(
+            [
+                path
+                for path in self.installation.spool.iterdir()
+                if path.name.startswith(".spool-write-")
+            ],
+            [],
+        )
+
+    def test_writer_temp_cleanup_revalidates_private_file_before_unlink(
+        self,
+    ) -> None:
+        temporary = (
+            self.installation.spool
+            / ".spool-write-00000000000000000000000000000000.tmp"
+        )
+        temporary.write_bytes(b"preserve")
+        temporary.chmod(0o600)
+        parent_descriptor, spool_descriptor = (
+            self.runtime.open_spool_directories(self.installation)
+        )
+        real_stat = os.stat
+        target_stats = 0
+
+        def make_nonprivate_before_second_stat(
+            target: object, *args: object, **kwargs: object
+        ):
+            nonlocal target_stats
+            if (
+                target == temporary.name
+                and kwargs.get("dir_fd") == spool_descriptor
+            ):
+                target_stats += 1
+                if target_stats == 2:
+                    temporary.chmod(0o644)
+            return real_stat(target, *args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                self.runtime.os,
+                "stat",
+                side_effect=make_nonprivate_before_second_stat,
+            ), self.runtime.open_locked_spool(spool_descriptor):
+                deleted = self.runtime.cleanup_spool_writer_temps(
+                    spool_descriptor
+                )
+        finally:
+            os.close(spool_descriptor)
+            os.close(parent_descriptor)
+
+        self.assertEqual(deleted, 0)
+        self.assertEqual(temporary.read_bytes(), b"preserve")
+        self.assertEqual(stat.S_IMODE(temporary.stat().st_mode), 0o644)
 
     def test_raw_transcript_content_is_never_persisted_in_ingress_or_database(
         self,
@@ -3326,7 +3678,10 @@ class MaintenanceStatusTests(unittest.TestCase):
         def fail_target_open(
             target: object, flags: int, *args: object, **kwargs: object
         ) -> int:
-            if Path(target) == path:
+            if (
+                target == path.name
+                and kwargs.get("dir_fd") is not None
+            ):
                 raise OSError(5, "transient read failure")
             return real_open(target, flags, *args, **kwargs)
 
@@ -3470,7 +3825,8 @@ class MaintenanceStatusTests(unittest.TestCase):
             nonlocal swapped
             if (
                 not swapped
-                and Path(target) == path
+                and target == path.name
+                and kwargs.get("dir_fd") is not None
             ):
                 swapped = True
                 path.unlink()
@@ -3559,7 +3915,11 @@ class MaintenanceStatusTests(unittest.TestCase):
             target: object, flags: int, *args: object, **kwargs: object
         ) -> int:
             nonlocal swapped
-            if not swapped and Path(target) == lock_path:
+            if (
+                not swapped
+                and target == lock_path.name
+                and kwargs.get("dir_fd") is not None
+            ):
                 swapped = True
                 lock_path.unlink()
                 lock_path.symlink_to(outside)
@@ -3607,20 +3967,23 @@ class MaintenanceStatusTests(unittest.TestCase):
         )
         entered = threading.Event()
         release = threading.Event()
-        real_fsync = self.runtime.fsync_directory
+        real_fsync = os.fsync
+        spool_info = self.installation.spool.stat()
         errors: list[BaseException] = []
         import_results: list[dict[str, int]] = []
         hook_results: list[bool] = []
 
-        def blocking_fsync(path: Path) -> None:
+        def blocking_fsync(descriptor: int) -> None:
+            info = os.fstat(descriptor)
             if (
                 threading.current_thread().name == "spool-importer"
-                and path == self.installation.spool
+                and (info.st_dev, info.st_ino)
+                == (spool_info.st_dev, spool_info.st_ino)
                 and not entered.is_set()
             ):
                 entered.set()
                 self.assertTrue(release.wait(1))
-            real_fsync(path)
+            real_fsync(descriptor)
 
         def importing() -> None:
             connection = self.runtime.open_database(self.installation)
@@ -3653,8 +4016,8 @@ class MaintenanceStatusTests(unittest.TestCase):
                 errors.append(error)
 
         with mock.patch.object(
-            self.runtime,
-            "fsync_directory",
+            self.runtime.os,
+            "fsync",
             side_effect=blocking_fsync,
         ):
             importer = threading.Thread(

@@ -214,18 +214,20 @@ The minimum automated proof is:
    its verified inode;
 6. repeated Stops for one session converge on one ingress file and preserve
    the newest observation;
-7. status observes ingress spool metadata without mutating either store;
+7. status reports HMAC/schema-verified ingress separately from raw inventory
+   without mutating either store;
 8. the existing capture, review, quality and full suites remain green.
 
 The production proof is one new Desktop task after installing the patch and
-trusting the changed Hook. Before import, status must show one or more ingress
-spool files. After explicit maintenance, it must show a pending canonical
+trusting the changed Hook. Before import, status must show
+`spool.verified_files >= 1`; raw `spool.files` is diagnostic inventory, not
+capture proof. After explicit maintenance, it must show a pending canonical
 session and an empty ingress spool.
 
 ## 10. Rollout and Gate Effect
 
 1. implement and verify the patch in the source repository;
-2. release it as `0.1.1`;
+2. release it as `0.1.2`;
 3. reinstall or refresh the local plugin;
 4. review and trust the changed Hook command;
 5. run one fresh meaningful Desktop task;

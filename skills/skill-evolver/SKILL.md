@@ -31,7 +31,9 @@ does not automatically review, label, evaluate, or apply anything.
 Status is read-only: it opens SQLite in `mode=ro`. Candidate inspection also
 opens SQLite read-only. They do not run maintenance, clean result files,
 import spool files, or open transcripts. Inspection shows only the sanitized
-candidate and aggregate evidence.
+candidate and aggregate evidence. In status, `spool.files` is raw diagnostic
+inventory and `spool.verified_files` is the HMAC/schema-verified capture
+count.
 `C-NNN` is the display grammar; replace it with the exact ID returned by
 Python for an actual invocation.
 
