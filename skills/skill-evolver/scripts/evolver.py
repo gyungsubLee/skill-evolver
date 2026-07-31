@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Mapping, Optional, Sequence, TypedDict
 from urllib.parse import quote
 
-VERSION = "skill-evolver 0.1.2"
+VERSION = "skill-evolver 0.1.3"
 SCHEMA_VERSION = 1
 MAX_HOOK_BYTES = 65_536
 SQLITE_INTEGER_MAX = 9_223_372_036_854_775_807
@@ -8481,7 +8481,7 @@ def load_review_runtime() -> ReviewRuntime:
         type(payload["schema_version"]) is not int
         or payload["schema_version"] != 1
         or type(payload["version"]) is not str
-        or payload["version"] != "0.1.2"
+        or payload["version"] != "0.1.3"
         or type(payload["installation"]) is not str
         or payload["installation"]
         != "/Users/igyeongseob/.codex/skill-evolver/installation.json"

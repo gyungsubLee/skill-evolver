@@ -1702,8 +1702,12 @@ class ProductionSurfaceTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(manifest["version"], "0.1.2")
-        self.assertEqual(runtime["version"], "0.1.2")
+        self.assertEqual(manifest["version"], "0.1.3")
+        self.assertEqual(runtime["version"], "0.1.3")
+        self.assertEqual(
+            load_runtime().VERSION,
+            "skill-evolver 0.1.3",
+        )
         self.assertEqual(set(hooks["hooks"]), {"Stop"})
         self.assertNotIn("matcher", hooks["hooks"]["Stop"][0])
         self.assertIn(" enqueue-stop ", command)

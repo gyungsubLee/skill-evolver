@@ -5,6 +5,11 @@ explicit Review/Inbox surface. The Hook does not run a model, analyze
 transcript bytes, create a candidate automatically, or change an installed
 skill.
 
+Version `0.1.3` recognizes the text and control response items emitted by
+Codex `0.146.0`. Codex rollout JSONL is not a stable Hook interface, so
+unknown or multimodal response items fail closed as `unsupported_transcript`
+until explicitly reviewed.
+
 ## Gate
 
 `docs/feasibility-report-v2.json` must contain:
