@@ -2687,7 +2687,10 @@ class MaintenanceStatusTests(unittest.TestCase):
             )
             self.assertEqual(
                 self.runtime.cmd_maintain(
-                    Namespace(installation=str(self.installation_path))
+                    Namespace(
+                        installation=str(self.installation_path),
+                        plugin_data=str(capture.spool.parent),
+                    )
                 ),
                 0,
             )
@@ -2750,7 +2753,10 @@ class MaintenanceStatusTests(unittest.TestCase):
             side_effect=captured.append,
         ):
             result = self.runtime.cmd_status(
-                Namespace(installation=str(self.installation_path))
+                Namespace(
+                    installation=str(self.installation_path),
+                    plugin_data=str(plugin_data),
+                )
             )
         self.assertEqual(result, 0)
         self.assertEqual(read_only_modes, [True])
@@ -2773,6 +2779,42 @@ class MaintenanceStatusTests(unittest.TestCase):
             sorted(path.name for path in self.installation.spool.iterdir()),
             spool_entries_before,
         )
+
+    def test_handlers_reject_wrong_plugin_data_before_touching_pinned_root(
+        self,
+    ) -> None:
+        capture = self.capture_installation()
+        sentinel = capture.spool / "pinned.json"
+        sentinel.write_bytes(b"pinned\n")
+        sentinel.chmod(0o600)
+        runtime = replace(
+            self.runtime.load_review_runtime(),
+            plugin_data=capture.spool.parent,
+        )
+        wrong = self.base / "wrong-plugin-data"
+
+        with mock.patch.object(
+            self.runtime, "load_review_runtime", return_value=runtime
+        ), mock.patch.object(
+            self.runtime,
+            "open_database",
+            side_effect=AssertionError("database touched"),
+        ):
+            for handler in (
+                self.runtime.cmd_status,
+                self.runtime.cmd_maintain,
+            ):
+                with self.subTest(handler=handler.__name__):
+                    with self.assertRaisesRegex(
+                        ValueError, "invalid_plugin_data"
+                    ):
+                        handler(
+                            Namespace(
+                                installation=str(self.installation_path),
+                                plugin_data=str(wrong),
+                            )
+                        )
+                    self.assertEqual(sentinel.read_bytes(), b"pinned\n")
 
     def test_spool_import_converges_by_session_and_deletes_invalid_payload(
         self,
@@ -4537,7 +4579,10 @@ class MaintenanceStatusTests(unittest.TestCase):
             side_effect=captured.append,
         ):
             result = self.runtime.cmd_status(
-                Namespace(installation=str(self.installation_path))
+                Namespace(
+                    installation=str(self.installation_path),
+                    plugin_data=str(capture.spool.parent),
+                )
             )
         self.assertEqual(result, 0)
         self.assertEqual(captured[0]["pending_sessions"], 1)

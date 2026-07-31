@@ -45,7 +45,7 @@ another path under that approval.
 
 Command shapes are not approvals. A displayed shape lists option names only;
 every actual approval request must contain fully expanded literal values and
-must be limited to that one invocation and the exact installation data root.
+must be limited to that one invocation and the roots stated below.
 
 - `maintain`: show the exact `maintain --installation
   /Users/igyeongseob/.codex/skill-evolver/installation.json --plugin-data
@@ -59,7 +59,6 @@ must be limited to that one invocation and the exact installation data root.
 - `defer` requires separate approval for one fully expanded command and the exact installation data root.
 - `resume` requires separate approval for one fully expanded command and the exact installation data root.
 - `reject` requires separate approval for one fully expanded command and the exact installation data root.
-- `maintain` requires separate approval for one fully expanded command and the canonical and plugin-data roots for that invocation.
 
 The non-runnable review command shapes are:
 

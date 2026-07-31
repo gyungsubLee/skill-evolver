@@ -13435,17 +13435,8 @@ def cmd_enqueue_stop(args: argparse.Namespace) -> int:
 def cmd_maintain(args: argparse.Namespace) -> int:
     installation = load_installation(Path(args.installation))
     config = load_config(installation)
-    plugin_data = load_review_runtime().plugin_data
-    expected_plugin_data = (
-        installation.data_root.parent
-        / "plugins/data/skill-evolver-skill-evolver-dev"
-    )
-    capture = (
-        plugin_spool_installation(
-            installation, plugin_data, create=True
-        )
-        if plugin_data == expected_plugin_data
-        else installation
+    capture = plugin_spool_installation(
+        installation, Path(args.plugin_data), create=True
     )
     connection = open_database(installation)
     try:
@@ -13464,17 +13455,8 @@ def cmd_maintain(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     installation = load_installation(Path(args.installation))
-    plugin_data = load_review_runtime().plugin_data
-    expected_plugin_data = (
-        installation.data_root.parent
-        / "plugins/data/skill-evolver-skill-evolver-dev"
-    )
-    capture = (
-        plugin_spool_installation(
-            installation, plugin_data, create=False
-        )
-        if plugin_data == expected_plugin_data
-        else installation
+    capture = plugin_spool_installation(
+        installation, Path(args.plugin_data), create=False
     )
     connection = open_database(installation, read_only=True)
     try:
