@@ -262,7 +262,12 @@ git commit -m "test(skill-evolver): cover Codex 0.146 rollouts"
 
 **Files:**
 
+- Modify: `skills/skill-evolver/tests/test_review.py`
 - Modify: `skills/skill-evolver/scripts/evolver.py`
+
+`test_review.py` remains unchanged for the planned GREEN path. If task review
+finds an uncovered compatibility boundary, add its failing regression here
+before changing production behavior.
 
 **Interfaces:**
 
