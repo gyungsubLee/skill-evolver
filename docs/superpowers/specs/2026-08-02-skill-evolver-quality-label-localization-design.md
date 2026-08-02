@@ -22,6 +22,12 @@ through one explicit CLI option.
 - The final confirmation remains exactly
   `C-NNN@<full-sealed-subject-digest>`.
 - The successful final canonical JSON keeps its current English keys and schema.
+- Future Review candidates write human-facing summaries in the language of the
+  direct user request or correction that supplies the strong signal. If that
+  language is ambiguous, the fallback is Korean.
+- Fingerprint-bearing `target_locator` and `proposal_intent` remain concise
+  canonical English so equivalent improvements do not split by display
+  language.
 - The command remains user-only, external-TTY-only, insert-only, and free of
   judgment flags.
 - Use only Python's standard library and static in-process copy. Do not add
@@ -54,7 +60,8 @@ human-readable block in the selected locale containing exactly:
 Korean maps the validated risk enum as `low=낮음`, `medium=중간`, and
 `high=높음`. English displays the existing enum values. Candidate-authored
 sanitized values are displayed verbatim; localization changes labels and fixed
-instructions, not candidate content.
+instructions, not already sealed candidate content. Future candidates follow
+the authoring-language contract in Section 4.1.
 
 The three prompts explain the judgment in the selected language while still
 requiring lowercase `yes` or `no`:
@@ -87,6 +94,26 @@ The renderer must not open SQLite, read a transcript, inspect a skill, mutate
 state, or recompute candidate data. The parser supplies the locale; the
 prepared subject supplies all displayed variable values.
 
+### 4.1 Future candidate authoring language
+
+Update the Review policy and fixed result instructions without changing the
+candidate schema:
+
+- `problem_summary`, `proposal_summary`, `validation_plan`, and every evidence
+  `summary` use the language of the direct user request or correction that
+  provides the candidate's strong signal;
+- when one session contains mixed languages, use the language of the latest
+  evidence-eligible direct user record;
+- when the language is still ambiguous, use Korean;
+- enum values, `target_identity`, `problem_category`, `risk_level`,
+  `signal_type`, and `source_kind` retain their existing canonical values;
+- `target_locator` and `proposal_intent` remain canonical English because they
+  participate in `candidate_fingerprint()`.
+
+This is a model-output policy, not runtime translation. Python still never
+invokes a model or translation service. Existing candidates, including sealed
+`C-001`, remain immutable and may retain English summaries.
+
 ## 5. Data Flow
 
 ```text
@@ -104,6 +131,9 @@ Locale never crosses into the transaction. Two invocations that make the same
 three judgments against the same sealed subject produce equivalent stored
 labels regardless of display language, aside from their existing attestation
 timestamp.
+
+Candidate authoring language is chosen earlier during explicit Review. It does
+not depend on the later `quality-label --locale` value.
 
 ## 6. Error Handling
 
@@ -133,6 +163,11 @@ Extend the existing fake-TTY quality-label tests to prove:
 6. The final output contains one canonical JSON line with the unchanged label
    keys.
 7. Non-TTY execution and all existing quality-label safety tests still pass.
+8. Review policy and result instructions require human-facing candidate text
+   in the direct user's language, Korean fallback, and canonical-English
+   fingerprint fields.
+9. Candidate fingerprint tests prove that the language policy does not change
+   the existing fingerprint input fields or hash algorithm.
 
 Run the focused quality-gate test module and then the complete unittest suite.
 
@@ -145,11 +180,19 @@ the next plugin version, verify source/cache parity, and run one real external
 TTY check for default Korean and explicit English. That deployment must not
 rewrite or relabel `Q-003`.
 
+The policy change intentionally changes the policy and runtime digests for
+future Review batches. It applies only after the terminal `Q-003` report is
+committed; it does not reopen, rewrite, or reinterpret that epoch.
+
 ## 9. Acceptance Criteria
 
 - A user can understand the candidate and every question without reading raw
   JSON or English fixed copy when using the default command.
 - `--locale en` provides an equivalent English interaction.
+- New candidates describe the problem, proposal, validation, and evidence in
+  the direct user's language, with Korean as the ambiguous-language fallback.
+- Fingerprint-bearing classification text remains canonical English, avoiding
+  language-only duplicate fingerprints.
 - Stored labels and terminal quality calculations are locale-independent.
 - No preliminary subject JSON is printed; the unchanged canonical success JSON
   remains available as the final line.
