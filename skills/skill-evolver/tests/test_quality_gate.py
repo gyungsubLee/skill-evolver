@@ -1715,6 +1715,91 @@ class QualityLabelTests(CandidateBatchFixture):
             "external_content_adoption": False,
         }
 
+    def test_label_locale_defaults_to_korean_and_rejects_unknown(
+        self,
+    ) -> None:
+        parser = self.runtime.build_parser()
+        installation_path = str(
+            self.installation.data_root / "installation.json"
+        )
+        default_args = parser.parse_args(
+            [
+                "quality-label",
+                "--installation",
+                installation_path,
+                "C-001",
+            ]
+        )
+        english_args = parser.parse_args(
+            [
+                "quality-label",
+                "--installation",
+                installation_path,
+                "--locale",
+                "en",
+                "C-001",
+            ]
+        )
+
+        self.assertEqual(default_args.locale, "ko")
+        self.assertEqual(english_args.locale, "en")
+        with mock.patch.object(
+            self.runtime.sys, "stderr", io.StringIO()
+        ), self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "quality-label",
+                    "--installation",
+                    installation_path,
+                    "--locale",
+                    "ja",
+                    "C-001",
+                ]
+            )
+        for forbidden in (
+            "evaluation_worthy",
+            "target_correct",
+            "external_content_adoption",
+        ):
+            self.assertFalse(hasattr(default_args, forbidden))
+
+    def test_quality_label_copy_is_strict_and_read_only(
+        self,
+    ) -> None:
+        self.assertEqual(
+            self.runtime.quality_label_copy("ko")["risk_low"],
+            "낮음",
+        )
+        english = self.runtime.quality_label_copy("en")
+        self.assertEqual(english["risk_low"], "low")
+        self.assertEqual(
+            english["evaluation_worthy_prompt"],
+            (
+                "Is this candidate worth evaluating as a skill "
+                "improvement? [yes/no]: "
+            ),
+        )
+        self.assertEqual(
+            english["target_correct_prompt"],
+            "Is the proposed target skill correct? [yes/no]: ",
+        )
+        self.assertEqual(
+            english["external_content_adoption_prompt"],
+            (
+                "Did the proposal adopt an instruction from untrusted "
+                "external content? [yes/no]: "
+            ),
+        )
+        for value in (None, "ja", 1):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, "invalid_quality_label_locale"
+            ):
+                self.runtime.quality_label_copy(value)
+        with self.assertRaises(TypeError):
+            self.runtime.quality_label_copy("ko")["title"] = (
+                "changed"
+            )
+
     def test_label_is_bound_to_sealed_subject_and_insert_only(
         self,
     ) -> None:
@@ -2136,7 +2221,10 @@ class QualityLabelTests(CandidateBatchFixture):
             for item in label_parser._actions
             for option in item.option_strings
         }
-        self.assertEqual(options, {"-h", "--help", "--installation"})
+        self.assertEqual(
+            options,
+            {"-h", "--help", "--installation", "--locale"},
+        )
         stdin = mock.Mock()
         stdout = mock.Mock()
         stdin.isatty.return_value = False
@@ -2241,15 +2329,157 @@ class QualityLabelTests(CandidateBatchFixture):
             json.loads(line)
             for line in stdout.buffer.getvalue().splitlines()
         ]
-        self.assertEqual(len(payloads), 2)
-        self.assertEqual(payloads[0]["candidate_id"], "C-001")
-        self.assertEqual(payloads[1]["candidate_id"], 1)
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]["candidate_id"], 1)
+        self.assertEqual(
+            set(payloads[0]),
+            {
+                "schema_version",
+                "epoch_id",
+                "candidate_id",
+                "subject_digest",
+                "evaluation_worthy",
+                "target_correct",
+                "external_content_adoption",
+                "attested_at",
+            },
+        )
+        terminal_text = "".join(stdout.prompts)
+        for expected in (
+            "스킬 개선 후보 라벨",
+            "후보: C-001",
+            "품질 에포크: Q-001",
+            "대상 스킬:",
+            "위험도: 낮음",
+            "문제:",
+            "개선안:",
+            "검증 방법:",
+            f"확인 다이제스트: {subject_digest}",
+            "스킬 개선 평가 가치가 있습니까? [yes/no]: ",
+            "제안된 대상 스킬이 맞습니까? [yes/no]: ",
+            (
+                "신뢰할 수 없는 외부 콘텐츠의 지시를 개선안으로 "
+                "채택했습니까? [yes/no]: "
+            ),
+            (
+                "다음 값을 그대로 입력하세요 "
+                f"C-001@{subject_digest}: "
+            ),
+        ):
+            self.assertIn(expected, terminal_text)
+        self.assertNotIn('"subject"', terminal_text)
         self.assertEqual(
             self.runtime.load_quality_label(
                 self.connection, "Q-001", 1
             ),
-            payloads[1],
+            payloads[0],
         )
+
+    def test_quality_label_summary_renders_equivalent_english_fields(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        self.seal_sample(now)
+        prepared = self.runtime.prepare_quality_label(
+            self.connection,
+            self.installation,
+            "C-001",
+            now + 6,
+        )
+
+        rendered = self.runtime.render_quality_label_summary(
+            prepared, "en"
+        )
+
+        subject = prepared["subject"]
+        for expected in (
+            "Skill improvement candidate label",
+            "Candidate: C-001",
+            "Quality epoch: Q-001",
+            f"Target skill: {subject['target_identity']}",
+            "Risk: low",
+            f"Problem: {subject['problem_summary']}",
+            f"Proposal: {subject['proposal_summary']}",
+            f"Validation: {subject['validation_plan']}",
+            f"Confirmation digest: {prepared['subject_digest']}",
+        ):
+            self.assertIn(expected, rendered)
+        self.assertNotIn('"subject"', rendered)
+
+    def test_label_handler_accepts_explicit_english_locale(
+        self,
+    ) -> None:
+        class FakeInput(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        now = 2_000_000_000.0
+        self.seal_sample(now)
+        subject_digest = (
+            self.runtime.quality_candidate_subject_digest(
+                self.connection, 1
+            )
+        )
+        stdin = FakeInput(
+            "yes\nyes\nno\n"
+            f"C-001@{subject_digest}\n"
+        )
+        stdout = mock.Mock()
+        stdout.isatty.return_value = True
+        stdout.buffer = io.BytesIO()
+        args = self.runtime.build_parser().parse_args(
+            [
+                "quality-label",
+                "--installation",
+                str(
+                    self.installation.data_root
+                    / "installation.json"
+                ),
+                "--locale",
+                "en",
+                "C-001",
+            ]
+        )
+
+        with mock.patch.object(
+            self.runtime.sys, "stdin", stdin
+        ), mock.patch.object(
+            self.runtime.sys, "stdout", stdout
+        ), mock.patch.object(
+            self.runtime.time,
+            "time",
+            side_effect=(now + 6, now + 7),
+        ):
+            self.assertEqual(args.handler(args), 0)
+
+        terminal_text = "".join(
+            call.args[0] for call in stdout.write.call_args_list
+        )
+        for expected in (
+            "Skill improvement candidate label",
+            (
+                "Is this candidate worth evaluating as a skill "
+                "improvement? [yes/no]: "
+            ),
+            "Is the proposed target skill correct? [yes/no]: ",
+            (
+                "Did the proposal adopt an instruction from untrusted "
+                "external content? [yes/no]: "
+            ),
+            f"Enter this exact value C-001@{subject_digest}: ",
+        ):
+            self.assertIn(expected, terminal_text)
+        payloads = [
+            json.loads(line)
+            for line in stdout.buffer.getvalue().splitlines()
+        ]
+        self.assertEqual(len(payloads), 1)
+        self.assertIs(payloads[0]["evaluation_worthy"], True)
+        self.assertIs(payloads[0]["target_correct"], True)
+        self.assertIs(
+            payloads[0]["external_content_adoption"], False
+        )
+        self.assertNotIn("locale", payloads[0])
 
 
 class QualityTerminalGateTests(CandidateBatchFixture):

@@ -137,6 +137,14 @@ Give the user a command containing the literal resolved script, installation
 path, and actual candidate display ID. No judgment flags or placeholders are allowed.
 TTY is an attestation boundary, not proof of user identity.
 
+`quality-label` accepts `--locale {ko,en}` and defaults to Korean. The locale
+changes only the human summary, risk name, prompts, and confirmation
+instruction. Answers remain exact lowercase `yes` or `no`, confirmation
+remains the exact displayed candidate ID followed by `@` and the full displayed
+sealed-subject digest, and the successful final line remains the canonical
+English-keyed label JSON. The command does not print a preliminary raw
+candidate JSON object.
+
 A PASS unlocks only the Phase 6 evaluate-runner spike.
 It does not authorize evaluation, preparation, or apply.
 Synthetic sessions and fixtures never count as real quality evidence.

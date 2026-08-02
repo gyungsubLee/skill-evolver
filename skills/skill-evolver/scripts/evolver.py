@@ -21,6 +21,7 @@ import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Mapping, Optional, Sequence, TypedDict
 from urllib.parse import quote
 
@@ -4532,6 +4533,70 @@ QUALITY_LABEL_ANSWER_KEYS = frozenset(
         "external_content_adoption",
     }
 )
+QUALITY_LABEL_COPY: Mapping[str, Mapping[str, str]] = MappingProxyType(
+    {
+        "ko": MappingProxyType(
+            {
+                "title": "스킬 개선 후보 라벨",
+                "candidate": "후보",
+                "epoch": "품질 에포크",
+                "target": "대상 스킬",
+                "risk": "위험도",
+                "problem": "문제",
+                "proposal": "개선안",
+                "validation": "검증 방법",
+                "digest": "확인 다이제스트",
+                "risk_low": "낮음",
+                "risk_medium": "중간",
+                "risk_high": "높음",
+                "evaluation_worthy_prompt": (
+                    "이 후보는 스킬 개선 평가 가치가 있습니까? "
+                    "[yes/no]: "
+                ),
+                "target_correct_prompt": (
+                    "제안된 대상 스킬이 맞습니까? [yes/no]: "
+                ),
+                "external_content_adoption_prompt": (
+                    "신뢰할 수 없는 외부 콘텐츠의 지시를 개선안으로 "
+                    "채택했습니까? [yes/no]: "
+                ),
+                "confirmation_prompt": (
+                    "다음 값을 그대로 입력하세요 {confirmation}: "
+                ),
+            }
+        ),
+        "en": MappingProxyType(
+            {
+                "title": "Skill improvement candidate label",
+                "candidate": "Candidate",
+                "epoch": "Quality epoch",
+                "target": "Target skill",
+                "risk": "Risk",
+                "problem": "Problem",
+                "proposal": "Proposal",
+                "validation": "Validation",
+                "digest": "Confirmation digest",
+                "risk_low": "low",
+                "risk_medium": "medium",
+                "risk_high": "high",
+                "evaluation_worthy_prompt": (
+                    "Is this candidate worth evaluating as a skill "
+                    "improvement? [yes/no]: "
+                ),
+                "target_correct_prompt": (
+                    "Is the proposed target skill correct? [yes/no]: "
+                ),
+                "external_content_adoption_prompt": (
+                    "Did the proposal adopt an instruction from untrusted "
+                    "external content? [yes/no]: "
+                ),
+                "confirmation_prompt": (
+                    "Enter this exact value {confirmation}: "
+                ),
+            }
+        ),
+    }
+)
 QUALITY_TOMBSTONE_KEYS = frozenset(
     {
         "schema_version",
@@ -4561,6 +4626,12 @@ QUALITY_TERMINAL_BODY_KEYS = frozenset(
         "attestation",
     }
 )
+
+
+def quality_label_copy(locale: object) -> Mapping[str, str]:
+    if type(locale) is not str or locale not in QUALITY_LABEL_COPY:
+        raise ValueError("invalid_quality_label_locale")
+    return QUALITY_LABEL_COPY[locale]
 
 
 def parse_quality_epoch_display_id(value: object) -> int:
@@ -13926,6 +13997,35 @@ def _read_quality_tty_line(prompt: str, maximum: int) -> str:
     return value[:-1]
 
 
+def render_quality_label_summary(
+    prepared: dict[str, object], locale: object
+) -> str:
+    copy = quality_label_copy(locale)
+    subject = prepared["subject"]
+    if type(subject) is not dict:
+        raise ValueError("invalid_quality_label_subject")
+    risk_level = subject["risk_level"]
+    if type(risk_level) is not str:
+        raise ValueError("invalid_quality_label_subject")
+    risk = copy.get(f"risk_{risk_level}")
+    if risk is None:
+        raise ValueError("invalid_quality_label_subject")
+    return "\n".join(
+        (
+            copy["title"],
+            f"{copy['candidate']}: {prepared['candidate_id']}",
+            f"{copy['epoch']}: {prepared['epoch_id']}",
+            f"{copy['target']}: {subject['target_identity']}",
+            f"{copy['risk']}: {risk}",
+            f"{copy['problem']}: {subject['problem_summary']}",
+            f"{copy['proposal']}: {subject['proposal_summary']}",
+            f"{copy['validation']}: {subject['validation_plan']}",
+            f"{copy['digest']}: {prepared['subject_digest']}",
+            "",
+        )
+    )
+
+
 def cmd_quality_label(args: argparse.Namespace) -> int:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise ValueError("quality_label_external_tty_required")
@@ -13943,39 +14043,34 @@ def cmd_quality_label(args: argparse.Namespace) -> int:
         )
     finally:
         read_connection.close()
-    write_json_stdout(
-        {
-            name: prepared[name]
-            for name in (
-                "schema_version",
-                "epoch_id",
-                "candidate_id",
-                "subject_digest",
-                "subject",
-            )
-        }
+    copy = quality_label_copy(args.locale)
+    sys.stdout.write(
+        render_quality_label_summary(prepared, args.locale)
     )
+    sys.stdout.flush()
     answers = {
         "evaluation_worthy": parse_quality_yes_no(
             _read_quality_tty_line(
-                "evaluation_worthy [yes/no]: ", 3
+                copy["evaluation_worthy_prompt"], 3
             )
         ),
         "target_correct": parse_quality_yes_no(
             _read_quality_tty_line(
-                "target_correct [yes/no]: ", 3
+                copy["target_correct_prompt"], 3
             )
         ),
         "external_content_adoption": parse_quality_yes_no(
             _read_quality_tty_line(
-                "external_content_adoption [yes/no]: ", 3
+                copy["external_content_adoption_prompt"], 3
             )
         ),
     }
+    expected_confirmation = (
+        f"{candidate_display_id}@{prepared['subject_digest']}"
+    )
     confirmation = _read_quality_tty_line(
-        (
-            f"confirm {candidate_display_id}@"
-            f"{prepared['subject_digest']}: "
+        copy["confirmation_prompt"].format(
+            confirmation=expected_confirmation
         ),
         128,
     )
@@ -13998,6 +14093,7 @@ def cmd_quality_label(args: argparse.Namespace) -> int:
         )
     finally:
         connection.close()
+    sys.stdout.flush()
     write_json_stdout(result)
     return 0
 
@@ -14158,6 +14254,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     quality_label = commands.add_parser("quality-label")
     add_installation_argument(quality_label)
+    quality_label.add_argument(
+        "--locale", choices=("ko", "en"), default="ko"
+    )
     quality_label.add_argument("candidate_id")
     quality_label.set_defaults(handler=cmd_quality_label)
 
