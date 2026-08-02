@@ -33,8 +33,9 @@ user's language while fingerprint-bearing fields remain canonical English.
   current English keys and schema; remove the preliminary subject JSON line.
 - Existing non-TTY, expiry, provenance, subject-drift, duplicate-label, and
   transaction behavior remains fail-closed.
-- Human-facing candidate fields use the latest evidence-eligible direct user
-  record's language; ambiguous language falls back to Korean.
+- Human-facing candidate fields use the final evidence-eligible `user_direct`
+  record's language in envelope order, independently of the strong-evidence
+  record; a missing or ambiguous source falls back to Korean.
 - `target_locator` and `proposal_intent` stay concise canonical English because
   `candidate_fingerprint()` hashes them.
 - Existing candidate `C-001` remains immutable and may retain English text.
@@ -615,8 +616,14 @@ with:
 
 ```python
 for expected in (
-    b"latest evidence-eligible direct user record",
-    b"ambiguous, use Korean",
+    b"final record in envelope order",
+    b"whose `source_kind` is",
+    b"`user_direct`.",
+    b"`verification_failure` uses `tool_output`",
+    b"quoted or pasted content",
+    b"no such record exists",
+    b"its language is",
+    b"ambiguous, use Korean.",
     b"target_locator",
     b"proposal_intent",
     b"canonical English",
@@ -628,12 +635,18 @@ instructions = self.runtime.REVIEW_RESULT_SCHEMA_INSTRUCTIONS[
 ]
 for expected in (
     (
-        "Write problem_summary, proposal_summary, validation_plan, and "
-        "every evidence summary in the language of the latest "
-        "evidence-eligible direct user record that supplies the strong "
-        "signal."
+        "Choose the candidate authoring language independently of the "
+        "strong-evidence record: use the final envelope record with "
+        "evidence_eligible true and source_kind user_direct."
     ),
-    "When that language is ambiguous, use Korean.",
+    (
+        "This also applies when verification_failure uses tool_output "
+        "as its strong evidence."
+    ),
+    (
+        "When no such record exists or that language is ambiguous, "
+        "use Korean."
+    ),
     (
         "Keep target_locator and proposal_intent concise canonical "
         "English because candidate_fingerprint hashes them."
@@ -689,9 +702,12 @@ Insert before the final mutation prohibition in
 
 ```markdown
 Write `problem_summary`, `proposal_summary`, `validation_plan`, and every
-evidence `summary` in the language of the latest evidence-eligible direct user
-record that supplies the candidate's strong signal. When that language is
-ambiguous, use Korean.
+evidence `summary` in the selected candidate authoring language. Select it
+independently of the strong-evidence record by using the final evidence-eligible
+`user_direct` record in envelope order. This includes `verification_failure`,
+whose strong evidence is `tool_output`. Ignore quoted or pasted content when
+selecting language. When no such record exists or its language is ambiguous,
+use Korean.
 
 Keep enum values and `target_identity` in their existing canonical forms. Keep
 `target_locator` and `proposal_intent` concise canonical English because they
@@ -707,11 +723,25 @@ Append these strings to the `instructions` list in
 ```python
 (
     "Write problem_summary, proposal_summary, validation_plan, and "
-    "every evidence summary in the language of the latest "
-    "evidence-eligible direct user record that supplies the strong "
-    "signal."
+    "every evidence summary in the candidate authoring language."
 ),
-"When that language is ambiguous, use Korean.",
+(
+    "Choose the candidate authoring language independently of the "
+    "strong-evidence record: use the final envelope record with "
+    "evidence_eligible true and source_kind user_direct."
+),
+(
+    "This also applies when verification_failure uses tool_output "
+    "as its strong evidence."
+),
+(
+    "Infer the language from the user's own request or correction, "
+    "not quoted or pasted content."
+),
+(
+    "When no such record exists or that language is ambiguous, use "
+    "Korean."
+),
 (
     "Keep target_locator and proposal_intent concise canonical "
     "English because candidate_fingerprint hashes them."
@@ -742,12 +772,14 @@ Add to the Review sections of `skills/skill-evolver/SKILL.md` and `README.md`:
 
 ```markdown
 For new candidates, human-facing problem, proposal, validation, and evidence
-summaries follow the language of the latest evidence-eligible direct user
-record that supplies the strong signal; ambiguous language falls back to
-Korean. Canonical enum values and fingerprint-bearing `target_locator` and
-`proposal_intent` remain English. This authoring rule is independent of the
-later `quality-label --locale` display option and does not rewrite existing
-candidates.
+summaries use the language of the final evidence-eligible `user_direct` record
+in envelope order, independently of which record supplies strong evidence.
+This includes `verification_failure`, whose evidence is `tool_output`. Quoted
+or pasted content does not select the language; a missing or ambiguous source
+falls back to Korean. Canonical enum values and fingerprint-bearing
+`target_locator` and `proposal_intent` remain English. This authoring rule is
+independent of the later `quality-label --locale` display option and does not
+rewrite existing candidates.
 ```
 
 - [ ] **Step 8: Run complete verification**

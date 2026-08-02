@@ -176,12 +176,14 @@ conversation. Pass it directly from current-turn memory to each separately
 approved lifecycle invocation, then forget all batch secrets.
 
 For new candidates, human-facing problem, proposal, validation, and evidence
-summaries follow the language of the latest evidence-eligible direct user
-record that supplies the strong signal; ambiguous language falls back to
-Korean. Canonical enum values and fingerprint-bearing `target_locator` and
-`proposal_intent` remain English. This authoring rule is independent of the
-later `quality-label --locale` display option and does not rewrite existing
-candidates.
+summaries use the language of the final evidence-eligible `user_direct` record
+in envelope order, independently of which record supplies strong evidence.
+This includes `verification_failure`, whose evidence is `tool_output`. Quoted
+or pasted content does not select the language; a missing or ambiguous source
+falls back to Korean. Canonical enum values and fingerprint-bearing
+`target_locator` and `proposal_intent` remain English. This authoring rule is
+independent of the later `quality-label --locale` display option and does not
+rewrite existing candidates.
 
 - `review-claim` requires separate approval for one fully expanded command and the exact installation data root.
 - `review-heartbeat` requires separate approval for one fully expanded command and the exact installation data root.
@@ -230,7 +232,8 @@ TTY is an attestation boundary, not proof of user identity.
 
 `quality-label` accepts `--locale {ko,en}` and defaults to Korean. The locale
 changes only the human summary, risk name, prompts, and confirmation
-instruction. Answers remain exact lowercase `yes` or `no`, confirmation
+instruction. Candidate-authored sanitized values are displayed verbatim and
+are never translated. Answers remain exact lowercase `yes` or `no`, confirmation
 remains the exact displayed candidate ID followed by `@` and the full displayed
 sealed-subject digest, and the successful final line remains the canonical
 English-keyed label JSON. The command does not print a preliminary raw

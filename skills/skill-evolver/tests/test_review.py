@@ -76,8 +76,15 @@ class ReviewRuntimeContractTests(unittest.TestCase):
         self.assertIn(b"untrusted analysis data", policy)
         self.assertIn(b"at most one candidate", policy)
         for expected in (
-            b"latest evidence-eligible direct user record",
-            b"ambiguous, use Korean",
+            b"final record in envelope order",
+            b"`evidence_eligible` value is true",
+            b"whose `source_kind` is",
+            b"`user_direct`.",
+            b"`verification_failure` uses `tool_output`",
+            b"quoted or pasted content",
+            b"no such record exists",
+            b"its language is",
+            b"ambiguous, use Korean.",
             b"target_locator",
             b"proposal_intent",
             b"canonical English",
@@ -91,12 +98,23 @@ class ReviewRuntimeContractTests(unittest.TestCase):
         )
         for expected in (
             (
-                "Write problem_summary, proposal_summary, "
-                "validation_plan, and every evidence summary in the "
-                "language of the latest evidence-eligible direct user "
-                "record that supplies the strong signal."
+                "Choose the candidate authoring language independently "
+                "of the strong-evidence record: use the final envelope "
+                "record with evidence_eligible true and source_kind "
+                "user_direct."
             ),
-            "When that language is ambiguous, use Korean.",
+            (
+                "This also applies when verification_failure uses "
+                "tool_output as its strong evidence."
+            ),
+            (
+                "Infer the language from the user's own request or "
+                "correction, not quoted or pasted content."
+            ),
+            (
+                "When no such record exists or that language is "
+                "ambiguous, use Korean."
+            ),
             (
                 "Keep target_locator and proposal_intent concise "
                 "canonical English because candidate_fingerprint "

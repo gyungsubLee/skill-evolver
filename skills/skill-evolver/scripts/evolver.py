@@ -8712,11 +8712,27 @@ REVIEW_RESULT_SCHEMA_INSTRUCTIONS = {
         "Write one JSON object to the allocated result file.",
         (
             "Write problem_summary, proposal_summary, validation_plan, "
-            "and every evidence summary in the language of the latest "
-            "evidence-eligible direct user record that supplies the "
-            "strong signal."
+            "and every evidence summary in the candidate authoring "
+            "language."
         ),
-        "When that language is ambiguous, use Korean.",
+        (
+            "Choose the candidate authoring language independently "
+            "of the strong-evidence record: use the final envelope "
+            "record with evidence_eligible true and source_kind "
+            "user_direct."
+        ),
+        (
+            "This also applies when verification_failure uses "
+            "tool_output as its strong evidence."
+        ),
+        (
+            "Infer the language from the user's own request or "
+            "correction, not quoted or pasted content."
+        ),
+        (
+            "When no such record exists or that language is "
+            "ambiguous, use Korean."
+        ),
         (
             "Keep target_locator and proposal_intent concise canonical "
             "English because candidate_fingerprint hashes them."

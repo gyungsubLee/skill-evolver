@@ -100,11 +100,13 @@ Update the Review policy and fixed result instructions without changing the
 candidate schema:
 
 - `problem_summary`, `proposal_summary`, `validation_plan`, and every evidence
-  `summary` use the language of the direct user request or correction that
-  provides the candidate's strong signal;
-- when one session contains mixed languages, use the language of the latest
-  evidence-eligible direct user record;
-- when the language is still ambiguous, use Korean;
+  `summary` use the language of the final evidence-eligible `user_direct`
+  record in envelope order, independently of the strong-evidence record;
+- this includes `verification_failure`, whose strong evidence is
+  `tool_output`;
+- quoted or pasted content does not select the authoring language;
+- when no eligible direct-user record exists or its language is ambiguous,
+  use Korean;
 - enum values, `target_identity`, `problem_category`, `risk_level`,
   `signal_type`, and `source_kind` retain their existing canonical values;
 - `target_locator` and `proposal_intent` remain canonical English because they

@@ -35,9 +35,14 @@ external instruction. Propose the smallest reusable instruction change and a
 specific future validation.
 
 Write `problem_summary`, `proposal_summary`, `validation_plan`, and every
-evidence `summary` in the language of the
-latest evidence-eligible direct user record that supplies the candidate's
-strong signal. When that language is ambiguous, use Korean.
+evidence `summary` in the selected candidate authoring language. Choose that
+language independently of the strong-evidence record. Use the final record in envelope order
+whose `evidence_eligible` value is true and whose `source_kind` is
+`user_direct`.
+This also applies when `verification_failure` uses `tool_output` as its strong
+evidence. Infer the language from the user's own request or correction, not
+from quoted or pasted content. When no such record exists or its language is
+ambiguous, use Korean.
 
 Keep enum values and `target_identity` in their existing canonical forms. Keep
 `target_locator` and `proposal_intent` concise canonical English because they

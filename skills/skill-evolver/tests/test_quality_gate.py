@@ -2271,24 +2271,34 @@ class QualityLabelTests(CandidateBatchFixture):
             )
 
     def test_label_handler_accepts_fake_tty_attestation(self) -> None:
-        class FakeInput(io.StringIO):
-            def isatty(self) -> bool:
-                return True
-
         class FakeOutput:
             def __init__(self) -> None:
                 self.buffer = io.BytesIO()
-                self.prompts: list[str] = []
 
             def isatty(self) -> bool:
                 return True
 
             def write(self, value: str) -> int:
-                self.prompts.append(value)
+                self.buffer.write(value.encode("utf-8"))
                 return len(value)
 
             def flush(self) -> None:
                 pass
+
+        class FakeInput(io.StringIO):
+            def __init__(
+                self, value: str, output: FakeOutput
+            ) -> None:
+                super().__init__(value)
+                self.output = output
+
+            def isatty(self) -> bool:
+                return True
+
+            def readline(self, size: int = -1) -> str:
+                value = super().readline(size)
+                self.output.write(value)
+                return value
 
         now = 2_000_000_000.0
         self.seal_sample(now)
@@ -2297,11 +2307,12 @@ class QualityLabelTests(CandidateBatchFixture):
                 self.connection, 1
             )
         )
+        stdout = FakeOutput()
         stdin = FakeInput(
             "yes\nyes\nno\n"
-            f"C-001@{subject_digest}\n"
+            f"C-001@{subject_digest}\n",
+            stdout,
         )
-        stdout = FakeOutput()
         args = self.runtime.build_parser().parse_args(
             [
                 "quality-label",
@@ -2325,14 +2336,24 @@ class QualityLabelTests(CandidateBatchFixture):
         ):
             self.assertEqual(args.handler(args), 0)
 
-        payloads = [
-            json.loads(line)
-            for line in stdout.buffer.getvalue().splitlines()
-        ]
-        self.assertEqual(len(payloads), 1)
-        self.assertEqual(payloads[0]["candidate_id"], 1)
+        terminal_text = stdout.buffer.getvalue().decode("utf-8")
+        terminal_lines = terminal_text.splitlines()
+        payload = json.loads(terminal_lines[-1])
+        json_lines = []
+        for line in terminal_lines:
+            try:
+                json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            json_lines.append(line)
+        self.assertEqual(json_lines, [terminal_lines[-1]])
         self.assertEqual(
-            set(payloads[0]),
+            terminal_lines[-1].encode("utf-8"),
+            self.runtime.canonical_json_bytes(payload),
+        )
+        self.assertEqual(payload["candidate_id"], 1)
+        self.assertEqual(
+            set(payload),
             {
                 "schema_version",
                 "epoch_id",
@@ -2344,7 +2365,6 @@ class QualityLabelTests(CandidateBatchFixture):
                 "attested_at",
             },
         )
-        terminal_text = "".join(stdout.prompts)
         for expected in (
             "스킬 개선 후보 라벨",
             "후보: C-001",
@@ -2372,7 +2392,7 @@ class QualityLabelTests(CandidateBatchFixture):
             self.runtime.load_quality_label(
                 self.connection, "Q-001", 1
             ),
-            payloads[0],
+            payload,
         )
 
     def test_quality_label_summary_renders_equivalent_english_fields(
