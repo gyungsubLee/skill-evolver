@@ -2,7 +2,7 @@
 
 ## Overview
 
-Skill Evolver는 Phase 1 Feasibility `FAIL`을 Phase 2의 session-level 계약으로 수정해 amended gate `PASS`를 확보했고, Phase 3에서 bounded Runtime Queue를 구현했다. `0.1.0`의 production capture assumption은 regressed 되었고 설치된 `0.1.2`는 capture를 plugin data로 route한다. `Q-001`은 provenance drift로 terminal `INVALID` 처리됐고 `Q-002`가 실제 sample을 수집 중이다. Phase 6은 `Q-002`가 Phase 5를 통과할 때까지 차단된다. 이제 explicit Review/Inbox를 구현한 뒤 quality, runner, immutable evaluation, manual apply/versioning, undo/recovery와 hardening gate를 순서대로 통과한다.
+Skill Evolver는 Phase 1 Feasibility `FAIL`을 Phase 2의 session-level 계약으로 수정해 amended gate `PASS`를 확보했고, Phase 3 bounded Runtime Queue와 Phase 4 explicit Review/Inbox를 구현했다. 설치된 `0.1.3`은 plugin data capture와 Codex `0.146.0` transcript adapter를 사용한다. `Q-001`과 `Q-002`는 각각의 provenance drift로 terminal `INVALID` 처리됐고, `Q-003`은 12 distinct real sessions와 candidate `C-001` 1건으로 sealed 됐다. Phase 6은 사용자가 외부 TTY에서 `C-001`을 label하고 `Q-003`이 Phase 5 terminal `PASS`를 얻을 때까지 차단된다. 이후 runner, immutable evaluation, manual apply/versioning, undo/recovery와 hardening gate를 순서대로 통과한다.
 
 ## Phases
 
@@ -112,14 +112,16 @@ Plans:
 **Depends on**: Phase 4
 **Requirements**: QUALITY-01
 **Entry Gate**: Review/Inbox suite passes with zero target-skill writes
-**Gate Result**: **BLOCKED** — installed `0.1.2` routes capture through plugin
-data. `Q-001` terminalized `INVALID` for provenance drift with report digest
-`2759c55fcc9262ef7ae83b55eb30b95466e932ce6621761dd305fa0d80a51bc1`;
-`Q-002` is `COLLECTING`. Production proof on 2026-07-31 observed two
-authenticated ingress files with `pending_sessions=0`, imported both in one
-approved maintenance invocation, and then observed `pending_sessions=2`,
-`pending_generations=2`, and an empty spool. The complete real quality sample
-and labels remain. Phase 6 stays blocked until `Q-002` passes.
+**Gate Result**: **AWAITING LABELS** — installed `0.1.3` binds capture and
+review to the Codex `0.146.0` transcript adapter. `Q-002` terminalized
+`INVALID` for `quality_provenance_drift` with report digest
+`57c64c9a7b32591f3af0e78c77d2f766f75f57e1da41a1a5a6aefca7b3993bfe`.
+`Q-003` opened from that exact predecessor and sealed on 2026-07-31 with 12
+distinct real sessions and one candidate, `C-001`. Read-only
+`quality-status` reports `AWAITING_LABELS`, `attested_label_count=0`, and
+`missing_labels=["C-001"]`. Only the user may label it in an external TTY.
+Phase 6 stays blocked until the separately approved quality gate returns
+terminal `PASS`.
 **Failure Route**: Phase 4 transcript adapter 또는 improvement policy로 돌아간다.
 **Success Criteria** (what must be TRUE):
   1. 개발자가 최소 10 sessions 또는 30 review items에 대한 complete label set을 확인할 수 있다.
@@ -238,7 +240,7 @@ Plans:
 | 2. Session-Level Capture Design Amendment | 1/1 | Complete (gate PASS) | 2026-07-29 |
 | 3. Runtime Queue | 1/1 | Complete (gate PASS) | 2026-07-29 |
 | 4. Review and Inbox | 1/1 | Complete (gate PASS) | 2026-07-30 |
-| 5. Read-only Quality Gate | 0/1 | Blocked — Q-001 pending provenance-drift terminalization; successor epoch must pass | - |
+| 5. Read-only Quality Gate | 0/1 | Awaiting user label — Q-003 sealed with 12 sessions and C-001 | - |
 | 6. Evaluate Runner Spike | 0/1 | Not started | - |
 | 7. Evaluate Prepare | 0/1 | Not started | - |
 | 8. Evaluate Execution | 0/1 | Not started | - |

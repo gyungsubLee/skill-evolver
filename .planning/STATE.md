@@ -13,7 +13,7 @@ progress:
 
 ## Project Reference
 
-See: `.planning/PROJECT.md` (updated 2026-07-27)
+See: `.planning/PROJECT.md` (updated 2026-08-02)
 
 **Core value:** 관찰은 최소화하고 판단과 스킬 변경 권한은 사용자에게 남긴다.
 **Current focus:** Phase 5 — Read-only Quality Gate
@@ -22,12 +22,14 @@ See: `.planning/PROJECT.md` (updated 2026-07-27)
 
 Phase: 5 of 11 (Read-only Quality Gate)
 Plan: 0 of 1 in current phase
-Status: `0.1.2` is installed with source/cache digest parity. `Q-001`
-terminalized `INVALID` for provenance drift and `Q-002` is `COLLECTING`.
-Two authenticated Desktop Stop captures were imported into the canonical
-queue. Phase 5 remains blocked from Phase 6 until `Q-002` passes.
-Last activity: 2026-07-31 — initialized the exact mode-`0700` plugin-data
-root, verified two ingress files, and imported both into the canonical queue
+Status: `0.1.3` is installed with source/cache parity and the Codex `0.146.0`
+transcript adapter. `Q-002` terminalized `INVALID` for provenance drift.
+`Q-003` is sealed with 12 distinct real sessions and candidate `C-001`; its
+read-only status is `AWAITING_LABELS`. Phase 6 remains blocked until the user
+labels `C-001` in an external TTY and the quality gate returns terminal `PASS`.
+Last activity: 2026-08-02 — revalidated `Q-003` status, confirmed recurring
+Desktop `unknown conversation` hook logs are internal-agent renderer routing
+rather than Hook execution failures, and completed read-only Phase 6 preflight
 
 Progress: [████░░░░░░] 36%
 
@@ -48,10 +50,10 @@ Progress: [████░░░░░░] 36%
 | 4. Review and Inbox | 1/1 | Not recorded | Not recorded |
 
 **Recent Trend:** Four sequential phase gates recorded; Phase 2, Phase 3 and
-Phase 4 are PASS; the `0.1.0` production capture assumption regressed and
-the `0.1.2` plugin-data path now has real Desktop capture/import proof. Phase
-5 remains blocked pending the complete `Q-002` sample, labels and successor
-PASS
+Phase 4 are PASS; installed `0.1.3` has real Desktop capture/import and
+current transcript-adapter proof. Phase 5 now has a complete sealed `Q-003`
+sample and remains gated only by the user-owned `C-001` label and terminal
+quality decision
 
 ## Accumulated Context
 
@@ -76,13 +78,18 @@ PASS
 - Phase 5 labels are user-entered only in a user-controlled external terminal;
   the agent must not enter or infer them, including through a PTY.
 - The `0.1.0` production capture assumption regressed. Release `0.1.2`
-  routes Stop capture through the pinned plugin-data root.
-- Installed plugin `0.1.2` reports source/cache executable digest
-  `3cb3f1f611c0a7b07b62e4390bc7dc4b607fd8ee1444fc6a700c1c664f570d22`.
+  introduced the pinned plugin-data route and release `0.1.3` added the
+  Codex `0.146.0` transcript adapter.
+- Installed plugin, runtime and source release identity are `0.1.3`.
 - `Q-001` terminalized `INVALID` for `quality_provenance_drift` with report
   digest `2759c55fcc9262ef7ae83b55eb30b95466e932ce6621761dd305fa0d80a51bc1`.
 - `Q-002` opened from that exact predecessor digest at
-  `2026-07-31T01:36:39Z` and is `COLLECTING` with no synthetic carryover.
+  `2026-07-31T01:36:39Z`, then terminalized `INVALID` for
+  `quality_provenance_drift` with report digest
+  `57c64c9a7b32591f3af0e78c77d2f766f75f57e1da41a1a5a6aefca7b3993bfe`.
+- `Q-003` opened from that exact predecessor at `2026-07-31T07:31:54Z` and
+  sealed at `2026-07-31T07:56:07Z` with 12 distinct real sessions and one
+  candidate, `C-001`; no label has been attested.
 - In this rollout Codex supplied the plugin-data locator without pre-creating
   its directory. The exact pinned root was initialized once as a user-owned
   mode-`0700` directory; the Hook remains fail-closed for an absent or unsafe
@@ -94,11 +101,11 @@ PASS
 
 ### Pending Todos
 
-- Collect at least 10 distinct meaningful real Codex sessions in `Q-002`.
-- Explicitly review the successor epoch's collected sessions in bounded batches
-  and seal it.
-- Have the user attest every sealed candidate in an external terminal, then run
-  the terminal quality gate and commit its content-addressed PASS report.
+- Have the user attest sealed candidate `C-001` in an external terminal.
+- Run the separately approved terminal quality gate and commit its
+  content-addressed PASS report if every threshold passes.
+- Refresh the Phase 6 runner plan against Codex `0.146.0` and the final
+  content-addressed `Q-003` report only after Phase 5 PASS.
 - Keep Runner, Prepare, Evaluate and Apply disabled until `QUALITY-01` passes.
 
 ### Blockers/Concerns
@@ -107,9 +114,13 @@ PASS
 - Phase 4 PASS proves deterministic mechanics and safety only; candidate quality remains unmeasured until Phase 5.
 - Phase 5 cannot use fixtures, subagents, repeated generations in this task, or
   empty generated tasks as substitutes for 10 distinct real sessions.
-- `Q-002` has production-proven Desktop ingress and two imported pending
-  sessions, but no complete real quality sample or human label set yet. Phase
-  6 remains blocked until `Q-002` passes.
+- `Q-003` has a complete sealed real sample but lacks the user-owned label for
+  `C-001`. The agent must not invoke `quality-label`, infer its answers, or
+  start Phase 6 before terminal `PASS`.
+- Desktop log entries `Received hook/... for unknown conversation` observed
+  for internal-agent conversation IDs are renderer routing errors, not Hook
+  process failures. Main Desktop sessions continued to update the private Stop
+  spool; use single-task verification to avoid that app-level noise.
 - The original Phase 1 `FAIL` and superseded turn-level Review plan remain immutable historical evidence.
 
 ## Deferred Items
@@ -121,8 +132,7 @@ PASS
 
 ## Session Continuity
 
-Last session: 2026-07-31
-Stopped at: `0.1.2` Desktop ingress/import proved with two sessions and
-`Q-002` collecting; next collect real Codex tasks for bounded review,
-external-terminal labels, and the quality gate
+Last session: 2026-08-02
+Stopped at: `0.1.3` and sealed `Q-003` revalidated; waiting for the user-only
+external-terminal label for `C-001`, then a separately approved quality gate
 Resume file: None
