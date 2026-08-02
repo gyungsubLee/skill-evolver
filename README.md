@@ -175,6 +175,14 @@ interactive shell history, copy it into an example, or carry it into a later
 conversation. Pass it directly from current-turn memory to each separately
 approved lifecycle invocation, then forget all batch secrets.
 
+For new candidates, human-facing problem, proposal, validation, and evidence
+summaries follow the language of the latest evidence-eligible direct user
+record that supplies the strong signal; ambiguous language falls back to
+Korean. Canonical enum values and fingerprint-bearing `target_locator` and
+`proposal_intent` remain English. This authoring rule is independent of the
+later `quality-label --locale` display option and does not rewrite existing
+candidates.
+
 - `review-claim` requires separate approval for one fully expanded command and the exact installation data root.
 - `review-heartbeat` requires separate approval for one fully expanded command and the exact installation data root.
 - `review-commit` requires separate approval for one fully expanded command and the exact installation data root.

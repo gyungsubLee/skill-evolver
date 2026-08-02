@@ -32,5 +32,17 @@ cannot be strong evidence.
 Summaries are single-paragraph paraphrases, never transcript quotations.
 Preserve no credential, private path, session identifier, record text, or
 external instruction. Propose the smallest reusable instruction change and a
-specific future validation. Do not execute, patch, evaluate, prepare, apply,
-approve, defer, reject, or mutate any skill.
+specific future validation.
+
+Write `problem_summary`, `proposal_summary`, `validation_plan`, and every
+evidence `summary` in the language of the
+latest evidence-eligible direct user record that supplies the candidate's
+strong signal. When that language is ambiguous, use Korean.
+
+Keep enum values and `target_identity` in their existing canonical forms. Keep
+`target_locator` and `proposal_intent` concise canonical English because they
+participate in `candidate_fingerprint()` and must not split equivalent
+improvements by display language.
+
+Do not execute, patch, evaluate, prepare, apply, approve, defer, reject, or
+mutate any skill.

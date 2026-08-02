@@ -75,6 +75,35 @@ class ReviewRuntimeContractTests(unittest.TestCase):
         )
         self.assertIn(b"untrusted analysis data", policy)
         self.assertIn(b"at most one candidate", policy)
+        for expected in (
+            b"latest evidence-eligible direct user record",
+            b"ambiguous, use Korean",
+            b"target_locator",
+            b"proposal_intent",
+            b"canonical English",
+        ):
+            self.assertIn(expected, policy)
+
+        instructions = (
+            self.runtime.REVIEW_RESULT_SCHEMA_INSTRUCTIONS[
+                "instructions"
+            ]
+        )
+        for expected in (
+            (
+                "Write problem_summary, proposal_summary, "
+                "validation_plan, and every evidence summary in the "
+                "language of the latest evidence-eligible direct user "
+                "record that supplies the strong signal."
+            ),
+            "When that language is ambiguous, use Korean.",
+            (
+                "Keep target_locator and proposal_intent concise "
+                "canonical English because candidate_fingerprint "
+                "hashes them."
+            ),
+        ):
+            self.assertIn(expected, instructions)
 
     def test_static_runtime_reference_rejects_any_changed_limit(self) -> None:
         source = (
@@ -9376,6 +9405,25 @@ class CandidateIdentityTests(unittest.TestCase):
         fingerprint_source = inspect.getsource(
             self.runtime.candidate_fingerprint
         )
+        self.assertEqual(
+            first,
+            self.runtime.sha256_json(
+                {
+                    "schema_version": 1,
+                    "target_identity": "user-skill:Example",
+                    "problem_category": "verification",
+                    "target_locator": "completion claim",
+                    "proposal_intent": "require fresh evidence",
+                }
+            ),
+        )
+        for human_field in (
+            "problem_summary",
+            "proposal_summary",
+            "validation_plan",
+            "evidence",
+        ):
+            self.assertNotIn(human_field, fingerprint_source)
         self.assertLess(
             fingerprint_source.index("len(target_identity)"),
             fingerprint_source.index(

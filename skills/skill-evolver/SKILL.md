@@ -123,6 +123,14 @@ terminal state.
 Do not quote transcript text in summaries. Use only the documented signal and
 exclusion enums. Never call a model from Python. Never apply a candidate.
 
+For new candidates, human-facing problem, proposal, validation, and evidence
+summaries follow the language of the latest evidence-eligible direct user
+record that supplies the strong signal; ambiguous language falls back to
+Korean. Canonical enum values and fingerprint-bearing `target_locator` and
+`proposal_intent` remain English. This authoring rule is independent of the
+later `quality-label --locale` display option and does not rewrite existing
+candidates.
+
 ## Real session quality boundary
 
 `quality-open`, `quality-seal`, and `quality-gate` are separately approved explicit mutations.

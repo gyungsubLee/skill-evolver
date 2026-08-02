@@ -8710,6 +8710,17 @@ REVIEW_RESULT_SCHEMA_INSTRUCTIONS = {
         "Never quote transcript content or invent a target path.",
         "Reference only record_ref values from the same session.",
         "Write one JSON object to the allocated result file.",
+        (
+            "Write problem_summary, proposal_summary, validation_plan, "
+            "and every evidence summary in the language of the latest "
+            "evidence-eligible direct user record that supplies the "
+            "strong signal."
+        ),
+        "When that language is ambiguous, use Korean.",
+        (
+            "Keep target_locator and proposal_intent concise canonical "
+            "English because candidate_fingerprint hashes them."
+        ),
     ],
     "result_shape": {
         "schema_version": 1,
