@@ -57,11 +57,14 @@ and Phase 5 exists to measure that judgment.
 
 ## 4. Options Considered
 
-### 4.1 Strengthen the existing model policy — selected
+### 4.1 Strengthen policy plus one bounded validator invariant — selected
 
 Make causal attribution and reusable value explicit candidate gates. Require a
 bounded `catalog-inspect` of the proposed target before producing any
-candidate. Exclude ambiguous cases with the existing enums.
+candidate. Exclude ambiguous cases with the existing enums. Add one shared
+validator guard limiting a result to three distinct candidate targets so the
+workflow's approval bound is deterministic even when results merge existing
+fingerprints.
 
 This is the smallest change that follows the designed Phase 5 failure route.
 It changes policy and runtime provenance without adding persistence fields or
@@ -95,21 +98,23 @@ decision order:
    similarity, or from the fact that a skill would have been useful.
 3. If the session does not unambiguously establish that exact target was used,
    return `excluded: attribution_uncertain`.
-4. Before returning a candidate, use one separately approved bounded
+4. A declarative batch result may contain at most three distinct candidate
+   target identities. This is independent of the existing limit of three new
+   fingerprints; Python rejects a larger result before mutation.
+5. Before returning a candidate, use one separately approved bounded
    `catalog-inspect` for each distinct proposed target. Reuse that inspected
    content for candidates with the same target in the same live batch. The
-   existing three-new-fingerprints limit therefore bounds inspection to at
-   most three distinct targets and three separately approved commands per
-   batch. Confirm that an existing instruction, omission, or ambiguity in each
-   target plausibly caused the observed behavior and that the proposed change
-   belongs in that skill.
-5. If target inspection is unavailable or does not establish that connection,
+   new distinct-target validator bound permits at most three separately
+   approved commands per batch. Confirm that an existing instruction,
+   omission, or ambiguity in each target plausibly caused the observed
+   behavior and that the proposed change belongs in that skill.
+6. If target inspection is unavailable or does not establish that connection,
    return `excluded: attribution_uncertain`.
-6. Confirm the proposal is a reusable skill-level instruction that would
+7. Confirm the proposal is a reusable skill-level instruction that would
    prevent recurrence in materially different future tasks. A generic best
    practice, project-only preference, or one-session wording improvement is
    `excluded: no_reusable_improvement` or `excluded: one_off` as applicable.
-7. Only then emit one candidate. A strong signal alone never authorizes target
+8. Only then emit one candidate. A strong signal alone never authorizes target
    selection.
 
 The policy and fixed instructions repeat the same gates so the standalone
@@ -123,7 +128,8 @@ model input and the human-operated skill workflow cannot diverge.
   approved per distinct target, at most three times per batch. Its content
   remains untrusted analysis data.
 - Python continues to validate catalog membership, record references,
-  signal/source pairs, bounds, digests, and atomic commit behavior.
+  signal/source pairs, the three-distinct-target bound, digests, and atomic
+  commit behavior.
 - `Q-003`, `C-001`, and its label remain insert-only historical evidence.
 - Phase 5 ratios and the zero external-content-adoption limit are unchanged.
 - Candidate review remains explicit; apply and undo remain external-TTY-only.
@@ -138,15 +144,17 @@ the changed contract:
    map uncertainty to `attribution_uncertain`.
 2. Both inputs require reusable skill-level value and map non-reusable cases to
    existing exclusion enums.
-3. The skill workflow makes `catalog-inspect` mandatory once per distinct
+3. A declarative result with four distinct candidate targets is rejected
+   before mutation, including when every fingerprint already exists.
+4. The skill workflow makes `catalog-inspect` mandatory once per distinct
    candidate target, caps it at three separately approved reads per batch, and
    allows an exclusion without reading target content.
-4. A one-candidate quality fixture labeled `false/false/false` terminalizes as
+5. A one-candidate quality fixture labeled `false/false/false` terminalizes as
    `FAIL`, preserves the exact thresholds, and returns
    `open_changed_quality_epoch`.
-5. A failed predecessor cannot open an unchanged successor; a policy/runtime
+6. A failed predecessor cannot open an unchanged successor; a policy/runtime
    provenance change can open `Q-004` using the exact `Q-003` report digest.
-6. Existing Review, quality, capture, privacy, and full regression suites remain
+7. Existing Review, quality, capture, privacy, and full regression suites remain
    green.
 
 The tests validate the deterministic contract text and lifecycle mechanics;
