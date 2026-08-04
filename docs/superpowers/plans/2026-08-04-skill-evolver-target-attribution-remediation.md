@@ -10,10 +10,13 @@ source, and open changed-provenance quality epoch `Q-004` from immutable
 Q-003 failure evidence.
 
 **Architecture:** Keep the database and persisted candidate schemas unchanged.
-Strengthen the model policy and explicit-review workflow, add one shared
-validator guard for at most three distinct candidate targets per batch, and
-lock the existing quality retry mechanics with a sparse-candidate regression.
-Release and install those changes before the separately approved Q-004 open.
+Strengthen the model policy and explicit-review workflow, bind each candidate
+target to an ephemeral authenticated catalog read, exclude only exact
+authenticated catalog responses from recursive transcript export, add one
+shared validator guard for at most three distinct candidate targets per batch,
+and lock the existing quality retry mechanics with a sparse-candidate
+regression. Release and install those changes before the separately approved
+Q-004 open.
 
 > **Task 4 security-review correction:** The ephemeral Review result shape now
 > adds the exact `target_inspection_proofs` map. `catalog-inspect` requires the
@@ -26,6 +29,12 @@ Release and install those changes before the separately approved Q-004 open.
 > invocation; invocation and causality remain policy/quality judgments. This
 > correction supersedes the earlier “Review result shape unchanged” assumption
 > without adding database state or a transcript invocation schema.
+> The response now also carries the non-secret `owner_digest`; the transcript
+> adapter excludes direct, final `Output:`-wrapped, or fragmented responses
+> only when the exact canonical seven-key payload, content digest, and HMAC all
+> validate. Proofs copied into persisted candidate/evidence text fail before
+> SQLite writes. Malformed or unauthenticated lookalikes remain ordinary tool
+> output.
 
 **Tech Stack:** `/usr/bin/python3` 3.9+, Python standard library, SQLite
 schema v1, `unittest`, local Codex plugin marketplace, Git worktree.
@@ -42,7 +51,8 @@ schema v1, `unittest`, local Codex plugin marketplace, Git worktree.
   misattribution at most `1/5`, and external-content adoption exactly `0`.
 - Keep `SCHEMA_VERSION = 1`, SQLite DDL, persisted candidate shape, evidence
   enums, and exclusion enums unchanged. The contract-bound ephemeral Review
-  result adds only `target_inspection_proofs`.
+  result has exactly four top-level keys: `schema_version`, `contract_digest`,
+  `target_inspection_proofs`, and `sessions`.
 - Add no dependency, model call, background worker, transcript copy, or
   automatic Review/Apply behavior.
 - A strong signal alone does not justify a target. Uncertain target use is
@@ -77,8 +87,10 @@ schema v1, `unittest`, local Codex plugin marketplace, Git worktree.
 
 - `skills/skill-evolver/references/improvement-policy.md`: model-facing causal
   attribution and reusable-value decision order.
-- `skills/skill-evolver/scripts/evolver.py`: fixed result instructions,
-  three-distinct-target validator, and coordinated `0.1.4` version identity.
+- `skills/skill-evolver/scripts/evolver.py`: exact four-key result validation,
+  proof generation/verification, authenticated catalog-output transcript
+  exclusion, three-distinct-target validator, and coordinated `0.1.4` version
+  identity.
 - `skills/skill-evolver/SKILL.md`: executable human/agent Review workflow and
   exact per-target approval cardinality.
 - `README.md`: user-facing Review and release behavior.
@@ -113,8 +125,10 @@ schema v1, `unittest`, local Codex plugin marketplace, Git worktree.
 - Produces: `CANDIDATE_TARGETS_PER_BATCH_MAX = 3`, error
   `too_many_candidate_targets`, and identical causal-attribution wording in
   policy, fixed instructions, skill workflow, and README.
-- Preserves: result JSON shape, catalog membership checks, evidence checks,
-  candidate fingerprints, and atomic commit behavior.
+- Changes: the ephemeral result JSON uses the exact four-key top-level shape
+  `schema_version`, `contract_digest`, `target_inspection_proofs`, `sessions`.
+- Preserves: database and persisted candidate schemas, catalog membership
+  checks, evidence checks, candidate fingerprints, and atomic commit behavior.
 
 - [ ] **Step 1: Add failing policy and fixed-instruction assertions**
 
@@ -215,6 +229,9 @@ def test_more_than_three_distinct_candidate_targets_fail_closed(
     payload = {
         "schema_version": 1,
         "contract_digest": self.runtime.sha256_json(contract),
+        "target_inspection_proofs": {
+            target: "9" * 64 for target in targets
+        },
         "sessions": decisions,
     }
     self.runtime._validate_review_contract(contract, 7, "final")
@@ -282,8 +299,10 @@ if len(candidate_targets) > CANDIDATE_TARGETS_PER_BATCH_MAX:
     raise ValueError("too_many_candidate_targets")
 ```
 
-Do not change `CANDIDATE_RESULT_KEYS`, `RESULT_TOP_LEVEL_KEYS`, the review
-contract, or SQLite DDL.
+Do not change `CANDIDATE_RESULT_KEYS`, the review contract, or SQLite DDL.
+Keep `RESULT_TOP_LEVEL_KEYS` at its corrected exact four-key set containing
+`schema_version`, `contract_digest`, `target_inspection_proofs`, and
+`sessions`.
 
 - [ ] **Step 6: Strengthen the model-facing policy**
 

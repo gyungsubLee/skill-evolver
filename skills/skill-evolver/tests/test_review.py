@@ -2600,6 +2600,9 @@ class FrozenTranscriptBoundedReadTests(FrozenTranscriptTestCase):
                     "ready_review_claim_tool_output": (
                         "direct-or-final-output-suffix-v1-strict-owner-hmac"
                     ),
+                    "catalog_inspect_tool_output": (
+                        "direct-or-final-output-suffix-v1-strict-owner-digest-hmac"
+                    ),
                     "structured_text_security": (
                         "concatenated-scan-before-fragment-export-v1"
                     ),
@@ -2620,6 +2623,248 @@ class FrozenTranscriptBoundedReadTests(FrozenTranscriptTestCase):
 
 
 class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
+    def catalog_inspect_output(
+        self,
+        *,
+        content: str = (
+            "---\nname: Reviewed Skill\n"
+            "description: Authenticated body\n---\n"
+        ),
+        batch_id: int = 7,
+        owner_token: str = "d" * 64,
+        target_identity: str = "user-skill:reviewed-skill",
+    ) -> tuple[dict[str, object], str]:
+        owner_digest = self.runtime.review_owner_digest(
+            self.installation, owner_token
+        )
+        skill_sha256 = hashlib.sha256(
+            content.encode("utf-8")
+        ).hexdigest()
+        binding = {
+            "schema_version": 1,
+            "batch_id": batch_id,
+            "owner_digest": owner_digest,
+            "target_identity": target_identity,
+            "skill_sha256": skill_sha256,
+        }
+        inspection_proof = hmac.new(
+            self.installation.identity_key.read_bytes(),
+            b"catalog-inspection\0"
+            + self.runtime.canonical_json_bytes(binding),
+            "sha256",
+        ).hexdigest()
+        payload = {
+            "schema_version": 1,
+            "batch_id": batch_id,
+            "owner_digest": owner_digest,
+            "target_identity": target_identity,
+            "skill_sha256": skill_sha256,
+            "inspection_proof": inspection_proof,
+            "content": content,
+        }
+        return payload, self.runtime.canonical_json_bytes(
+            payload
+        ).decode("utf-8")
+
+    def test_authenticated_catalog_inspect_outputs_are_excluded(
+        self,
+    ) -> None:
+        session_id = "catalog-inspect-output-exclusion"
+        header = (
+            b'{"type":"session_meta","payload":{"session_id":"'
+            + session_id.encode("utf-8")
+            + b'"}}\n'
+        )
+        payload, direct = self.catalog_inspect_output()
+        split_at = direct.index('"inspection_proof"') + 8
+        wrapped = (
+            "Chunk ID: catalog\n"
+            "Wall time: 0.1 seconds\n"
+            "Process exited with code 0\n"
+            "Output:\n"
+            f"{direct}\n"
+        )
+        records = [
+            self.response_item(
+                {
+                    "type": "function_call_output",
+                    "output": direct,
+                }
+            ),
+            self.response_item(
+                {
+                    "type": "custom_tool_call_output",
+                    "output": wrapped,
+                }
+            ),
+            self.response_item(
+                {
+                    "type": "custom_tool_call_output",
+                    "output": [
+                        {
+                            "type": "input_text",
+                            "text": direct[:split_at],
+                        },
+                        {
+                            "type": "input_text",
+                            "text": direct[split_at:],
+                        },
+                    ],
+                }
+            ),
+            self.response_item(
+                {
+                    "type": "function_call_output",
+                    "output": "ordinary tool evidence",
+                }
+            ),
+        ]
+        connection, _, frozen = self.capture_and_claim(
+            [header, *records],
+            reviewed_boundary=len(header),
+            session_id=session_id,
+        )
+        try:
+            exported = self.runtime.read_frozen_transcript(
+                self.installation,
+                frozen,
+                self.config,
+                self.review,
+            )
+        finally:
+            connection.close()
+        self.assertEqual(
+            [record.text for record in exported.records],
+            ["ordinary tool evidence"],
+        )
+        exported_text = "\n".join(
+            record.text for record in exported.records
+        )
+        for private in (
+            payload["content"],
+            payload["inspection_proof"],
+            payload["owner_digest"],
+        ):
+            self.assertNotIn(str(private), exported_text)
+
+    def test_tampered_and_noncanonical_catalog_outputs_are_exported(
+        self,
+    ) -> None:
+        session_id = "catalog-inspect-output-lookalikes"
+        header = (
+            b'{"type":"session_meta","payload":{"session_id":"'
+            + session_id.encode("utf-8")
+            + b'"}}\n'
+        )
+        payload, direct = self.catalog_inspect_output()
+        bad_proof = copy.deepcopy(payload)
+        bad_proof["inspection_proof"] = "0" * 64
+        bad_content = copy.deepcopy(payload)
+        bad_content["content"] = str(payload["content"]) + "tampered"
+        outputs = [
+            self.runtime.canonical_json_bytes(bad_proof).decode(),
+            self.runtime.canonical_json_bytes(bad_content).decode(),
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "catalog-inspect",
+                    "content": "general lookalike",
+                },
+                separators=(",", ":"),
+            ),
+        ]
+        self.assertNotEqual(outputs[2], direct)
+        records = [
+            self.response_item(
+                {
+                    "type": "function_call_output",
+                    "output": output,
+                }
+            )
+            for output in outputs
+        ]
+        records.append(
+            self.response_item(
+                {
+                    "type": "custom_tool_call_output",
+                    "output": [
+                        {"type": "input_text", "text": direct},
+                        {
+                            "type": "input_text",
+                            "text": "sibling tool evidence",
+                        },
+                    ],
+                }
+            )
+        )
+        connection, _, frozen = self.capture_and_claim(
+            [header, *records],
+            reviewed_boundary=len(header),
+            session_id=session_id,
+        )
+        try:
+            exported = self.runtime.read_frozen_transcript(
+                self.installation,
+                frozen,
+                self.config,
+                self.review,
+            )
+        finally:
+            connection.close()
+        self.assertEqual(
+            [record.text for record in exported.records],
+            [*outputs, direct, "sibling tool evidence"],
+        )
+
+    def test_catalog_inspect_exclusion_checks_shape_types_and_bounds(
+        self,
+    ) -> None:
+        prefix = (
+            "---\nname: Reviewed Skill\n"
+            "description: Authenticated body\n---\n"
+        )
+        maximum_content = prefix + "x" * (
+            self.runtime.CATALOG_INSPECT_MAX_BYTES
+            - len(prefix.encode("utf-8"))
+        )
+        payload, maximum = self.catalog_inspect_output(
+            content=maximum_content
+        )
+        self.assertTrue(
+            self.runtime._contains_catalog_inspect_output(
+                maximum, self.installation
+            )
+        )
+
+        extra_key = copy.deepcopy(payload)
+        extra_key["extra"] = "not exact"
+        wrong_type = copy.deepcopy(payload)
+        wrong_type["batch_id"] = "7"
+        _, invalid_target = self.catalog_inspect_output(
+            target_identity="not-a-user-skill"
+        )
+        _, oversized = self.catalog_inspect_output(
+            content=maximum_content + "x"
+        )
+        variants = {
+            "extra-key": self.runtime.canonical_json_bytes(
+                extra_key
+            ).decode(),
+            "wrong-type": self.runtime.canonical_json_bytes(
+                wrong_type
+            ).decode(),
+            "invalid-target": invalid_target,
+            "oversized-content": oversized,
+        }
+        for label, value in variants.items():
+            with self.subTest(label=label):
+                self.assertFalse(
+                    self.runtime._contains_catalog_inspect_output(
+                        value, self.installation
+                    )
+                )
+
     def test_response_items_export_textual_tool_session(self) -> None:
         session_id = "response-item-tool-session"
         owner_token = "a" * 64
@@ -10137,6 +10382,45 @@ class CandidateCommitTests(CandidateBatchFixture):
             "\n".join(self.connection.iterdump()),
         )
 
+    def test_inspection_proof_in_candidate_text_rotates_before_writes(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        claim = self.claim(1, now)
+        payload = self.result_payload(claim)
+        inspection_proof = payload["target_inspection_proofs"][
+            self.catalog_entry.identity
+        ]
+        payload["sessions"][0]["problem_summary"] = (
+            f"Copied inspection proof {inspection_proof}."
+        )
+        old_path = self.write_result(claim, payload)
+
+        retried = self.commit(claim, old_path, now + 1)
+
+        self.assertEqual(retried["status"], "retry")
+        self.assertEqual(
+            retried["error_code"], "invalid_review_result"
+        )
+        self.assertFalse(old_path.exists())
+        self.assertTrue(Path(str(retried["result_path"])).exists())
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM candidates"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM candidate_evidence"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertNotIn(
+            inspection_proof,
+            "\n".join(self.connection.iterdump()),
+        )
+
     def test_forged_catalog_inspection_proof_rotates_before_candidate_writes(
         self,
     ) -> None:
@@ -10610,6 +10894,7 @@ class CandidateCommitTests(CandidateBatchFixture):
         sensitive_hashes = {
             str(clean_claim["owner_token"]),
             str(clean_claim["contract_digest"]),
+            self.inspection_proof(clean_claim),
             *(
                 str(clean_contract[field])
                 for field in self.runtime.HEX_DIGEST_FIELDS
@@ -14432,6 +14717,7 @@ class ReviewSurfaceTests(CandidateBatchFixture):
             {
                 "schema_version",
                 "batch_id",
+                "owner_digest",
                 "target_identity",
                 "skill_sha256",
                 "inspection_proof",
@@ -14439,6 +14725,12 @@ class ReviewSurfaceTests(CandidateBatchFixture):
             },
         )
         self.assertEqual(payload["batch_id"], int(claim["batch_id"]))
+        self.assertEqual(
+            payload["owner_digest"],
+            self.runtime.review_owner_digest(
+                self.installation, str(claim["owner_token"])
+            ),
+        )
         self.assertEqual(
             payload["target_identity"],
             self.catalog_entry.identity,
@@ -14763,6 +15055,15 @@ class ReviewDocumentationTests(unittest.TestCase):
             "at most three distinct candidate targets per batch",
             "inspected body for repeated targets",
             "target_inspection_proofs",
+            "non-secret owner digest used in that proof",
+            "exact authenticated catalog-inspect response is excluded "
+            "from later transcript export",
+            "malformed, noncanonical, or cryptographically invalid "
+            "lookalike remains ordinary tool output",
+            "top-level result keys are exactly `schema_version`, "
+            "`contract_digest`, `target_inspection_proofs`, and `sessions`",
+            "rejects any inspection proof copied into candidate or "
+            "evidence text before database writes",
             "does not prove target invocation in a source session",
             "attribution_uncertain",
             "Use only when the user explicitly names $skill-evolver",
@@ -14826,6 +15127,15 @@ class ReviewDocumentationTests(unittest.TestCase):
             "at most three distinct candidate targets per batch",
             "inspected body for repeated targets",
             "target_inspection_proofs",
+            "non-secret owner digest used in that proof",
+            "exact authenticated catalog-inspect response is excluded "
+            "from later transcript export",
+            "malformed, noncanonical, or cryptographically invalid "
+            "lookalike remains ordinary tool output",
+            "top-level result keys are exactly `schema_version`, "
+            "`contract_digest`, `target_inspection_proofs`, and `sessions`",
+            "rejects any inspection proof copied into candidate or "
+            "evidence text before database writes",
             "does not prove target invocation in a source session",
             "attribution_uncertain",
             "## Explicit session review",

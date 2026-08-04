@@ -44,6 +44,8 @@ SQLite or opens a transcript. Present one fully expanded command containing
 the exact installation path, decimal batch ID, raw owner token, and target identity,
 then request approval for that exact read and installation data root. Never
 inspect another path under that approval.
+The response also returns the non-secret owner digest used in that proof.
+An exact authenticated catalog-inspect response is excluded from later transcript export; a malformed, noncanonical, or cryptographically invalid lookalike remains ordinary tool output.
 
 ## Approval boundaries
 
@@ -120,6 +122,8 @@ Review is a scoped sequence, not an autonomous command:
    choose another result file or parent. Before the lease approaches expiry,
    construct a fully expanded `review-heartbeat` command in memory, request
    its separate approval, and run it once.
+   The top-level result keys are exactly `schema_version`, `contract_digest`, `target_inspection_proofs`, and `sessions`.
+   Python rejects any inspection proof copied into candidate or evidence text before database writes.
 7. Construct a fully expanded `review-commit` command using the same
    installation, decimal `batch_id`, raw `owner_token`, and exact
    `result_path`. Request separate approval for that literal command and run

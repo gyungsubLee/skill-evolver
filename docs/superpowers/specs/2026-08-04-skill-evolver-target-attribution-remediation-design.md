@@ -93,6 +93,8 @@ shape could remain unchanged: it now contains one top-level
 `target_inspection_proofs` map. Its schema version remains 1 because every
 result is bound to the exact live contract digest and the validator requires
 the exact top-level key set; an older three-key result therefore fails closed.
+The exact top-level keys are `schema_version`, `contract_digest`,
+`target_inspection_proofs`, and `sessions`.
 The Review policy, fixed result instructions, and skill workflow must apply
 this decision order:
 
@@ -111,7 +113,8 @@ this decision order:
    batch ID and owner token. Reuse that inspected content for candidates with
    the same target in the same live batch. The read returns an installation
    HMAC bound to the batch ID, owner-token digest, target identity, and current
-   skill SHA-256. Copy exactly one proof per distinct target into
+   skill SHA-256, plus the non-secret owner digest needed to authenticate the
+   exact response during later transcript parsing. Copy exactly one proof per distinct target into
    `target_inspection_proofs`; missing and extra entries fail closed. The new
    distinct-target validator bound permits at most three separately approved
    commands per batch. Confirm that an existing instruction,
@@ -143,7 +146,18 @@ model input and the human-operated skill workflow cannot diverge.
   semantic gate.
 - `review-commit` recomputes every proof against both the preflight and live
   transaction snapshots. It stores no proof, owner token, or target body in
-  candidate, evidence, audit, or schema state.
+  candidate, evidence, audit, or schema state. Every validated proof is also a
+  persisted-text deny marker, so copying it into candidate, classification, or
+  evidence text fails before SQLite writes.
+- The transcript adapter excludes a direct, final `Output:`-wrapped, or
+  fragmented `catalog-inspect` tool response only when it has the exact
+  canonical seven-key shape (`schema_version`, `batch_id`, `owner_digest`,
+  `target_identity`, `skill_sha256`, `inspection_proof`, `content`), bounded
+  UTF-8 content, matching content SHA-256, and a valid installation HMAC.
+  Tampered content/proofs, noncanonical JSON, extra or missing keys, and
+  general lookalikes remain ordinary tool output under the existing redaction
+  and transcript limits. This changes the transcript adapter contract/digest
+  without adding a transcript invocation schema.
 - Python continues to validate catalog membership, record references,
   signal/source pairs, the three-distinct-target bound, digests, and atomic
   commit behavior.
@@ -171,12 +185,18 @@ the changed contract:
 5. Missing, extra, forged, or replayed inspection proofs fail closed before
    candidate or evidence writes, while a wrong owner is rejected before the
    target file is read.
-6. A one-candidate quality fixture labeled `false/false/false` terminalizes as
+6. A proof copied into any persisted candidate/evidence text rotates the
+   invalid result without candidate persistence or proof leakage, while a
+   normal valid result still completes.
+7. Exact authenticated direct, wrapped, and fragmented catalog outputs are
+   excluded from transcript export; tampered, noncanonical, and general
+   lookalikes remain ordinary tool output.
+8. A one-candidate quality fixture labeled `false/false/false` terminalizes as
    `FAIL`, preserves the exact thresholds, and returns
    `open_changed_quality_epoch`.
-7. A failed predecessor cannot open an unchanged successor; a policy/runtime
+9. A failed predecessor cannot open an unchanged successor; a policy/runtime
    provenance change can open `Q-004` using the exact `Q-003` report digest.
-8. Existing Review, quality, capture, privacy, and full regression suites remain
+10. Existing Review, quality, capture, privacy, and full regression suites remain
    green.
 
 The tests validate the deterministic contract text and lifecycle mechanics;

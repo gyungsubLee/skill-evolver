@@ -57,6 +57,11 @@ CATALOG_FRONTMATTER_MAX_BYTES = 65_536
 CATALOG_INSPECT_MAX_BYTES = 65_536
 CATALOG_EXPORT_MAX_BYTES = 49_152
 CATALOG_IDENTITY_MAX_BYTES = 272
+CATALOG_INSPECT_RESPONSE_MAX_BYTES = (
+    (CATALOG_INSPECT_MAX_BYTES + CATALOG_IDENTITY_MAX_BYTES)
+    * 6
+    + 8_192
+)
 CATALOG_DISPLAY_NAME_MAX_BYTES = 128
 CATALOG_DESCRIPTION_MAX_BYTES = 384
 RUNTIME_REFERENCE_MAX_BYTES = 8_192
@@ -334,13 +339,31 @@ def catalog_inspection_proof(
     target_identity: str,
     skill_sha256: str,
 ) -> str:
+    return catalog_inspection_proof_for_owner_digest(
+        installation,
+        batch_id,
+        review_owner_digest(installation, owner_token),
+        target_identity,
+        skill_sha256,
+    )
+
+
+def catalog_inspection_proof_for_owner_digest(
+    installation: Installation,
+    batch_id: int,
+    owner_digest: str,
+    target_identity: str,
+    skill_sha256: str,
+) -> str:
     if (
         type(installation) is not Installation
         or type(batch_id) is not int
         or batch_id < 1
+        or not _is_lower_hex(owner_digest, 64)
         or type(target_identity) is not str
         or not target_identity
         or not target_identity.startswith("user-skill:")
+        or target_identity == "user-skill:"
         or not _is_lower_hex(skill_sha256, 64)
     ):
         raise ValueError("invalid_catalog_inspection_proof_input")
@@ -355,9 +378,7 @@ def catalog_inspection_proof(
     payload = {
         "schema_version": 1,
         "batch_id": batch_id,
-        "owner_digest": review_owner_digest(
-            installation, owner_token
-        ),
+        "owner_digest": owner_digest,
         "target_identity": target_identity,
         "skill_sha256": skill_sha256,
     }
@@ -2166,6 +2187,9 @@ def transcript_adapter_contract(
             "ready_review_claim_tool_output": (
                 "direct-or-final-output-suffix-v1-strict-owner-hmac"
             ),
+            "catalog_inspect_tool_output": (
+                "direct-or-final-output-suffix-v1-strict-owner-digest-hmac"
+            ),
             "structured_text_security": (
                 "concatenated-scan-before-fragment-export-v1"
             ),
@@ -2295,6 +2319,19 @@ READY_REVIEW_ENVELOPE_KEYS = frozenset(
         "result_schema_instructions",
     }
 )
+CATALOG_INSPECT_OUTPUT_KEYS = frozenset(
+    {
+        "schema_version",
+        "batch_id",
+        "owner_digest",
+        "target_identity",
+        "skill_sha256",
+        "inspection_proof",
+        "content",
+    }
+)
+
+
 class TranscriptRecordMapping(TypedDict):
     source_kind: str
     text: str
@@ -2440,6 +2477,95 @@ def _contains_ready_review_claim_output(
     return (
         parsed is not None
         and _is_exact_ready_review_claim(parsed, installation)
+    )
+
+
+def _is_exact_catalog_inspect_output(
+    value: object,
+    installation: Installation,
+) -> bool:
+    if (
+        type(value) is not dict
+        or set(value) != CATALOG_INSPECT_OUTPUT_KEYS
+        or type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or type(value["batch_id"]) is not int
+        or value["batch_id"] < 1
+        or not _is_lower_hex(value["owner_digest"], 64)
+        or not _is_lower_hex(value["skill_sha256"], 64)
+        or not _is_lower_hex(value["inspection_proof"], 64)
+        or type(value["content"]) is not str
+    ):
+        return False
+    try:
+        content = value["content"].encode("utf-8")
+        expected_proof = (
+            catalog_inspection_proof_for_owner_digest(
+                installation,
+                value["batch_id"],
+                value["owner_digest"],
+                value["target_identity"],
+                value["skill_sha256"],
+            )
+        )
+    except OSError:
+        raise _transcript_error("unsupported_transcript") from None
+    except (UnicodeError, ValueError):
+        return False
+    return (
+        len(content) <= CATALOG_INSPECT_MAX_BYTES
+        and hmac.compare_digest(
+            hashlib.sha256(content).hexdigest(),
+            value["skill_sha256"],
+        )
+        and hmac.compare_digest(
+            expected_proof, value["inspection_proof"]
+        )
+    )
+
+
+def _parse_catalog_inspect_output_json(
+    value: str,
+) -> Optional[object]:
+    candidate = value[:-1] if value.endswith("\n") else value
+    if not candidate or candidate.endswith("\n"):
+        return None
+    try:
+        parsed = _load_bounded_json(
+            candidate,
+            CATALOG_INSPECT_RESPONSE_MAX_BYTES,
+            "invalid_catalog_inspect_output",
+        )
+        if canonical_json_bytes(parsed).decode("utf-8") != candidate:
+            return None
+    except (RecursionError, TypeError, UnicodeError, ValueError):
+        return None
+    return parsed
+
+
+def _contains_catalog_inspect_output(
+    value: str,
+    installation: Installation,
+) -> bool:
+    try:
+        if (
+            len(value.encode("utf-8"))
+            > CATALOG_INSPECT_RESPONSE_MAX_BYTES
+        ):
+            return False
+    except UnicodeEncodeError:
+        return False
+    parsed = _parse_catalog_inspect_output_json(value)
+    if parsed is None:
+        _prefix, marker, candidate = value.rpartition("\nOutput:\n")
+        if not marker:
+            return False
+        parsed = _parse_catalog_inspect_output_json(candidate)
+    return (
+        parsed is not None
+        and _is_exact_catalog_inspect_output(
+            parsed, installation
+        )
     )
 
 
@@ -2621,6 +2747,8 @@ def _classify_transcript_object(
                 output, installation
             )
             for output in (*raw_outputs, combined_raw)
+        ) or _contains_catalog_inspect_output(
+            combined_raw, installation
         ):
             return []
         outputs = [
@@ -3699,6 +3827,7 @@ def reject_persisted_candidate_text_leaks(
         sha256_json(contract),
         *result_paths,
         *target_paths,
+        *validated["target_inspection_proofs"].values(),
     }
     stack: list[object] = [contract]
     while stack:
@@ -14280,7 +14409,7 @@ def cmd_catalog_inspect(args: argparse.Namespace) -> int:
     owner_token = str(args.owner_token)
     connection = open_database(installation, read_only=True)
     try:
-        require_live_review_batch(
+        _batch, _contract, owner_digest = require_live_review_batch(
             connection,
             installation,
             batch_id,
@@ -14337,14 +14466,17 @@ def cmd_catalog_inspect(args: argparse.Namespace) -> int:
         {
             "schema_version": 1,
             "batch_id": batch_id,
+            "owner_digest": owner_digest,
             "target_identity": entry.identity,
             "skill_sha256": entry.skill_sha256,
-            "inspection_proof": catalog_inspection_proof(
-                installation,
-                batch_id,
-                owner_token,
-                entry.identity,
-                entry.skill_sha256,
+            "inspection_proof": (
+                catalog_inspection_proof_for_owner_digest(
+                    installation,
+                    batch_id,
+                    owner_digest,
+                    entry.identity,
+                    entry.skill_sha256,
+                )
             ),
             "content": content.decode("utf-8"),
         }

@@ -153,6 +153,8 @@ an installation-HMAC `inspection_proof`. Before that read, it opens SQLite
 read-only to authenticate the exact live batch and owner. It does not write
 the database or inspect a transcript. Its exact batch ID, raw owner token,
 target identity, and installation data root require a separate read approval.
+The response also returns the non-secret owner digest used in that proof.
+An exact authenticated catalog-inspect response is excluded from later transcript export; a malformed, noncanonical, or cryptographically invalid lookalike remains ordinary tool output.
 
 A strong signal alone never authorizes target selection. Never infer target use from catalog similarity. Before any candidate, request one separately
 approved catalog-inspect per distinct proposed target, with at most three distinct candidate targets per batch, and reuse the inspected body for repeated targets. If use or causality is unclear, the exact target read is not
@@ -168,6 +170,8 @@ that the exact body was read for this live batch.
 It does not prove target invocation in a source session. The existing actual-use and causality rules
 remain mandatory. The bound result is ephemeral; Python stores neither the
 proof nor the owner token in candidate, evidence, or audit records.
+The top-level result keys are exactly `schema_version`, `contract_digest`, `target_inspection_proofs`, and `sessions`.
+Python rejects any inspection proof copied into candidate or evidence text before database writes.
 
 The review command shapes below are deliberately non-runnable. They name
 required options without supplying a batch ID, owner token, or result path:
