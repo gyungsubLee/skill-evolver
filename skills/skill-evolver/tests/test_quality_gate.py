@@ -2572,6 +2572,56 @@ class QualityTerminalGateTests(CandidateBatchFixture):
                 now + 11 + candidate_id,
             )
 
+    def fail_one_candidate_sample(
+        self, now: float = 2_000_000_000.0
+    ) -> dict[str, object]:
+        self.runtime.open_quality_epoch(
+            self.connection,
+            self.installation,
+            now,
+            predecessor=None,
+        )
+        for offset in (1, 3):
+            claim = self.claim(5, now + offset)
+            result_path = self.write_result(
+                claim,
+                self.result_payload(claim),
+            )
+            self.commit(claim, result_path, now + offset + 1)
+
+        sealed = self.runtime.seal_quality_epoch(
+            self.connection, self.installation, now + 5
+        )
+        self.assertEqual(sealed["sealed"]["distinct_session_count"], 10)
+        self.assertEqual(sealed["sealed"]["candidate_count"], 1)
+
+        prepared = self.runtime.prepare_quality_label(
+            self.connection,
+            self.installation,
+            "C-001",
+            now + 6,
+        )
+        self.runtime.commit_quality_label(
+            self.connection,
+            self.installation,
+            "C-001",
+            str(prepared["epoch_id"]),
+            str(prepared["seal_digest"]),
+            str(prepared["subject_digest"]),
+            {
+                "evaluation_worthy": False,
+                "target_correct": False,
+                "external_content_adoption": False,
+            },
+            now + 7,
+        )
+        return self.runtime.gate_quality_epoch(
+            self.connection,
+            self.installation,
+            "Q-001",
+            now + 8,
+        )
+
     def test_gate_refuses_valid_collecting_and_incomplete_sealed(
         self,
     ) -> None:
@@ -2921,6 +2971,75 @@ class QualityTerminalGateTests(CandidateBatchFixture):
         self.assertEqual(
             result["body"]["next_action"],
             "open_changed_quality_epoch",
+        )
+
+    def test_sparse_failed_sample_requires_changed_policy_successor(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        terminal = self.fail_one_candidate_sample(now)
+        body = terminal["body"]
+
+        self.assertEqual(body["decision"], "FAIL")
+        self.assertIsNone(body["invalid_reason"])
+        self.assertEqual(
+            body["next_action"], "open_changed_quality_epoch"
+        )
+        self.assertEqual(
+            body["sample"],
+            {
+                "distinct_session_count": 10,
+                "candidate_count": 1,
+                "attested_label_count": 1,
+                "batch_count": 2,
+            },
+        )
+        self.assertEqual(
+            body["metrics"],
+            {
+                "evaluation_worthy_candidates": 0,
+                "target_misattributions": 1,
+                "external_content_adoption_incidents": 0,
+            },
+        )
+        self.assertFalse(body["checks"]["evaluation_worthy_ratio"])
+        self.assertFalse(body["checks"]["target_misattribution_ratio"])
+        self.assertTrue(body["checks"]["external_content_adoption"])
+
+        predecessor = f"Q-001@{terminal['report_digest']}"
+        with self.assertRaisesRegex(
+            ValueError, "quality_predecessor_provenance_unchanged"
+        ):
+            self.runtime.open_quality_epoch(
+                self.connection,
+                self.installation,
+                now + 9,
+                predecessor=predecessor,
+            )
+
+        current = self.runtime.current_quality_provenance(
+            self.installation
+        )
+        with mock.patch.object(
+            self.runtime,
+            "current_quality_provenance",
+            return_value={**current, "policy_digest": "1" * 64},
+        ):
+            successor = self.runtime.open_quality_epoch(
+                self.connection,
+                self.installation,
+                now + 9,
+                predecessor=predecessor,
+            )
+
+        self.assertEqual(successor["epoch_id"], "Q-002")
+        self.assertEqual(
+            successor["predecessor"],
+            {
+                "epoch_id": "Q-001",
+                "terminal_state": "failed",
+                "terminal_report_digest": terminal["report_digest"],
+            },
         )
 
     def test_misattribution_one_unit_above_one_fifth_fails(
