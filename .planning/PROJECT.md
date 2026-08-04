@@ -49,7 +49,7 @@ CLI와 Desktop 모두에서 경계가 명확한 session metadata를 수집하고
 - `evaluate`는 전체 immutable evaluation-spec digest에 결합되고 installed target을 변경하지 않는다.
 - apply, privacy purge와 undo mutation은 external TTY와 전체 digest 또는 current hash를 요구한다.
 - 모든 경로, identity, artifact, lease, state transition과 schema version은 fail-closed로 검증한다.
-- Phase 6은 sealed `Q-003`의 사용자 전용 외부 TTY label과 Phase 5 `PASS`가 확인될 때까지 시작하지 않는다.
+- Phase 6은 changed-provenance successor quality epoch의 사용자 전용 외부 TTY label과 Phase 5 `PASS`가 확인될 때까지 시작하지 않는다.
 
 ## Key Decisions
 
@@ -69,8 +69,8 @@ CLI와 Desktop 모두에서 경계가 명확한 session metadata를 수집하고
 - Phase 3 Runtime Queue와 Phase 4 Review/Inbox는 canonical report `PASS`로 완료됐다.
 - 설치된 plugin/runtime은 `0.1.3`이며 Codex `0.146.0` transcript adapter provenance를 사용한다.
 - `Q-002`는 adapter provenance drift로 terminal `INVALID` 처리됐다.
-- 현재 단계는 Phase 5 Read-only Quality Gate다. `Q-003`은 12 distinct real sessions와 candidate `C-001` 1건으로 sealed 됐고 사용자 label을 기다린다.
-- Phase 6 Evaluate Runner Spike는 `Q-003`의 user-only label과 Phase 5 terminal `PASS` 전까지 차단된다.
+- 현재 단계는 Phase 5 Read-only Quality Gate remediation이다. `Q-003`은 12 distinct real sessions와 candidate `C-001` 1건을 측정한 뒤 evaluation-worth와 target-attribution 기준에서 terminal `FAIL`했다.
+- Phase 6 Evaluate Runner Spike는 Phase 4 attribution policy를 교정한 successor epoch의 terminal `PASS` 전까지 차단된다.
 
 ## Sources of Truth
 
@@ -81,3 +81,5 @@ CLI와 Desktop 모두에서 경계가 명확한 session metadata를 수집하고
 - `docs/release-reports/runtime-queue.json`
 - `docs/release-reports/review-inbox.json`
 - `docs/superpowers/specs/2026-07-30-skill-evolver-session-quality-gate-design.md`
+- `docs/release-reports/quality/Q-003-512aa6cb395e7a4d6c94a51ad2b9950fb8cada381381784370d3edecda01ac1a.json`
+- `docs/superpowers/specs/2026-08-04-skill-evolver-target-attribution-remediation-design.md`

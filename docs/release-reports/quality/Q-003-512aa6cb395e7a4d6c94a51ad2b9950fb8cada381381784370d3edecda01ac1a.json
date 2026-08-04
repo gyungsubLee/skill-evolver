@@ -1,0 +1,67 @@
+{
+  "attestation": "user_attested_not_identity_proven",
+  "checks": {
+    "candidate_sample": true,
+    "evaluation_worthy_ratio": false,
+    "external_content_adoption": true,
+    "labels_complete": true,
+    "provenance_current": true,
+    "sample_size": true,
+    "source_complete": true,
+    "subject_current": true,
+    "target_misattribution_ratio": false
+  },
+  "decision": "FAIL",
+  "epoch_id": "Q-003",
+  "evaluated_at": "2026-08-04T12:49:43Z",
+  "invalid_reason": null,
+  "label_set_digest": "17b6438c0ec783f7964f11903740788518cdcd394f61fdf13142fa30877d45e8",
+  "lineage": {
+    "digest": "f5a3df5533cc2731e275bcc0013eb5b40227adb480dab5fd9524edbffa26c8bd",
+    "entries": [
+      {
+        "epoch_id": "Q-001",
+        "invalid_reason": "quality_provenance_drift",
+        "terminal_report_digest": "2759c55fcc9262ef7ae83b55eb30b95466e932ce6621761dd305fa0d80a51bc1",
+        "terminal_state": "invalid"
+      },
+      {
+        "epoch_id": "Q-002",
+        "invalid_reason": "quality_provenance_drift",
+        "terminal_report_digest": "57c64c9a7b32591f3af0e78c77d2f766f75f57e1da41a1a5a6aefca7b3993bfe",
+        "terminal_state": "invalid"
+      }
+    ]
+  },
+  "metrics": {
+    "evaluation_worthy_candidates": 0,
+    "external_content_adoption_incidents": 0,
+    "target_misattributions": 1
+  },
+  "next_action": "open_changed_quality_epoch",
+  "observation_set_digest": "b597fadce63dce5d779fa9fc350b42ba7aeafed4c11d168f33115596761b794b",
+  "provenance": {
+    "catalog_adapter_digest": "f10f93c08906253ad75ee47b7512808290aab45b1d6d54c5df051c50ba20314d",
+    "phase4_report_digest": "54a329aed87df395a8594a5758ec0e831840f15dbc7f8d7745b9d148f646fdaa",
+    "policy_digest": "2a90a7c6d9fa39f31d41d2efe9de47bbb5a3de832caac3863fe10310c18ee362",
+    "quality_contract_digest": "e5744e8d2c3fda437887b39ef93e67d621acdd4dc3e56eba19d7e6b37a9f07c5",
+    "runtime_digest": "70d46d16cd0c9a299f7563e878b975a1a40c0095367f4a316aff7c5428280207",
+    "transcript_adapter_digest": "30f2b9aee7c90aa27ab1e69c494ccc19e8c44818a58539503deb18b6782246d8"
+  },
+  "sample": {
+    "attested_label_count": 1,
+    "batch_count": 9,
+    "candidate_count": 1,
+    "distinct_session_count": 12
+  },
+  "schema_version": 1,
+  "thresholds": {
+    "evaluation_worthy_denominator": 2,
+    "evaluation_worthy_numerator": 1,
+    "external_content_adoption_maximum": 0,
+    "minimum_candidate_count": 1,
+    "minimum_distinct_sessions": 10,
+    "misattribution_denominator": 5,
+    "misattribution_numerator": 1
+  }
+}

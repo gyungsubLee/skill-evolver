@@ -4,6 +4,12 @@
 
 **Status:** Approved for implementation
 
+> **Release-boundary amendment — 2026-08-04:** Q-003 terminalized `FAIL`, so
+> the Q-003-PASS deployment precondition in Sections 2 and 8 cannot be met.
+> `2026-08-04-skill-evolver-target-attribution-remediation-design.md`
+> supersedes only that release boundary. The completed localization behavior,
+> user-only label contract, and authoring-language rules remain unchanged.
+
 **Requirement:** QUALITY-01 usability amendment
 
 ## 1. Goal

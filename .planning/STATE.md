@@ -24,12 +24,12 @@ Phase: 5 of 11 (Read-only Quality Gate)
 Plan: 0 of 1 in current phase
 Status: `0.1.3` is installed with source/cache parity and the Codex `0.146.0`
 transcript adapter. `Q-002` terminalized `INVALID` for provenance drift.
-`Q-003` is sealed with 12 distinct real sessions and candidate `C-001`; its
-read-only status is `AWAITING_LABELS`. Phase 6 remains blocked until the user
-labels `C-001` in an external TTY and the quality gate returns terminal `PASS`.
-Last activity: 2026-08-04 — reconciled the localized-label implementation
-commits and plan checkboxes, then revalidated unchanged installed `0.1.3` and
-Q-003 `AWAITING_LABELS` with `attested_label_count=0`
+`Q-003` terminalized `FAIL` after the user labeled `C-001` not evaluation
+worthy and incorrectly attributed. Phase 6 remains blocked while Phase 4
+policy attribution is corrected and a changed-provenance successor `Q-004`
+collects a new real sample.
+Last activity: 2026-08-04 — preserved Q-003 terminal FAIL and approved the
+target-attribution remediation design for a corrective 0.1.4 release and Q-004
 
 Progress: [████░░░░░░] 36%
 
@@ -51,11 +51,12 @@ Progress: [████░░░░░░] 36%
 
 **Recent Trend:** Four sequential phase gates recorded; Phase 2, Phase 3 and
 Phase 4 are PASS; installed `0.1.3` has real Desktop capture/import and
-current transcript-adapter proof. Phase 5 now has a complete sealed `Q-003`
-sample and remains gated only by the user-owned `C-001` label and terminal
-quality decision. The source branch already contains Korean-default label
+current transcript-adapter proof. Phase 5 measured its first complete sealed
+sample: `Q-003` failed because its only candidate was neither evaluation
+worthy nor correctly attributed. The source branch already contains Korean-default label
 display and direct-user-language candidate authoring in `e520b8d`, `5ee8d29`,
-and `68f8660`, but release/install remains intentionally at `0.1.3` until PASS
+and `68f8660`; release/install remains at `0.1.3` until the corrective 0.1.4
+plan replaces the now-impossible Q-003-PASS release precondition
 
 ## Accumulated Context
 
@@ -89,9 +90,19 @@ and `68f8660`, but release/install remains intentionally at `0.1.3` until PASS
   `2026-07-31T01:36:39Z`, then terminalized `INVALID` for
   `quality_provenance_drift` with report digest
   `57c64c9a7b32591f3af0e78c77d2f766f75f57e1da41a1a5a6aefca7b3993bfe`.
-- `Q-003` opened from that exact predecessor at `2026-07-31T07:31:54Z` and
-  sealed at `2026-07-31T07:56:07Z` with 12 distinct real sessions and one
-  candidate, `C-001`; no label has been attested.
+- `Q-003` opened from that exact predecessor at `2026-07-31T07:31:54Z`, sealed
+  at `2026-07-31T07:56:07Z` with 12 distinct real sessions and `C-001`, and
+  terminalized `FAIL` after the user attested `false/false/false`. Its report
+  digest is `512aa6cb395e7a4d6c94a51ad2b9950fb8cada381381784370d3edecda01ac1a`.
+- Its exact aggregate body is preserved at
+  `docs/release-reports/quality/Q-003-512aa6cb395e7a4d6c94a51ad2b9950fb8cada381381784370d3edecda01ac1a.json`.
+- Q-003 passed sample, label completeness, provenance, subject integrity, and
+  external-content checks. It failed evaluation-worth and target-attribution
+  ratios; the canonical next action is `open_changed_quality_epoch`.
+- The Phase 4 contract proves only catalog membership for `target_identity`;
+  no trusted skill-invocation record is bound to candidate evidence. The first
+  remediation is therefore a fail-closed causal-attribution policy and
+  mandatory bounded target inspection, without schema or threshold changes.
 - In this rollout Codex supplied the plugin-data locator without pre-creating
   its directory. The exact pinned root was initialized once as a user-owned
   mode-`0700` directory; the Hook remains fail-closed for an absent or unsafe
@@ -103,13 +114,12 @@ and `68f8660`, but release/install remains intentionally at `0.1.3` until PASS
 
 ### Pending Todos
 
-- Have the user attest sealed candidate `C-001` in an external terminal.
-- Run the separately approved terminal quality gate and commit its
-  content-addressed PASS report if every threshold passes.
-- After that PASS, release and install `0.1.4`, then verify source/cache parity
-  and localized CLI exposure without fabricating another label.
-- Refresh the Phase 6 runner plan against Codex `0.146.0` and the final
-  content-addressed `Q-003` report only after Phase 5 PASS.
+- Write and execute the target-attribution remediation plan.
+- Release and install corrective `0.1.4`, then verify source/cache parity and
+  changed policy/runtime provenance.
+- Open `Q-004` from the exact Q-003 terminal digest, collect at least ten new
+  real sessions, explicitly review them, and obtain user-only labels.
+- Refresh the Phase 6 runner plan only after a successor quality epoch passes.
 - Keep Runner, Prepare, Evaluate and Apply disabled until `QUALITY-01` passes.
 
 ### Blockers/Concerns
@@ -118,9 +128,11 @@ and `68f8660`, but release/install remains intentionally at `0.1.3` until PASS
 - Phase 4 PASS proves deterministic mechanics and safety only; candidate quality remains unmeasured until Phase 5.
 - Phase 5 cannot use fixtures, subagents, repeated generations in this task, or
   empty generated tasks as substitutes for 10 distinct real sessions.
-- `Q-003` has a complete sealed real sample but lacks the user-owned label for
-  `C-001`. The agent must not invoke `quality-label`, infer its answers, or
-  start Phase 6 before terminal `PASS`.
+- `Q-003` is an immutable terminal `FAIL`; do not relabel, rewrite, or
+  reinterpret it. An unchanged-provenance successor is rejected.
+- The first remediation intentionally stays inside the Phase 4 policy boundary.
+  A second target-attribution failure must route to a schema-bound explicit
+  target or invocation-event feasibility design instead of weakening metrics.
 - Desktop log entries `Received hook/... for unknown conversation` observed
   for internal-agent conversation IDs are renderer routing errors, not Hook
   process failures. Main Desktop sessions continued to update the private Stop
@@ -137,6 +149,6 @@ and `68f8660`, but release/install remains intentionally at `0.1.3` until PASS
 ## Session Continuity
 
 Last session: 2026-08-04
-Stopped at: `0.1.3` and sealed `Q-003` revalidated; waiting for the user-only
-external-terminal label for `C-001`, then a separately approved quality gate
+Stopped at: `0.1.3` and immutable Q-003 terminal FAIL; target-attribution
+remediation design approved, ready to write its execution plan
 Resume file: None

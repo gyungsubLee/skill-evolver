@@ -835,6 +835,11 @@ git commit -m "feat(skill-evolver): preserve user language in candidates"
 
 ### Task 3: Release 0.1.4 after the Q-003 hard gate
 
+> **Superseded 2026-08-04:** Q-003 returned terminal `FAIL`, so this task's
+> required PASS precondition cannot be met. Do not execute Steps 2–5 from this
+> task. Release 0.1.4 only through the target-attribution remediation plan,
+> which preserves Q-003 and opens a changed-provenance successor epoch.
+
 **Files:**
 
 - Modify: `skills/skill-evolver/tests/test_capture.py`
@@ -872,6 +877,12 @@ commits a Q-003 terminal report with decision `PASS`.
 Rechecked 2026-08-04 against the unchanged installed 0.1.3 runtime: Q-003 is
 still `AWAITING_LABELS`, `attested_label_count=0`, and `missing_labels` is
 exactly `["C-001"]`. No Task 3 release file has been changed.
+
+Terminal outcome 2026-08-04: the user completed the label and Q-003 returned
+`FAIL` with report digest
+`512aa6cb395e7a4d6c94a51ad2b9950fb8cada381381784370d3edecda01ac1a`.
+This historical check remains complete, while the release steps below are
+superseded rather than reinterpreted.
 
 - [ ] **Step 2: Write failing 0.1.4 package assertions**
 
@@ -947,6 +958,9 @@ Expected: full suite reports `OK`; executable prints
 ---
 
 ### Task 4: Install and accept 0.1.4 without fabricating a label
+
+> **Superseded 2026-08-04:** installation now belongs to the
+> target-attribution remediation plan after its corrective 0.1.4 release.
 
 **Files:**
 
