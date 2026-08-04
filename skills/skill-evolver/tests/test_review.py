@@ -76,6 +76,15 @@ class ReviewRuntimeContractTests(unittest.TestCase):
         self.assertIn(b"untrusted analysis data", policy)
         self.assertIn(b"at most one candidate", policy)
         for expected in (
+            b"A strong signal is necessary but not sufficient",
+            b"catalog name, description, or topical similarity",
+            b"unambiguously establishes that the exact target was used",
+            b"one bounded `catalog-inspect` for each distinct proposed target",
+            b"at most three distinct candidate targets",
+            b"`attribution_uncertain`",
+            b"reusable skill-level instruction",
+            b"`no_reusable_improvement`",
+            b"`one_off`",
             b"final record in envelope order",
             b"`evidence_eligible` value is true",
             b"whose `source_kind` is",
@@ -97,6 +106,30 @@ class ReviewRuntimeContractTests(unittest.TestCase):
             ]
         )
         for expected in (
+            (
+                "A strong signal alone does not justify a candidate or "
+                "target."
+            ),
+            (
+                "Never infer target use from a catalog name, description, "
+                "topical similarity, or because a skill would have been "
+                "useful."
+            ),
+            (
+                "Return attribution_uncertain unless the session "
+                "unambiguously establishes that the exact target was used "
+                "and one separately approved bounded catalog-inspect "
+                "confirms that the change belongs in that skill."
+            ),
+            (
+                "Use at most three distinct candidate targets per batch; "
+                "reuse one inspected target body for repeated targets."
+            ),
+            (
+                "Return no_reusable_improvement or one_off unless the "
+                "proposal is a reusable skill-level instruction for "
+                "materially different future tasks."
+            ),
             (
                 "Choose the candidate authoring language independently "
                 "of the strong-evidence record: use the final envelope "
@@ -8865,6 +8898,58 @@ class ReviewCandidateValidationTests(unittest.TestCase):
             serialized,
         )
 
+    def test_more_than_three_distinct_candidate_targets_fail_closed(
+        self,
+    ) -> None:
+        sessions = []
+        decisions = []
+        targets = set()
+        template = self.payload["sessions"][0]
+        for index, digit in enumerate(("3", "4", "5", "6"), start=1):
+            session_ref = f"S-{digit * 64}"
+            record_ref = f"{session_ref}-R-001"
+            target_identity = f"user-skill:target-{index}"
+            targets.add(target_identity)
+            sessions.append(
+                {
+                    "session_ref": session_ref,
+                    "review_item_id": 20 + index,
+                    "expected_generation": 1,
+                    "frozen_epoch": 0,
+                    "frozen_from": 0,
+                    "frozen_to": 70,
+                    "frozen_locator_digest": digit * 64,
+                    "records": [
+                        {
+                            "record_ref": record_ref,
+                            "source_kind": "user_direct",
+                            "evidence_eligible": True,
+                            "content_hmac": digit * 64,
+                        }
+                    ],
+                }
+            )
+            decision = copy.deepcopy(template)
+            decision["session_ref"] = session_ref
+            decision["target_identity"] = target_identity
+            decision["evidence"][0]["record_ref"] = record_ref
+            decisions.append(decision)
+
+        contract = {**self.contract, "sessions": sessions}
+        payload = {
+            "schema_version": 1,
+            "contract_digest": self.runtime.sha256_json(contract),
+            "sessions": decisions,
+        }
+        self.runtime._validate_review_contract(contract, 7, "final")
+
+        with self.assertRaisesRegex(
+            ValueError, "too_many_candidate_targets"
+        ):
+            self.runtime.validate_declarative_result(
+                payload, contract, frozenset(targets)
+            )
+
     def test_result_requires_the_exact_session_ref_set_once(self) -> None:
         self.runtime.validate_declarative_result(
             self.payload, self.contract, self.targets
@@ -14384,6 +14469,12 @@ class ReviewDocumentationTests(unittest.TestCase):
             root / "skills" / "skill-evolver" / "SKILL.md"
         ).read_text(encoding="utf-8")
         for phrase in (
+            "A strong signal alone never authorizes target selection.",
+            "Never infer target use from catalog similarity",
+            "per distinct proposed target",
+            "at most three distinct candidate targets per batch",
+            "inspected body for repeated targets",
+            "attribution_uncertain",
             "Use only when the user explicitly names $skill-evolver",
             "Python never invokes a model",
             "The current model consumes only the returned envelope plus "
@@ -14439,6 +14530,12 @@ class ReviewDocumentationTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[3]
         text = (root / "README.md").read_text(encoding="utf-8")
         for phrase in (
+            "A strong signal alone never authorizes target selection.",
+            "Never infer target use from catalog similarity",
+            "per distinct proposed target",
+            "at most three distinct candidate targets per batch",
+            "inspected body for repeated targets",
+            "attribution_uncertain",
             "## Explicit session review",
             "## Candidate inbox",
             "review-claim",

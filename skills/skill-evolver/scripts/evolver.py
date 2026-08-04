@@ -3185,6 +3185,7 @@ EVIDENCE_RESULT_KEYS = frozenset(
 RESULT_FILE_MAX_BYTES = REVIEW_RESULT_MAX_BYTES
 CANONICAL_RESULT_MAX_BYTES = 32_768
 EVIDENCE_PER_CANDIDATE_MAX = 3
+CANDIDATE_TARGETS_PER_BATCH_MAX = 3
 SECRET_REDACTIONS = (
     (
         re.compile(
@@ -3567,6 +3568,13 @@ def validate_declarative_result(
                 "evidence": normalized_evidence,
             }
         )
+    candidate_targets = {
+        item["target_identity"]
+        for item in normalized_sessions
+        if item["decision"] == "candidate"
+    }
+    if len(candidate_targets) > CANDIDATE_TARGETS_PER_BATCH_MAX:
+        raise ValueError("too_many_candidate_targets")
     normalized = {
         "schema_version": 1,
         "contract_digest": result["contract_digest"],
@@ -8710,6 +8718,26 @@ REVIEW_RESULT_SCHEMA_INSTRUCTIONS = {
         "Never quote transcript content or invent a target path.",
         "Reference only record_ref values from the same session.",
         "Write one JSON object to the allocated result file.",
+        "A strong signal alone does not justify a candidate or target.",
+        (
+            "Never infer target use from a catalog name, description, "
+            "topical similarity, or because a skill would have been useful."
+        ),
+        (
+            "Return attribution_uncertain unless the session unambiguously "
+            "establishes that the exact target was used and one separately "
+            "approved bounded catalog-inspect confirms that the change "
+            "belongs in that skill."
+        ),
+        (
+            "Use at most three distinct candidate targets per batch; reuse "
+            "one inspected target body for repeated targets."
+        ),
+        (
+            "Return no_reusable_improvement or one_off unless the proposal "
+            "is a reusable skill-level instruction for materially different "
+            "future tasks."
+        ),
         (
             "Write problem_summary, proposal_summary, validation_plan, "
             "and every evidence summary in the candidate authoring "

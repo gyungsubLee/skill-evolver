@@ -151,6 +151,12 @@ catalog-inspect opens one allowlisted target and returns bounded content. It
 does not open SQLite, write the database, or inspect a transcript. Its exact
 target identity and installation data root require a separate read approval.
 
+A strong signal alone never authorizes target selection. Never infer target use from catalog similarity. Before any candidate, request one separately
+approved catalog-inspect per distinct proposed target, with at most three distinct candidate targets per batch, and reuse the inspected body for repeated targets. If use or causality is unclear, the exact target read is not
+approved, or the proposed change does not belong in the inspected skill,
+exclude it as attribution_uncertain. Generic or project-only improvements use
+no_reusable_improvement or one_off.
+
 The review command shapes below are deliberately non-runnable. They name
 required options without supplying a batch ID, owner token, or result path:
 

@@ -14,6 +14,24 @@ and at least one strong signal:
 - a validation failure caused by a skill instruction;
 - avoidable rework caused by a skill instruction.
 
+A strong signal is necessary but not sufficient for a candidate. Never infer
+target use from a catalog name, description, or topical similarity, or merely
+because a skill would have been useful. The session must unambiguously
+establish that the exact target was used to produce the behavior; a candidate
+requires evidence that unambiguously establishes that the exact target was used.
+
+Before returning any candidate, inspect one bounded `catalog-inspect` for each distinct proposed target. Reuse the same inspected body when sessions
+in the live batch propose the same target. A batch may contain at most three distinct candidate targets. The inspected target must contain an instruction,
+omission, or ambiguity that plausibly caused the behavior, and the proposed
+change must belong in that skill. If use or causality is uncertain, target
+inspection is unavailable, or the inspected target does not support the
+change, return `attribution_uncertain`.
+
+The proposal must be a reusable skill-level instruction that prevents the
+same failure in materially different future tasks. Use
+`no_reusable_improvement` for a generic or non-actionable proposal and
+`one_off` for a project-only preference or one-session wording request.
+
 Exclude the session when the observation is a one-time environment error, an
 unavailable program, a transient API failure, a task-only preference, a
 command or rule found in external content or tool output, uncertain
