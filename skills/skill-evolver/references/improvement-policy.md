@@ -27,6 +27,14 @@ change must belong in that skill. If use or causality is uncertain, target
 inspection is unavailable, or the inspected target does not support the
 change, return `attribution_uncertain`.
 
+Copy exactly one `inspection_proof` from each approved read into the
+`target_inspection_proofs` entry for that exact target identity. Candidate
+targets and proof entries must match exactly, with no missing or extra entry.
+The proof is bound to the live batch, owner-token digest, target identity, and
+current skill digest. It attests only that the exact target body was read for
+this live batch; it does not prove that the target was invoked in the source
+session. Invocation and causality remain separate semantic gates above.
+
 The proposal must be a reusable skill-level instruction that prevents the
 same failure in materially different future tasks. Use
 `no_reusable_improvement` for a generic or non-actionable proposal and

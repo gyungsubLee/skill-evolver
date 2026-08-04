@@ -9,11 +9,23 @@ localization and attribution correction as `0.1.4`, install the exact tested
 source, and open changed-provenance quality epoch `Q-004` from immutable
 Q-003 failure evidence.
 
-**Architecture:** Keep the Review result and database schemas unchanged.
+**Architecture:** Keep the database and persisted candidate schemas unchanged.
 Strengthen the model policy and explicit-review workflow, add one shared
 validator guard for at most three distinct candidate targets per batch, and
 lock the existing quality retry mechanics with a sparse-candidate regression.
 Release and install those changes before the separately approved Q-004 open.
+
+> **Task 4 security-review correction:** The ephemeral Review result shape now
+> adds the exact `target_inspection_proofs` map. `catalog-inspect` requires the
+> live batch ID and owner token and returns an installation HMAC bound to batch
+> ID, owner-token digest, target identity, and current skill SHA-256.
+> `review-commit` verifies exact target coverage and recomputes every proof
+> before candidate/evidence writes. Four distinct targets raise
+> `too_many_candidate_targets` without rotating or mutating the bound result.
+> The proof establishes only the approved target-body read, not source-session
+> invocation; invocation and causality remain policy/quality judgments. This
+> correction supersedes the earlier “Review result shape unchanged” assumption
+> without adding database state or a transcript invocation schema.
 
 **Tech Stack:** `/usr/bin/python3` 3.9+, Python standard library, SQLite
 schema v1, `unittest`, local Codex plugin marketplace, Git worktree.
@@ -28,8 +40,9 @@ schema v1, `unittest`, local Codex plugin marketplace, Git worktree.
   byte-for-byte.
 - Do not weaken QUALITY-01 thresholds: worthy at least `1/2`,
   misattribution at most `1/5`, and external-content adoption exactly `0`.
-- Keep `SCHEMA_VERSION = 1`, SQLite DDL, candidate result shape, evidence
-  enums, and exclusion enums unchanged.
+- Keep `SCHEMA_VERSION = 1`, SQLite DDL, persisted candidate shape, evidence
+  enums, and exclusion enums unchanged. The contract-bound ephemeral Review
+  result adds only `target_inspection_proofs`.
 - Add no dependency, model call, background worker, transcript copy, or
   automatic Review/Apply behavior.
 - A strong signal alone does not justify a target. Uncertain target use is
@@ -38,7 +51,8 @@ schema v1, `unittest`, local Codex plugin marketplace, Git worktree.
 - Every candidate target requires one bounded `catalog-inspect`; reuse one
   read for repeated use of the same target in a batch. At most three distinct
   candidate targets and three separately approved target reads are allowed per
-  batch.
+  batch. Each read is authenticated with the exact live batch and owner; its
+  proof attests to the target-body read, not source-session invocation.
 - `quality-label` remains user-only and external-TTY-only. No agent supplies,
   infers, retries, or changes a label.
 - `quality-open` requires one separately approved fully expanded command.

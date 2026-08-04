@@ -876,6 +876,7 @@ class QualitySealTests(CandidateBatchFixture):
                 }
                 for item in payload["sessions"]
             ]
+            payload["target_inspection_proofs"] = {}
         result_path = self.write_result(claim, payload)
         self.commit(claim, result_path, now + 1)
         return claim

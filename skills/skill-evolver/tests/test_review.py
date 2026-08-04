@@ -81,6 +81,8 @@ class ReviewRuntimeContractTests(unittest.TestCase):
             b"unambiguously establishes that the exact target was used",
             b"one bounded `catalog-inspect` for each distinct proposed target",
             b"at most three distinct candidate targets",
+            b"`target_inspection_proofs` entry for that exact target",
+            b"does not prove that the target was invoked",
             b"`attribution_uncertain`",
             b"reusable skill-level instruction",
             b"`no_reusable_improvement`",
@@ -124,6 +126,17 @@ class ReviewRuntimeContractTests(unittest.TestCase):
             (
                 "Use at most three distinct candidate targets per batch; "
                 "reuse one inspected target body for repeated targets."
+            ),
+            (
+                "Copy exactly one inspection_proof from each separately "
+                "approved catalog-inspect response into "
+                "target_inspection_proofs under that exact target identity; "
+                "include no missing or extra entries."
+            ),
+            (
+                "An inspection proof attests only that the exact target body "
+                "was read for this live batch; it does not prove target "
+                "invocation in a source session."
             ),
             (
                 "Return no_reusable_improvement or one_off unless the "
@@ -8818,9 +8831,15 @@ class ReviewCandidateValidationTests(unittest.TestCase):
             "lease_expires_at": "2033-05-18T03:43:20Z",
         }
         self.api_key = "ｓｋ－abcdefghijklmnopqrst－"
+        self.inspection_proof = "9" * 64
         self.payload = {
             "schema_version": 1,
             "contract_digest": self.runtime.sha256_json(self.contract),
+            "target_inspection_proofs": {
+                "user-skill:verification-before-completion": (
+                    self.inspection_proof
+                )
+            },
             "sessions": [
                 {
                     "session_ref": self.first_ref,
@@ -8939,6 +8958,10 @@ class ReviewCandidateValidationTests(unittest.TestCase):
         payload = {
             "schema_version": 1,
             "contract_digest": self.runtime.sha256_json(contract),
+            "target_inspection_proofs": {
+                target: f"{index:x}" * 64
+                for index, target in enumerate(sorted(targets), start=1)
+            },
             "sessions": decisions,
         }
         self.runtime._validate_review_contract(contract, 7, "final")
@@ -8949,6 +8972,52 @@ class ReviewCandidateValidationTests(unittest.TestCase):
             self.runtime.validate_declarative_result(
                 payload, contract, frozenset(targets)
             )
+
+    def test_candidate_targets_require_exact_inspection_proof_coverage(
+        self,
+    ) -> None:
+        try:
+            normalized = self.runtime.validate_declarative_result(
+                self.payload, self.contract, self.targets
+            )
+        except ValueError as error:
+            self.fail(f"inspection proof schema rejected: {error}")
+        self.assertEqual(
+            normalized["target_inspection_proofs"],
+            self.payload["target_inspection_proofs"],
+        )
+
+        missing = copy.deepcopy(self.payload)
+        missing["target_inspection_proofs"] = {}
+        extra = copy.deepcopy(self.payload)
+        extra["target_inspection_proofs"]["user-skill:extra"] = "8" * 64
+        malformed = copy.deepcopy(self.payload)
+        malformed["target_inspection_proofs"][
+            "user-skill:verification-before-completion"
+        ] = "not-a-proof"
+        for label, payload, error in (
+            (
+                "missing",
+                missing,
+                "catalog_inspection_proof_coverage_mismatch",
+            ),
+            (
+                "extra",
+                extra,
+                "catalog_inspection_proof_coverage_mismatch",
+            ),
+            (
+                "malformed",
+                malformed,
+                "invalid_catalog_inspection_proof",
+            ),
+        ):
+            with self.subTest(inspection_proof=label), self.assertRaisesRegex(
+                ValueError, f"^{error}$"
+            ):
+                self.runtime.validate_declarative_result(
+                    payload, self.contract, self.targets
+                )
 
     def test_result_requires_the_exact_session_ref_set_once(self) -> None:
         self.runtime.validate_declarative_result(
@@ -9388,6 +9457,9 @@ class ReviewCandidateValidationTests(unittest.TestCase):
         large_payload = {
             "schema_version": 1,
             "contract_digest": "",
+            "target_inspection_proofs": {
+                "user-skill:verification-before-completion": "9" * 64
+            },
             "sessions": [],
         }
         for index in range(1, 6):
@@ -9759,6 +9831,28 @@ class CandidateBatchFixture(BatchExportTestCase):
             now=now,
         )
 
+    def inspection_proof(
+        self,
+        claim: dict[str, object],
+        entry: Optional[object] = None,
+    ) -> str:
+        target = self.catalog_entry if entry is None else entry
+        payload = {
+            "schema_version": 1,
+            "batch_id": int(claim["batch_id"]),
+            "owner_digest": self.runtime.review_owner_digest(
+                self.installation, str(claim["owner_token"])
+            ),
+            "target_identity": target.identity,
+            "skill_sha256": target.skill_sha256,
+        }
+        return hmac.new(
+            self.installation.identity_key.read_bytes(),
+            b"catalog-inspection\0"
+            + self.runtime.canonical_json_bytes(payload),
+            "sha256",
+        ).hexdigest()
+
     def result_payload(
         self,
         claim: dict[str, object],
@@ -9811,6 +9905,9 @@ class CandidateBatchFixture(BatchExportTestCase):
         return {
             "schema_version": 1,
             "contract_digest": claim["contract_digest"],
+            "target_inspection_proofs": {
+                self.catalog_entry.identity: self.inspection_proof(claim)
+            },
             "sessions": sessions,
         }
 
@@ -9972,9 +10069,11 @@ class CandidateCommitTests(CandidateBatchFixture):
     ) -> None:
         now = 2_000_000_000.0
         claim = self.claim(5, now)
-        result_path = self.write_result(
-            claim, self.result_payload(claim)
-        )
+        payload = self.result_payload(claim)
+        inspection_proof = payload["target_inspection_proofs"][
+            self.catalog_entry.identity
+        ]
+        result_path = self.write_result(claim, payload)
         committed = self.commit(claim, result_path, now + 1)
         candidate = self.connection.execute(
             "SELECT * FROM candidates"
@@ -10033,6 +10132,155 @@ class CandidateCommitTests(CandidateBatchFixture):
         self.assertEqual(audit["candidate_count"], 5)
         self.assertEqual(batch["candidate_count"], 5)
         self.assertFalse(result_path.exists())
+        self.assertNotIn(
+            inspection_proof,
+            "\n".join(self.connection.iterdump()),
+        )
+
+    def test_forged_catalog_inspection_proof_rotates_before_candidate_writes(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        claim = self.claim(1, now)
+        payload = self.result_payload(claim)
+        payload["target_inspection_proofs"][
+            self.catalog_entry.identity
+        ] = "0" * 64
+        old_path = self.write_result(claim, payload)
+
+        retried = self.commit(claim, old_path, now + 1)
+        self.assertEqual(retried["status"], "retry")
+        self.assertEqual(retried["error_code"], "invalid_review_result")
+        retry_path = Path(str(retried["result_path"]))
+        self.assertFalse(old_path.exists())
+        self.assertTrue(retry_path.exists())
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM candidates"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_catalog_inspection_proof_cannot_replay_across_batches(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        first = self.claim(1, now)
+        first_proof = self.inspection_proof(first)
+        self.abort(first, now + 1)
+
+        second = self.claim(1, now + 10)
+        payload = self.result_payload(second)
+        payload["target_inspection_proofs"][
+            self.catalog_entry.identity
+        ] = first_proof
+        old_path = self.write_result(second, payload)
+
+        retried = self.commit(second, old_path, now + 11)
+
+        self.assertEqual(retried["status"], "retry")
+        self.assertEqual(retried["error_code"], "invalid_review_result")
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM candidates"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_four_targets_reject_without_rotating_or_mutating(self) -> None:
+        now = 2_000_000_000.0
+        entries = [self.catalog_entry]
+        for index in range(2, 5):
+            skill_dir = self.skill_root / f"target-{index}"
+            skill_dir.mkdir(mode=0o700)
+            skill_file = skill_dir / "SKILL.md"
+            skill_file.write_text(
+                "---\n"
+                f"name: Target {index}\n"
+                f"description: Test target {index}\n"
+                "---\n",
+                encoding="utf-8",
+            )
+            entries.append(
+                self.runtime.CatalogEntry(
+                    identity=f"user-skill:target-{index}",
+                    display_name=f"Target {index}",
+                    description=f"Test target {index}",
+                    skill_dir=skill_dir,
+                    skill_sha256=hashlib.sha256(
+                        skill_file.read_bytes()
+                    ).hexdigest(),
+                )
+            )
+        export = [
+            {
+                "identity": entry.identity,
+                "display_name": entry.display_name,
+                "description": entry.description,
+            }
+            for entry in entries
+        ]
+        snapshot = self.runtime.CatalogSnapshot(
+            entries=tuple(entries),
+            export_bytes=self.runtime.canonical_json_bytes(export),
+            snapshot_digest=self.runtime.sha256_json(
+                [
+                    {
+                        "identity": entry.identity,
+                        "path": str(entry.skill_dir),
+                        "skill_sha256": entry.skill_sha256,
+                    }
+                    for entry in entries
+                ]
+            ),
+            rejected_count=0,
+        )
+        self.catalog = snapshot
+        with mock.patch.object(
+            self.runtime,
+            "build_catalog_snapshot",
+            return_value=snapshot,
+        ):
+            claim = self.claim(4, now)
+            payload = self.result_payload(claim, distinct=True)
+            for decision, entry in zip(payload["sessions"], entries):
+                decision["target_identity"] = entry.identity
+            payload["target_inspection_proofs"] = {
+                entry.identity: self.inspection_proof(claim, entry)
+                for entry in entries
+            }
+            path = self.write_result(claim, payload)
+            binding_before = self.runtime.load_review_result_binding(
+                self.connection, int(claim["batch_id"])
+            )
+            database_before = tuple(self.connection.iterdump())
+            changes_before = self.connection.total_changes
+            files_before = {
+                item.name: item.read_bytes()
+                for item in self.runtime.review_result_root().iterdir()
+            }
+
+            with self.assertRaisesRegex(
+                ValueError, "^too_many_candidate_targets$"
+            ):
+                self.commit(claim, path, now + 1)
+
+        self.assertEqual(path.read_bytes(), files_before[path.name])
+        self.assertEqual(
+            {
+                item.name: item.read_bytes()
+                for item in self.runtime.review_result_root().iterdir()
+            },
+            files_before,
+        )
+        self.assertEqual(
+            self.runtime.load_review_result_binding(
+                self.connection, int(claim["batch_id"])
+            ),
+            binding_before,
+        )
+        self.assertEqual(tuple(self.connection.iterdump()), database_before)
+        self.assertEqual(self.connection.total_changes, changes_before)
 
     def test_partial_export_commit_preserves_adapter_and_capacity_exclusions(
         self,
@@ -14135,6 +14383,8 @@ class ReviewSurfaceTests(CandidateBatchFixture):
         )
 
     def test_catalog_inspect_returns_one_bound_target(self) -> None:
+        now = 2_000_000_000.0
+        claim = self.claim(1, now)
         sibling = self.skill_root / "sibling-skill"
         sibling.mkdir(mode=0o700)
         (sibling / "SKILL.md").write_text(
@@ -14151,6 +14401,8 @@ class ReviewSurfaceTests(CandidateBatchFixture):
             opened_names.append(str(args[3]))
             return read_entry(*args)
 
+        database_before = tuple(self.connection.iterdump())
+        changes_before = self.connection.total_changes
         with mock.patch.object(
             self.runtime,
             "build_catalog_snapshot",
@@ -14167,6 +14419,8 @@ class ReviewSurfaceTests(CandidateBatchFixture):
                         self.installation.data_root
                         / "installation.json"
                     ),
+                    batch_id=int(claim["batch_id"]),
+                    owner_token=str(claim["owner_token"]),
                     target_identity=self.catalog_entry.identity,
                 ),
             )
@@ -14177,11 +14431,14 @@ class ReviewSurfaceTests(CandidateBatchFixture):
             set(payload),
             {
                 "schema_version",
+                "batch_id",
                 "target_identity",
                 "skill_sha256",
+                "inspection_proof",
                 "content",
             },
         )
+        self.assertEqual(payload["batch_id"], int(claim["batch_id"]))
         self.assertEqual(
             payload["target_identity"],
             self.catalog_entry.identity,
@@ -14189,7 +14446,38 @@ class ReviewSurfaceTests(CandidateBatchFixture):
         self.assertRegex(
             payload["skill_sha256"], r"^[0-9a-f]{64}$"
         )
+        self.assertEqual(
+            payload["inspection_proof"],
+            self.inspection_proof(claim),
+        )
         self.assertIsInstance(payload["content"], str)
+        self.assertEqual(tuple(self.connection.iterdump()), database_before)
+        self.assertEqual(self.connection.total_changes, changes_before)
+
+    def test_catalog_inspect_rejects_wrong_owner_before_target_read(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        claim = self.claim(1, now)
+        with mock.patch.object(
+            self.runtime,
+            "_read_catalog_entry",
+            wraps=self.runtime._read_catalog_entry,
+        ) as read_entry, self.assertRaisesRegex(
+            ValueError, "^review_batch_owner_mismatch$"
+        ):
+            self.runtime.cmd_catalog_inspect(
+                argparse.Namespace(
+                    installation=str(
+                        self.installation.data_root
+                        / "installation.json"
+                    ),
+                    batch_id=int(claim["batch_id"]),
+                    owner_token="0" * 64,
+                    target_identity=self.catalog_entry.identity,
+                )
+            )
+        read_entry.assert_not_called()
 
     def test_review_handlers_preserve_underlying_output_contracts(
         self,
@@ -14474,6 +14762,8 @@ class ReviewDocumentationTests(unittest.TestCase):
             "per distinct proposed target",
             "at most three distinct candidate targets per batch",
             "inspected body for repeated targets",
+            "target_inspection_proofs",
+            "does not prove target invocation in a source session",
             "attribution_uncertain",
             "Use only when the user explicitly names $skill-evolver",
             "Python never invokes a model",
@@ -14535,6 +14825,8 @@ class ReviewDocumentationTests(unittest.TestCase):
             "per distinct proposed target",
             "at most three distinct candidate targets per batch",
             "inspected body for repeated targets",
+            "target_inspection_proofs",
+            "does not prove target invocation in a source session",
             "attribution_uncertain",
             "## Explicit session review",
             "## Candidate inbox",

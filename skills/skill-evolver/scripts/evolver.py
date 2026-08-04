@@ -327,6 +327,47 @@ def review_owner_digest(
     ).hexdigest()
 
 
+def catalog_inspection_proof(
+    installation: Installation,
+    batch_id: int,
+    owner_token: str,
+    target_identity: str,
+    skill_sha256: str,
+) -> str:
+    if (
+        type(installation) is not Installation
+        or type(batch_id) is not int
+        or batch_id < 1
+        or type(target_identity) is not str
+        or not target_identity
+        or not target_identity.startswith("user-skill:")
+        or not _is_lower_hex(skill_sha256, 64)
+    ):
+        raise ValueError("invalid_catalog_inspection_proof_input")
+    try:
+        identity_size = len(target_identity.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise ValueError(
+            "invalid_catalog_inspection_proof_input"
+        ) from None
+    if identity_size > CATALOG_IDENTITY_MAX_BYTES:
+        raise ValueError("invalid_catalog_inspection_proof_input")
+    payload = {
+        "schema_version": 1,
+        "batch_id": batch_id,
+        "owner_digest": review_owner_digest(
+            installation, owner_token
+        ),
+        "target_identity": target_identity,
+        "skill_sha256": skill_sha256,
+    }
+    return hmac.new(
+        installation.identity_key.read_bytes(),
+        b"catalog-inspection\0" + canonical_json_bytes(payload),
+        "sha256",
+    ).hexdigest()
+
+
 def review_session_ref(
     installation: Installation,
     batch_id: int,
@@ -3158,7 +3199,12 @@ SIGNAL_SOURCE_PAIRS = frozenset(
     }
 )
 RESULT_TOP_LEVEL_KEYS = frozenset(
-    {"schema_version", "contract_digest", "sessions"}
+    {
+        "schema_version",
+        "contract_digest",
+        "target_inspection_proofs",
+        "sessions",
+    }
 )
 CANDIDATE_RESULT_KEYS = frozenset(
     {
@@ -3575,9 +3621,25 @@ def validate_declarative_result(
     }
     if len(candidate_targets) > CANDIDATE_TARGETS_PER_BATCH_MAX:
         raise ValueError("too_many_candidate_targets")
+    inspection_proofs = result["target_inspection_proofs"]
+    if type(inspection_proofs) is not dict:
+        raise ValueError("invalid_catalog_inspection_proof")
+    if set(inspection_proofs) != candidate_targets:
+        raise ValueError(
+            "catalog_inspection_proof_coverage_mismatch"
+        )
+    if any(
+        not _is_lower_hex(proof, 64)
+        for proof in inspection_proofs.values()
+    ):
+        raise ValueError("invalid_catalog_inspection_proof")
     normalized = {
         "schema_version": 1,
         "contract_digest": result["contract_digest"],
+        "target_inspection_proofs": {
+            target: inspection_proofs[target]
+            for target in sorted(inspection_proofs)
+        },
         "sessions": normalized_sessions,
     }
     if (
@@ -3586,6 +3648,32 @@ def validate_declarative_result(
     ):
         raise ValueError("validated_result_too_large")
     return normalized
+
+
+def verify_catalog_inspection_proofs(
+    installation: Installation,
+    batch_id: int,
+    owner_token: str,
+    validated: dict[str, object],
+    snapshot: CatalogSnapshot,
+) -> None:
+    proofs = validated["target_inspection_proofs"]
+    if type(proofs) is not dict:
+        raise ValueError("invalid_catalog_inspection_proof")
+    entries = {entry.identity: entry for entry in snapshot.entries}
+    for target_identity, proof in proofs.items():
+        entry = entries.get(target_identity)
+        if entry is None or not hmac.compare_digest(
+            proof,
+            catalog_inspection_proof(
+                installation,
+                batch_id,
+                owner_token,
+                target_identity,
+                entry.skill_sha256,
+            ),
+        ):
+            raise ValueError("invalid_catalog_inspection_proof")
 
 
 def reject_persisted_candidate_text_leaks(
@@ -8207,6 +8295,13 @@ def commit_review_result(
         validated = validate_declarative_result(
             payload, contract, allowed_targets
         )
+        verify_catalog_inspection_proofs(
+            installation,
+            batch_id,
+            owner_token,
+            validated,
+            snapshot,
+        )
         reject_persisted_candidate_text_leaks(
             validated,
             contract,
@@ -8216,7 +8311,9 @@ def commit_review_result(
                 str(entry.skill_dir) for entry in snapshot.entries
             ),
         )
-    except ValueError:
+    except ValueError as error:
+        if error.args == ("too_many_candidate_targets",):
+            raise
         return rotate_invalid_review_result(
             connection,
             installation,
@@ -8266,6 +8363,13 @@ def commit_review_result(
                 validated = validate_declarative_result(
                     payload, live_contract, live_targets
                 )
+                verify_catalog_inspection_proofs(
+                    installation,
+                    batch_id,
+                    owner_token,
+                    validated,
+                    live_snapshot,
+                )
                 reject_persisted_candidate_text_leaks(
                     validated,
                     live_contract,
@@ -8278,7 +8382,9 @@ def commit_review_result(
                         for entry in live_snapshot.entries
                     ),
                 )
-            except ValueError:
+            except ValueError as error:
+                if error.args == ("too_many_candidate_targets",):
+                    raise
                 raise _CandidateResultRetry from None
 
             contract_sessions = {
@@ -8734,6 +8840,16 @@ REVIEW_RESULT_SCHEMA_INSTRUCTIONS = {
             "one inspected target body for repeated targets."
         ),
         (
+            "Copy exactly one inspection_proof from each separately approved "
+            "catalog-inspect response into target_inspection_proofs under "
+            "that exact target identity; include no missing or extra entries."
+        ),
+        (
+            "An inspection proof attests only that the exact target body was "
+            "read for this live batch; it does not prove target invocation "
+            "in a source session."
+        ),
+        (
             "Return no_reusable_improvement or one_off unless the proposal "
             "is a reusable skill-level instruction for materially different "
             "future tasks."
@@ -8769,6 +8885,11 @@ REVIEW_RESULT_SCHEMA_INSTRUCTIONS = {
     "result_shape": {
         "schema_version": 1,
         "contract_digest": "64 lowercase hexadecimal characters",
+        "target_inspection_proofs": {
+            "user-skill identity": (
+                "catalog-inspect inspection_proof for this live batch"
+            )
+        },
         "sessions": [
             {
                 "session_ref": "claim-contract session_ref",
@@ -14154,7 +14275,20 @@ def cmd_quality_label(args: argparse.Namespace) -> int:
 
 
 def cmd_catalog_inspect(args: argparse.Namespace) -> int:
-    load_installation(Path(args.installation))
+    installation = load_installation(Path(args.installation))
+    batch_id = int(args.batch_id)
+    owner_token = str(args.owner_token)
+    connection = open_database(installation, read_only=True)
+    try:
+        require_live_review_batch(
+            connection,
+            installation,
+            batch_id,
+            owner_token,
+            time.time(),
+        )
+    finally:
+        connection.close()
     runtime = load_review_runtime()
     if len(runtime.mutable_skill_roots) != 1:
         raise CatalogAdapterError("catalog_root_invalid")
@@ -14202,8 +14336,16 @@ def cmd_catalog_inspect(args: argparse.Namespace) -> int:
     write_json_stdout(
         {
             "schema_version": 1,
+            "batch_id": batch_id,
             "target_identity": entry.identity,
             "skill_sha256": entry.skill_sha256,
+            "inspection_proof": catalog_inspection_proof(
+                installation,
+                batch_id,
+                owner_token,
+                entry.identity,
+                entry.skill_sha256,
+            ),
             "content": content.decode("utf-8"),
         }
     )
@@ -14326,6 +14468,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     catalog_inspect = commands.add_parser("catalog-inspect")
     add_installation_argument(catalog_inspect)
+    catalog_inspect.add_argument(
+        "--batch-id", type=int, required=True
+    )
+    catalog_inspect.add_argument("--owner-token", required=True)
     catalog_inspect.add_argument(
         "--target-identity", required=True
     )

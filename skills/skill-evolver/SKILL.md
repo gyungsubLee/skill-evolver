@@ -38,10 +38,12 @@ count.
 Python for an actual invocation.
 
 catalog-inspect opens one allowlisted target and returns bounded target
-content. It does not open SQLite or a transcript. Present one fully expanded
-command containing the exact installation path and target identity, then
-request approval for that exact read and installation data root. Never inspect
-another path under that approval.
+content plus an `inspection_proof`. Before that read, it opens SQLite
+read-only only to authenticate the exact live batch and owner. It never writes
+SQLite or opens a transcript. Present one fully expanded command containing
+the exact installation path, decimal batch ID, raw owner token, and target identity,
+then request approval for that exact read and installation data root. Never
+inspect another path under that approval.
 
 ## Approval boundaries
 
@@ -58,6 +60,7 @@ must be limited to that one invocation and the roots stated below.
 - `review-heartbeat` requires separate approval for one fully expanded command and the exact installation data root.
 - `review-commit` requires separate approval for one fully expanded command and the exact installation data root.
 - `review-abort` requires separate approval for one fully expanded command and the exact installation data root.
+- `catalog-inspect` requires separate approval for one fully expanded command and the exact installation data root.
 - `defer` requires separate approval for one fully expanded command and the exact installation data root.
 - `resume` requires separate approval for one fully expanded command and the exact installation data root.
 - `reject` requires separate approval for one fully expanded command and the exact installation data root.
@@ -70,6 +73,7 @@ The non-runnable review command shapes are:
 | `review-heartbeat` | Python executable, script, subcommand, `--installation`, `--batch-id`, `--owner-token` |
 | `review-commit` | Python executable, script, subcommand, `--installation`, `--batch-id`, `--owner-token`, `--result` |
 | `review-abort` | Python executable, script, subcommand, `--installation`, `--batch-id`, `--owner-token` |
+| `catalog-inspect` | Python executable, script, subcommand, `--installation`, `--batch-id`, `--owner-token`, `--target-identity` |
 
 Do not approve a shape, an ellipsis, an environment-variable expansion, or a
 placeholder. Construct the single actual command in current-turn memory with
@@ -97,6 +101,13 @@ Review is a scoped sequence, not an autonomous command:
    used, exclude it as `attribution_uncertain` without inspecting a skill.
 4. Before emitting any candidate, request one separately approved
    catalog-inspect per distinct proposed target, at most three distinct candidate targets per batch, and reuse the inspected body for repeated targets.
+   Use the same live batch ID and owner token in each command. Copy exactly one
+   returned `inspection_proof` per candidate target into the top-level
+   `target_inspection_proofs` map; its keys must exactly equal the distinct
+   candidate target identities, with no extras. The inspection proof only
+   attests that the exact target body was read for this live batch.
+   It does not prove target invocation in a source session. Continue to require the
+   session's separate actual-use and causal evidence.
    If an exact target read is declined, unavailable, or does not show that the
    change belongs in that skill, exclude it as `attribution_uncertain` or abort
    the live batch. Never inspect an unrelated path.
@@ -104,7 +115,8 @@ Review is a scoped sequence, not an autonomous command:
    `session_ref`. A reusable skill-level candidate must remain useful in
    materially different future tasks; otherwise use
    `no_reusable_improvement` or `one_off`.
-6. Write only the strict JSON result to the exact bound `result_path`. Do not
+6. Write only the strict JSON result, including the exact ephemeral
+   `target_inspection_proofs` map, to the exact bound `result_path`. Do not
    choose another result file or parent. Before the lease approaches expiry,
    construct a fully expanded `review-heartbeat` command in memory, request
    its separate approval, and run it once.
@@ -122,6 +134,11 @@ Pass the raw owner token directly from current-turn memory to each separately
 approved lifecycle invocation without echoing, saving, or entering it in an
 interactive shell. Forget all batch secrets after commit or abort reaches a
 terminal state.
+
+Never copy target content or an inspection proof into candidate text, notes,
+the database, or another task. The proof may exist only in the current-turn
+memory and the bound ephemeral result; commit validates it twice and stores
+neither the proof nor the owner token in candidate or evidence records.
 
 Do not quote transcript text in summaries. Use only the documented signal and
 exclusion enums. Never call a model from Python. Never apply a candidate.
