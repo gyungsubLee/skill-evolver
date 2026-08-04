@@ -64,6 +64,8 @@ CATALOG_INSPECT_RESPONSE_MAX_BYTES = (
 )
 CATALOG_INSPECT_SCAN_ATTEMPTS_MAX = 32
 CATALOG_INSPECT_CANONICAL_START = '{"batch_id":'
+CATALOG_INSPECT_NESTED_SCAN_MAX_NODES = 4_096
+CATALOG_INSPECT_NESTED_SCAN_MAX_DEPTH = 64
 CATALOG_DISPLAY_NAME_MAX_BYTES = 128
 CATALOG_DESCRIPTION_MAX_BYTES = 384
 RUNTIME_REFERENCE_MAX_BYTES = 8_192
@@ -2190,10 +2192,16 @@ def transcript_adapter_contract(
                 "direct-or-final-output-suffix-v1-strict-owner-hmac"
             ),
             "catalog_inspect_tool_output": (
-                "all-authenticated-span-filter-v3-owner-digest-hmac-preserve-siblings"
+                "top-level-authenticated-container-filter-v4-reject-nested-auth"
             ),
             "catalog_inspect_scan_attempts": (
                 CATALOG_INSPECT_SCAN_ATTEMPTS_MAX
+            ),
+            "catalog_inspect_nested_scan_max_nodes": (
+                CATALOG_INSPECT_NESTED_SCAN_MAX_NODES
+            ),
+            "catalog_inspect_nested_scan_max_depth": (
+                CATALOG_INSPECT_NESTED_SCAN_MAX_DEPTH
             ),
             "structured_text_security": (
                 "concatenated-scan-before-fragment-export-v1"
@@ -2539,34 +2547,75 @@ def _filter_catalog_inspect_output(
     attempts = 0
     cursor = 0
     while True:
-        start = value.find(
-            CATALOG_INSPECT_CANONICAL_START, cursor
+        object_start = value.find("{", cursor)
+        array_start = value.find("[", cursor)
+        starts = tuple(
+            start
+            for start in (object_start, array_start)
+            if start >= 0
         )
-        if start < 0:
+        if not starts:
             break
+        start = min(starts)
         attempts += 1
         if attempts > CATALOG_INSPECT_SCAN_ATTEMPTS_MAX:
             raise _transcript_error("unsupported_transcript")
-        next_cursor = start + len(
-            CATALOG_INSPECT_CANONICAL_START
-        )
         try:
             parsed, candidate_end = decoder.raw_decode(
                 value, start
             )
-            candidate = value[start:candidate_end]
+        except RecursionError:
+            raise _transcript_error("unsupported_transcript") from None
+        except ValueError:
+            candidate_end = _balanced_json_container_end(
+                value, start
+            )
+            if candidate_end is not None:
+                if (
+                    CATALOG_INSPECT_CANONICAL_START
+                    in value[start:candidate_end]
+                ):
+                    raise _transcript_error(
+                        "unsupported_transcript"
+                    )
+                cursor = candidate_end
+                continue
+            if (
+                CATALOG_INSPECT_CANONICAL_START
+                in value[start:]
+            ):
+                raise _transcript_error("unsupported_transcript")
+            break
+        candidate = value[start:candidate_end]
+        try:
             encoded = candidate.encode("utf-8")
-            canonical = canonical_json_bytes(parsed).decode("utf-8")
-        except (RecursionError, TypeError, UnicodeError, ValueError):
-            cursor = next_cursor
-            continue
-        if (
-            len(encoded) > CATALOG_INSPECT_RESPONSE_MAX_BYTES
-            or canonical != candidate
-            or not _is_exact_catalog_inspect_output(
+        except UnicodeEncodeError:
+            raise _transcript_error("unsupported_transcript") from None
+        authenticated = (
+            len(encoded) <= CATALOG_INSPECT_RESPONSE_MAX_BYTES
+            and _is_exact_catalog_inspect_output(
                 parsed, installation
             )
-        ):
+        )
+        if authenticated:
+            try:
+                canonical = canonical_json_bytes(parsed).decode(
+                    "utf-8"
+                )
+            except (
+                RecursionError,
+                TypeError,
+                UnicodeError,
+                ValueError,
+            ):
+                authenticated = False
+            else:
+                authenticated = canonical == candidate
+        if not authenticated:
+            if _contains_nested_authenticated_catalog_output(
+                parsed, installation
+            ):
+                raise _transcript_error("unsupported_transcript")
             cursor = candidate_end
             continue
         span_start = start
@@ -2587,6 +2636,78 @@ def _filter_catalog_inspect_output(
         cursor = span_end
     pieces.append(value[cursor:])
     return True, "".join(pieces)
+
+
+def _balanced_json_container_end(
+    value: str,
+    start: int,
+) -> Optional[int]:
+    opening = value[start : start + 1]
+    if opening not in {"{", "["}:
+        return None
+    stack = ["}" if opening == "{" else "]"]
+    in_string = False
+    escaped = False
+    for index in range(start + 1, len(value)):
+        character = value[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in {"{", "["}:
+            stack.append("}" if character == "{" else "]")
+        elif character in {"}", "]"}:
+            if character != stack[-1]:
+                return None
+            stack.pop()
+            if not stack:
+                return index + 1
+    return None
+
+
+def _contains_nested_authenticated_catalog_output(
+    value: object,
+    installation: Installation,
+) -> bool:
+    if type(value) is dict:
+        children = value.values()
+    elif type(value) is list:
+        children = value
+    else:
+        return False
+    pending: list[tuple[object, int]] = []
+    scheduled = 0
+    for child in children:
+        scheduled += 1
+        if scheduled > CATALOG_INSPECT_NESTED_SCAN_MAX_NODES:
+            raise _transcript_error("unsupported_transcript")
+        pending.append((child, 1))
+    while pending:
+        current, depth = pending.pop()
+        if depth > CATALOG_INSPECT_NESTED_SCAN_MAX_DEPTH:
+            raise _transcript_error("unsupported_transcript")
+        if _is_exact_catalog_inspect_output(
+            current, installation
+        ):
+            return True
+        if type(current) is dict:
+            nested = current.values()
+        elif type(current) is list:
+            nested = current
+        else:
+            continue
+        for child in nested:
+            scheduled += 1
+            if scheduled > CATALOG_INSPECT_NESTED_SCAN_MAX_NODES:
+                raise _transcript_error("unsupported_transcript")
+            pending.append((child, depth + 1))
+    return False
 
 
 def _canonical_transcript_records(

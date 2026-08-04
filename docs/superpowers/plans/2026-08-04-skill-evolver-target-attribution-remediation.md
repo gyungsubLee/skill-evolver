@@ -30,15 +30,23 @@ Q-004 open.
 > correction supersedes the earlier “Review result shape unchanged” assumption
 > without adding database state or a transcript invocation schema.
 > The response now also carries the non-secret `owner_digest`; the transcript
-> adapter scans the combined tool output and filters every direct, wrapped,
-> fragmented, or repeated artifact only when the exact canonical seven-key
-> payload, content digest, and HMAC all validate. It removes only authenticated
-> spans and their immediately preceding `Output:` markers, preserving all
-> unmatched prefix, between-artifact, suffix, and sibling text byte-for-byte
-> with normal redaction and evidence scope. Scanning is capped at 32 canonical
-> start candidates and saturation fails closed as unsupported transcript.
+> adapter scans the combined tool output as a stream of top-level JSON
+> containers. Each successfully decoded object or array is indivisible: only
+> an entire exact canonical seven-key response with a valid content digest and
+> HMAC is removed, together with its immediately preceding `Output:` marker.
+> A decoded non-artifact outer object or array is traversed within fixed
+> 4096-node and 64-level bounds. A cryptographically valid nested seven-key
+> response fails the transcript closed instead of being exported or surgically
+> removed; nested tampered and other lookalikes remain byte-for-byte ordinary
+> tool output. A quote/escape-aware bracket scan preserves a balanced invalid
+> outer only when it contains no canonical catalog start. Balanced-invalid,
+> mismatched, or unclosed ambiguous outers containing that start fail closed.
+> Unmatched prefix, between-container, suffix, and sibling text remains ordered
+> with normal redaction and evidence scope. Scanning is capped at 32 top-level
+> object/array parse attempts and saturation is unsupported transcript.
 > Proofs copied into persisted candidate/evidence text fail before SQLite
-> writes. Malformed or unauthenticated lookalikes remain ordinary tool output.
+> writes. Unauthenticated nested values and unambiguous malformed lookalikes
+> remain ordinary tool output.
 
 **Tech Stack:** `/usr/bin/python3` 3.9+, Python standard library, SQLite
 schema v1, `unittest`, local Codex plugin marketplace, Git worktree.

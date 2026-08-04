@@ -149,20 +149,34 @@ model input and the human-operated skill workflow cannot diverge.
   candidate, evidence, audit, or schema state. Every validated proof is also a
   persisted-text deny marker, so copying it into candidate, classification, or
   evidence text fails before SQLite writes.
-- The transcript adapter scans combined tool output and filters every direct,
-  wrapped, fragmented, or repeated `catalog-inspect` artifact only when it has the exact
-  canonical seven-key shape (`schema_version`, `batch_id`, `owner_digest`,
+- The transcript adapter scans combined tool output as top-level JSON
+  containers. A successfully decoded object or array is indivisible and is
+  removed only when that entire raw container has the exact canonical
+  seven-key shape (`schema_version`, `batch_id`, `owner_digest`,
   `target_identity`, `skill_sha256`, `inspection_proof`, `content`), bounded
   UTF-8 content, matching content SHA-256, and a valid installation HMAC.
-  Only validated spans and their immediately preceding `Output:` markers are
-  removed; unmatched prefix, between-artifact, suffix, and sibling text is
-  concatenated byte-for-byte and preserved with normal owner-token redaction,
-  evidence eligibility, and scope. The scan checks at most 32 exact canonical
-  start tokens and fails closed as `unsupported_transcript` on saturation.
+  A decoded non-artifact outer object or array is traversed iteratively within
+  fixed 4096-node and 64-level bounds. Any cryptographically valid nested exact
+  seven-key response fails the transcript closed as `unsupported_transcript`;
+  it is neither exported nor surgically deleted. Nested tampered and general
+  lookalikes remain byte-for-byte ordinary tool output. For a decode failure,
+  a quote/escape-aware bracket scan preserves an entire balanced invalid outer
+  container only when it contains no canonical catalog start. A
+  balanced-invalid, mismatched, or unclosed ambiguous outer containing that
+  start fails closed.
+- Only authenticated top-level containers and their immediately preceding
+  `Output:` markers are removed. Unmatched prefix, between-container, suffix,
+  and sibling text remains ordered and receives normal owner-token redaction,
+  evidence eligibility, and scope. The scan makes at most 32 top-level
+  object/array parse attempts and fails closed as `unsupported_transcript` on
+  saturation.
   Tampered content/proofs, noncanonical JSON, extra or missing keys, and
   general lookalikes remain ordinary tool output under the existing redaction
-  and transcript limits. This changes the transcript adapter contract/digest
-  without adding a transcript invocation schema.
+  and transcript limits. Fragment boundaries are concatenated before this
+  scan: fragments that form one top-level authenticated response are removed,
+  while fragments that form an outer object or array containing an
+  authenticated nested response fail closed. This changes the transcript
+  adapter contract/digest without adding a transcript invocation schema.
 - Python continues to validate catalog membership, record references,
   signal/source pairs, the three-distinct-target bound, digests, and atomic
   commit behavior.
@@ -193,10 +207,13 @@ the changed contract:
 6. A proof copied into any persisted candidate/evidence text rotates the
    invalid result without candidate persistence or proof leakage, while a
    normal valid result still completes.
-7. Every exact authenticated direct, wrapped, fragmented, or repeated catalog
-   artifact is removed from transcript export while unmatched text remains
-   eligible; tampered, noncanonical, nested-lookalike, and general lookalike
-   objects remain ordinary tool output, and scan saturation fails closed.
+7. Every exact authenticated top-level direct, wrapped, fragmented, or
+   repeated catalog container is removed from transcript export while
+   unmatched text remains eligible. Valid, noncanonical, and oversized outer
+   objects or arrays containing an authenticated nested response fail closed,
+   while nested tampered lookalikes remain byte-for-byte. Balanced-invalid,
+   mismatched, or unclosed ambiguous outers containing a catalog start,
+   nested-scan saturation, and container-attempt saturation also fail closed.
 8. A one-candidate quality fixture labeled `false/false/false` terminalizes as
    `FAIL`, preserves the exact thresholds, and returns
    `open_changed_quality_epoch`.

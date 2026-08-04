@@ -2601,9 +2601,11 @@ class FrozenTranscriptBoundedReadTests(FrozenTranscriptTestCase):
                         "direct-or-final-output-suffix-v1-strict-owner-hmac"
                     ),
                     "catalog_inspect_tool_output": (
-                        "all-authenticated-span-filter-v3-owner-digest-hmac-preserve-siblings"
+                        "top-level-authenticated-container-filter-v4-reject-nested-auth"
                     ),
                     "catalog_inspect_scan_attempts": 32,
+                    "catalog_inspect_nested_scan_max_nodes": 4096,
+                    "catalog_inspect_nested_scan_max_depth": 64,
                     "structured_text_security": (
                         "concatenated-scan-before-fragment-export-v1"
                     ),
@@ -3040,54 +3042,257 @@ class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
                     ),
                     (True, expected),
                 )
-        nested_lookalike = self.runtime.canonical_json_bytes(
-            {"batch_id": 0, "nested": payload}
+        marker_before_tampered = (
+            f"prefix\nOutput:\n{tampered_text}"
+        )
+        self.assertEqual(
+            self.runtime._filter_catalog_inspect_output(
+                marker_before_tampered, self.installation
+            ),
+            (False, marker_before_tampered),
+        )
+        nested_tampered = self.runtime.canonical_json_bytes(
+            {"nested": tampered, "sibling": "keep me"}
         ).decode()
         self.assertEqual(
             self.runtime._filter_catalog_inspect_output(
-                nested_lookalike, self.installation
+                nested_tampered, self.installation
             ),
-            (False, nested_lookalike),
+            (False, nested_tampered),
         )
-        oversized_lookalike = self.runtime.canonical_json_bytes(
+
+    def test_catalog_filter_rejects_nested_authenticated_containers(
+        self,
+    ) -> None:
+        payload, direct = self.catalog_inspect_output()
+        nested_object = self.runtime.canonical_json_bytes(
+            {"nested": payload, "sibling": "keep me"}
+        ).decode()
+        nested_array = f"[{direct}]"
+        noncanonical_wrapper = (
+            '{ "nested": '
+            f'{direct}, "sibling": "keep me" }}'
+        )
+        oversized_outer = self.runtime.canonical_json_bytes(
             {
-                "batch_id": 0,
                 "nested": payload,
                 "padding": "x"
                 * self.runtime.CATALOG_INSPECT_RESPONSE_MAX_BYTES,
             }
         ).decode()
-        matched, preserved = (
-            self.runtime._filter_catalog_inspect_output(
-                oversized_lookalike, self.installation
+        for label, value in {
+            "canonical-object": nested_object,
+            "array": nested_array,
+            "noncanonical-wrapper": noncanonical_wrapper,
+            "oversized-outer": oversized_outer,
+        }.items():
+            with self.subTest(label=label), self.assertRaises(
+                self.runtime.TranscriptAdapterError
+            ) as rejected:
+                self.runtime._filter_catalog_inspect_output(
+                    value, self.installation
+                )
+            self.assertEqual(
+                rejected.exception.code, "unsupported_transcript"
             )
+            self.assertFalse(rejected.exception.retryable)
+
+        tampered = copy.deepcopy(payload)
+        tampered["inspection_proof"] = "0" * 64
+        tampered_object = self.runtime.canonical_json_bytes(
+            {"nested": tampered, "sibling": "keep me"}
+        ).decode()
+        tampered_array = self.runtime.canonical_json_bytes(
+            [tampered]
+        ).decode()
+        combined = (
+            f"{tampered_object}<A>{direct}<B>{tampered_array}"
+            f"<C>{direct}<D>{tampered_object}"
         )
-        self.assertFalse(matched)
         self.assertEqual(
-            hashlib.sha256(preserved.encode()).digest(),
-            hashlib.sha256(oversized_lookalike.encode()).digest(),
+            self.runtime._filter_catalog_inspect_output(
+                combined, self.installation
+            ),
+            (
+                True,
+                f"{tampered_object}<A><B>{tampered_array}"
+                f"<C><D>{tampered_object}",
+            ),
         )
 
+    def test_catalog_filter_rejects_balanced_ambiguous_outer_container(
+        self,
+    ) -> None:
+        _, direct = self.catalog_inspect_output()
+        balanced_invalid = (
+            '{"broken": invalid, "literal":"}]\\\"{", '
+            '"nested":'
+            + direct
+            + "}"
+        )
+        with self.assertRaises(
+            self.runtime.TranscriptAdapterError
+        ) as rejected:
+            self.runtime._filter_catalog_inspect_output(
+                balanced_invalid, self.installation
+            )
+        self.assertEqual(
+            rejected.exception.code, "unsupported_transcript"
+        )
+        self.assertFalse(rejected.exception.retryable)
+        balanced_without_token = (
+            '{"broken": invalid, "literal":"}]\\\"{", '
+            '"nested":{"batch":7}}'
+        )
+        self.assertEqual(
+            self.runtime._filter_catalog_inspect_output(
+                balanced_without_token, self.installation
+            ),
+            (False, balanced_without_token),
+        )
+
+    def test_catalog_filter_preserves_malformed_no_token_boundaries(
+        self,
+    ) -> None:
+        unclosed_without_token = "{" * (
+            self.runtime.CATALOG_INSPECT_SCAN_ATTEMPTS_MAX + 1
+        )
+        self.assertEqual(
+            self.runtime._filter_catalog_inspect_output(
+                unclosed_without_token, self.installation
+            ),
+            (False, unclosed_without_token),
+        )
+        mismatched_without_token = "{]|ordinary evidence"
+        self.assertEqual(
+            self.runtime._filter_catalog_inspect_output(
+                mismatched_without_token, self.installation
+            ),
+            (False, mismatched_without_token),
+        )
+
+    def test_catalog_filter_rejects_unclosed_outer_with_nested_artifact(
+        self,
+    ) -> None:
+        _, direct = self.catalog_inspect_output()
+        malformed = {
+            "unclosed": '{"nested":' + direct,
+            "mismatched": '{"nested":' + direct + "]",
+            "mismatch-before-nested": (
+                '{"broken":],"nested":' + direct + "}"
+            ),
+        }
+        for label, value in malformed.items():
+            with self.subTest(label=label), self.assertRaises(
+                self.runtime.TranscriptAdapterError
+            ) as rejected:
+                self.runtime._filter_catalog_inspect_output(
+                    value, self.installation
+                )
+            self.assertEqual(
+                rejected.exception.code, "unsupported_transcript"
+            )
+            self.assertFalse(rejected.exception.retryable)
+
     def test_catalog_filter_scan_saturation_fails_closed(self) -> None:
-        token = '{"batch_id":'
         attempts = self.runtime.CATALOG_INSPECT_SCAN_ATTEMPTS_MAX
-        at_limit = token * attempts
+        at_limit = "{}" * attempts
         self.assertEqual(
             self.runtime._filter_catalog_inspect_output(
                 at_limit, self.installation
             ),
             (False, at_limit),
         )
+        _, direct = self.catalog_inspect_output()
+        within_limit = "{}" * (attempts - 1) + direct
+        self.assertEqual(
+            self.runtime._filter_catalog_inspect_output(
+                within_limit, self.installation
+            ),
+            (True, "{}" * (attempts - 1)),
+        )
         with self.assertRaises(
             self.runtime.TranscriptAdapterError
         ) as saturated:
             self.runtime._filter_catalog_inspect_output(
-                token * (attempts + 1), self.installation
+                "{}" * (attempts + 1), self.installation
             )
         self.assertEqual(
             saturated.exception.code, "unsupported_transcript"
         )
         self.assertFalse(saturated.exception.retryable)
+        with self.assertRaises(
+            self.runtime.TranscriptAdapterError
+        ) as artifact_after_limit:
+            self.runtime._filter_catalog_inspect_output(
+                "{}" * attempts + direct, self.installation
+            )
+        self.assertEqual(
+            artifact_after_limit.exception.code,
+            "unsupported_transcript",
+        )
+        self.assertFalse(artifact_after_limit.exception.retryable)
+
+    def test_catalog_filter_nested_scan_bounds_fail_closed(self) -> None:
+        node_limit = (
+            self.runtime.CATALOG_INSPECT_NESTED_SCAN_MAX_NODES
+        )
+        at_node_limit = self.runtime.canonical_json_bytes(
+            [0] * node_limit
+        ).decode()
+        self.assertEqual(
+            self.runtime._filter_catalog_inspect_output(
+                at_node_limit, self.installation
+            ),
+            (False, at_node_limit),
+        )
+        over_node_limit = self.runtime.canonical_json_bytes(
+            [0] * (node_limit + 1)
+        ).decode()
+        with self.assertRaises(
+            self.runtime.TranscriptAdapterError
+        ) as nodes_rejected:
+            self.runtime._filter_catalog_inspect_output(
+                over_node_limit, self.installation
+            )
+        self.assertEqual(
+            nodes_rejected.exception.code,
+            "unsupported_transcript",
+        )
+        self.assertFalse(nodes_rejected.exception.retryable)
+
+        nested: object = 0
+        for _ in range(
+            self.runtime.CATALOG_INSPECT_NESTED_SCAN_MAX_DEPTH + 1
+        ):
+            nested = [nested]
+        over_depth_limit = self.runtime.canonical_json_bytes(
+            nested
+        ).decode()
+        with self.assertRaises(
+            self.runtime.TranscriptAdapterError
+        ) as depth_rejected:
+            self.runtime._filter_catalog_inspect_output(
+                over_depth_limit, self.installation
+            )
+        self.assertEqual(
+            depth_rejected.exception.code,
+            "unsupported_transcript",
+        )
+        self.assertFalse(depth_rejected.exception.retryable)
+
+        decoder_recursion = "[" * 2_000 + "0" + "]" * 2_000
+        with self.assertRaises(
+            self.runtime.TranscriptAdapterError
+        ) as recursion_rejected:
+            self.runtime._filter_catalog_inspect_output(
+                decoder_recursion, self.installation
+            )
+        self.assertEqual(
+            recursion_rejected.exception.code,
+            "unsupported_transcript",
+        )
+        self.assertFalse(recursion_rejected.exception.retryable)
 
     def test_response_items_export_textual_tool_session(self) -> None:
         session_id = "response-item-tool-session"
@@ -15280,13 +15485,17 @@ class ReviewDocumentationTests(unittest.TestCase):
             "inspected body for repeated targets",
             "target_inspection_proofs",
             "non-secret owner digest used in that proof",
-            "exact authenticated catalog-inspect response is excluded "
+            "exact authenticated top-level catalog-inspect response is excluded "
             "from later transcript export",
             "preserves unrelated prefix and sibling fragment text",
-            "removes every authenticated catalog-inspect artifact span",
-            "scans at most 32 canonical start candidates",
-            "malformed, noncanonical, or cryptographically invalid "
-            "lookalike remains ordinary tool output",
+            "removes every authenticated top-level catalog-inspect container",
+            "makes at most 32 top-level object/array parse attempts",
+            "authenticated nested catalog response fails closed as "
+            "unsupported transcript",
+            "nested tampered or lookalike values remain ordinary tool output",
+            "balanced invalid outer without a catalog start remains ordinary "
+            "tool output",
+            "Nested inspection is bounded to 4096 nodes and 64 levels",
             "top-level result keys are exactly `schema_version`, "
             "`contract_digest`, `target_inspection_proofs`, and `sessions`",
             "rejects any inspection proof copied into candidate or "
@@ -15355,13 +15564,17 @@ class ReviewDocumentationTests(unittest.TestCase):
             "inspected body for repeated targets",
             "target_inspection_proofs",
             "non-secret owner digest used in that proof",
-            "exact authenticated catalog-inspect response is excluded "
+            "exact authenticated top-level catalog-inspect response is excluded "
             "from later transcript export",
             "preserves unrelated prefix and sibling fragment text",
-            "removes every authenticated catalog-inspect artifact span",
-            "scans at most 32 canonical start candidates",
-            "malformed, noncanonical, or cryptographically invalid "
-            "lookalike remains ordinary tool output",
+            "removes every authenticated top-level catalog-inspect container",
+            "makes at most 32 top-level object/array parse attempts",
+            "authenticated nested catalog response fails closed as "
+            "unsupported transcript",
+            "nested tampered or lookalike values remain ordinary tool output",
+            "balanced invalid outer without a catalog start remains ordinary "
+            "tool output",
+            "Nested inspection is bounded to 4096 nodes and 64 levels",
             "top-level result keys are exactly `schema_version`, "
             "`contract_digest`, `target_inspection_proofs`, and `sessions`",
             "rejects any inspection proof copied into candidate or "

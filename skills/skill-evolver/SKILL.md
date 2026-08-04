@@ -45,9 +45,9 @@ the exact installation path, decimal batch ID, raw owner token, and target ident
 then request approval for that exact read and installation data root. Never
 inspect another path under that approval.
 The response also returns the non-secret owner digest used in that proof.
-An exact authenticated catalog-inspect response is excluded from later transcript export; a malformed, noncanonical, or cryptographically invalid lookalike remains ordinary tool output.
-The filter removes only the authenticated artifact and preserves unrelated prefix and sibling fragment text with normal redaction, eligibility, and scope.
-The bounded all-occurrence filter removes every authenticated catalog-inspect artifact span and scans at most 32 canonical start candidates; saturation fails closed as unsupported transcript.
+An exact authenticated top-level catalog-inspect response is excluded from later transcript export; a noncanonical top-level or cryptographically invalid lookalike remains ordinary tool output.
+The filter removes only an authenticated top-level container and preserves unrelated prefix and sibling fragment text with normal redaction, eligibility, and scope.
+It removes every authenticated top-level catalog-inspect container and makes at most 32 top-level object/array parse attempts. An authenticated nested catalog response fails closed as unsupported transcript instead of being exported or surgically deleted; nested tampered or lookalike values remain ordinary tool output. A balanced invalid outer without a catalog start remains ordinary tool output, while a balanced-invalid, mismatched, or unclosed outer containing that start fails closed. Nested inspection is bounded to 4096 nodes and 64 levels, with saturation failing closed.
 
 ## Approval boundaries
 
