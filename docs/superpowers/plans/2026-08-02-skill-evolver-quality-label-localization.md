@@ -66,6 +66,20 @@ user's language while fingerprint-bearing fields remain canonical English.
 - `.codex-plugin/plugin.json` and
   `skills/skill-evolver/references/runtime.json`: eventual 0.1.4 version.
 
+## Execution Status (reconciled 2026-08-04)
+
+- Task 1 is complete in `e520b8d`; the Korean-default/English-optional label
+  terminal, immutable copy, renderer, exact attestation grammar, tests, and
+  documentation are present.
+- Task 2 is complete in `5ee8d29` with the review correction in `68f8660`;
+  candidate authoring language is independent of the strong-evidence record,
+  while fingerprint-bearing fields remain canonical.
+- The complete suite last passed at this source state with 476 tests and 3
+  expected skips. Review and quality focused suites passed 116 and 82 tests.
+- Task 3 has not started its release mutation. The unchanged installed 0.1.3
+  runtime still reports Q-003 `AWAITING_LABELS` with missing `C-001`; the
+  user-only external-TTY label and terminal PASS remain the hard gate.
+
 ---
 
 ### Task 1: Localized user-only quality-label terminal
@@ -91,7 +105,7 @@ user's language while fingerprint-bearing fields remain canonical English.
 - Preserves: stored label schema, exact four-line input grammar, and existing
   transaction/CAS behavior.
 
-- [ ] **Step 1: Write failing parser and immutable-copy tests**
+- [x] **Step 1: Write failing parser and immutable-copy tests**
 
 Add these methods to the existing quality-label test class in
 `skills/skill-evolver/tests/test_quality_gate.py`:
@@ -182,7 +196,7 @@ def test_quality_label_copy_is_strict_and_read_only(self) -> None:
         self.runtime.quality_label_copy("ko")["title"] = "changed"
 ```
 
-- [ ] **Step 2: Run the focused module and verify RED**
+- [x] **Step 2: Run the focused module and verify RED**
 
 Run:
 
@@ -195,7 +209,7 @@ Run:
 Expected: FAIL because parsed arguments have no `locale` and
 `quality_label_copy` does not exist.
 
-- [ ] **Step 3: Add the immutable copy and parser option**
+- [x] **Step 3: Add the immutable copy and parser option**
 
 In `skills/skill-evolver/scripts/evolver.py`, import:
 
@@ -286,14 +300,14 @@ quality_label.add_argument(
 )
 ```
 
-- [ ] **Step 4: Run the focused module and verify the new parser tests pass**
+- [x] **Step 4: Run the focused module and verify the new parser tests pass**
 
 Run the Step 2 command.
 
 Expected: the parser/copy tests pass and the pre-existing handler contract
 still passes.
 
-- [ ] **Step 5: Write failing Korean handler and English renderer tests**
+- [x] **Step 5: Write failing Korean handler and English renderer tests**
 
 In `test_label_handler_accepts_fake_tty_attestation`, replace the two-payload
 assertions after `args.handler(args)` with:
@@ -452,14 +466,14 @@ def test_label_handler_accepts_explicit_english_locale(self) -> None:
     self.assertNotIn("locale", payloads[0])
 ```
 
-- [ ] **Step 6: Run the focused module and verify RED**
+- [x] **Step 6: Run the focused module and verify RED**
 
 Run the Step 2 command.
 
 Expected: FAIL because `render_quality_label_summary` does not exist and the
 handler still emits the preliminary JSON plus English prompts.
 
-- [ ] **Step 7: Implement the pure renderer**
+- [x] **Step 7: Implement the pure renderer**
 
 Add beside `_read_quality_tty_line`:
 
@@ -493,7 +507,7 @@ def render_quality_label_summary(
     )
 ```
 
-- [ ] **Step 8: Replace preliminary JSON and fixed English prompts**
+- [x] **Step 8: Replace preliminary JSON and fixed English prompts**
 
 In `cmd_quality_label`, replace the preliminary `write_json_stdout(...)` and
 answer/confirmation block with:
@@ -538,7 +552,7 @@ the authorities in their existing order. Immediately before the existing final
 sys.stdout.flush()
 ```
 
-- [ ] **Step 9: Run focused tests and inspect help**
+- [x] **Step 9: Run focused tests and inspect help**
 
 Run:
 
@@ -553,7 +567,7 @@ Run:
 Expected: tests report `OK`; help shows `[--locale {ko,en}]` and no judgment
 flags.
 
-- [ ] **Step 10: Document and commit Task 1**
+- [x] **Step 10: Document and commit Task 1**
 
 Add beside the existing user-only `quality-label` wording in
 `skills/skill-evolver/SKILL.md` and `README.md`:
@@ -608,7 +622,7 @@ listed paths enter the commit.
 - Preserves: canonical enums and target identity, canonical-English
   `target_locator`/`proposal_intent`, and the current SHA-256 field set.
 
-- [ ] **Step 1: Write failing policy and instruction assertions**
+- [x] **Step 1: Write failing policy and instruction assertions**
 
 Extend
 `ReviewRuntimeContractTests.test_fixed_runtime_reference_and_policy_are_bounded`
@@ -655,7 +669,7 @@ for expected in (
     self.assertIn(expected, instructions)
 ```
 
-- [ ] **Step 2: Pin the fingerprint field set and algorithm**
+- [x] **Step 2: Pin the fingerprint field set and algorithm**
 
 Extend
 `CandidateIdentityTests.test_fingerprint_is_nfkc_casefolded_and_field_bound`
@@ -683,7 +697,7 @@ for human_field in (
     self.assertNotIn(human_field, fingerprint_source)
 ```
 
-- [ ] **Step 3: Run Review tests and verify RED**
+- [x] **Step 3: Run Review tests and verify RED**
 
 Run:
 
@@ -695,7 +709,7 @@ Run:
 
 Expected: language-policy assertions fail; fingerprint assertions pass.
 
-- [ ] **Step 4: Add exact language rules to the policy**
+- [x] **Step 4: Add exact language rules to the policy**
 
 Insert before the final mutation prohibition in
 `skills/skill-evolver/references/improvement-policy.md`:
@@ -715,7 +729,7 @@ participate in `candidate_fingerprint()` and must not split equivalent
 improvements by display language.
 ```
 
-- [ ] **Step 5: Add the bounded rules to fixed result instructions**
+- [x] **Step 5: Add the bounded rules to fixed result instructions**
 
 Append these strings to the `instructions` list in
 `REVIEW_RESULT_SCHEMA_INSTRUCTIONS`:
@@ -750,7 +764,7 @@ Append these strings to the `instructions` list in
 
 Do not alter `result_shape`, candidate validation, or runtime translation.
 
-- [ ] **Step 6: Run Review and quality tests**
+- [x] **Step 6: Run Review and quality tests**
 
 Run:
 
@@ -766,7 +780,7 @@ Run:
 Expected: both modules report `OK`. Existing candidate `C-001` remains valid
 with its already sealed English subject.
 
-- [ ] **Step 7: Document authoring language versus display locale**
+- [x] **Step 7: Document authoring language versus display locale**
 
 Add to the Review sections of `skills/skill-evolver/SKILL.md` and `README.md`:
 
@@ -782,7 +796,7 @@ independent of the later `quality-label --locale` display option and does not
 rewrite existing candidates.
 ```
 
-- [ ] **Step 8: Run complete verification**
+- [x] **Step 8: Run complete verification**
 
 Run:
 
@@ -806,7 +820,7 @@ Expected: full suite reports `OK` with only expected skips; compile and JSON
 checks succeed; privacy scan shows only deliberate security-policy wording and
 no credential value; diff check is silent.
 
-- [ ] **Step 9: Commit Task 2**
+- [x] **Step 9: Commit Task 2**
 
 ```bash
 git add \
@@ -838,7 +852,7 @@ git commit -m "feat(skill-evolver): preserve user language in candidates"
 - Gate: do not start while `quality-status` is `AWAITING_LABELS`,
   `COLLECTING`, or a non-PASS terminal decision.
 
-- [ ] **Step 1: Check Q-003 read-only**
+- [x] **Step 1: Check Q-003 read-only**
 
 Run:
 
@@ -854,6 +868,10 @@ Expected before the user finishes `C-001`: JSON contains
 there. The agent does not run `quality-label`. Resume only after the user
 completes the external-terminal attestation and the existing Phase 5 workflow
 commits a Q-003 terminal report with decision `PASS`.
+
+Rechecked 2026-08-04 against the unchanged installed 0.1.3 runtime: Q-003 is
+still `AWAITING_LABELS`, `attested_label_count=0`, and `missing_labels` is
+exactly `["C-001"]`. No Task 3 release file has been changed.
 
 - [ ] **Step 2: Write failing 0.1.4 package assertions**
 

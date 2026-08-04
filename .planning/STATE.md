@@ -27,9 +27,9 @@ transcript adapter. `Q-002` terminalized `INVALID` for provenance drift.
 `Q-003` is sealed with 12 distinct real sessions and candidate `C-001`; its
 read-only status is `AWAITING_LABELS`. Phase 6 remains blocked until the user
 labels `C-001` in an external TTY and the quality gate returns terminal `PASS`.
-Last activity: 2026-08-02 — revalidated `Q-003` status, confirmed recurring
-Desktop `unknown conversation` hook logs are internal-agent renderer routing
-rather than Hook execution failures, and completed read-only Phase 6 preflight
+Last activity: 2026-08-04 — reconciled the localized-label implementation
+commits and plan checkboxes, then revalidated unchanged installed `0.1.3` and
+Q-003 `AWAITING_LABELS` with `attested_label_count=0`
 
 Progress: [████░░░░░░] 36%
 
@@ -53,7 +53,9 @@ Progress: [████░░░░░░] 36%
 Phase 4 are PASS; installed `0.1.3` has real Desktop capture/import and
 current transcript-adapter proof. Phase 5 now has a complete sealed `Q-003`
 sample and remains gated only by the user-owned `C-001` label and terminal
-quality decision
+quality decision. The source branch already contains Korean-default label
+display and direct-user-language candidate authoring in `e520b8d`, `5ee8d29`,
+and `68f8660`, but release/install remains intentionally at `0.1.3` until PASS
 
 ## Accumulated Context
 
@@ -104,6 +106,8 @@ quality decision
 - Have the user attest sealed candidate `C-001` in an external terminal.
 - Run the separately approved terminal quality gate and commit its
   content-addressed PASS report if every threshold passes.
+- After that PASS, release and install `0.1.4`, then verify source/cache parity
+  and localized CLI exposure without fabricating another label.
 - Refresh the Phase 6 runner plan against Codex `0.146.0` and the final
   content-addressed `Q-003` report only after Phase 5 PASS.
 - Keep Runner, Prepare, Evaluate and Apply disabled until `QUALITY-01` passes.
@@ -132,7 +136,7 @@ quality decision
 
 ## Session Continuity
 
-Last session: 2026-08-02
+Last session: 2026-08-04
 Stopped at: `0.1.3` and sealed `Q-003` revalidated; waiting for the user-only
 external-terminal label for `C-001`, then a separately approved quality gate
 Resume file: None
