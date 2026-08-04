@@ -2601,7 +2601,7 @@ class FrozenTranscriptBoundedReadTests(FrozenTranscriptTestCase):
                         "direct-or-final-output-suffix-v1-strict-owner-hmac"
                     ),
                     "catalog_inspect_tool_output": (
-                        "direct-or-final-output-suffix-v1-strict-owner-digest-hmac"
+                        "exact-artifact-filter-v2-owner-digest-hmac-preserve-siblings"
                     ),
                     "structured_text_security": (
                         "concatenated-scan-before-fragment-export-v1"
@@ -2677,11 +2677,13 @@ class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
         )
         payload, direct = self.catalog_inspect_output()
         split_at = direct.index('"inspection_proof"') + 8
+        prefix_owner_token = "e" * 64
+        wrapped_prefix = (
+            "sibling tool evidence "
+            f"owner_token={prefix_owner_token}"
+        )
         wrapped = (
-            "Chunk ID: catalog\n"
-            "Wall time: 0.1 seconds\n"
-            "Process exited with code 0\n"
-            "Output:\n"
+            f"{wrapped_prefix}\nOutput:\n"
             f"{direct}\n"
         )
         records = [
@@ -2735,7 +2737,19 @@ class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
             connection.close()
         self.assertEqual(
             [record.text for record in exported.records],
-            ["ordinary tool evidence"],
+            [
+                "sibling tool evidence "
+                "owner_token=[REDACTED:owner-token]",
+                "ordinary tool evidence",
+            ],
+        )
+        self.assertEqual(
+            [record.evidence_eligible for record in exported.records],
+            [True, True],
+        )
+        self.assertEqual(
+            [record.scope for record in exported.records],
+            ["delta", "delta"],
         )
         exported_text = "\n".join(
             record.text for record in exported.records
@@ -2784,7 +2798,35 @@ class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
             )
             for output in outputs
         ]
-        records.append(
+        connection, _, frozen = self.capture_and_claim(
+            [header, *records],
+            reviewed_boundary=len(header),
+            session_id=session_id,
+        )
+        try:
+            exported = self.runtime.read_frozen_transcript(
+                self.installation,
+                frozen,
+                self.config,
+                self.review,
+            )
+        finally:
+            connection.close()
+        self.assertEqual(
+            [record.text for record in exported.records], outputs
+        )
+
+    def test_catalog_inspect_fragments_preserve_siblings_in_order(
+        self,
+    ) -> None:
+        session_id = "catalog-inspect-fragment-siblings"
+        header = (
+            b'{"type":"session_meta","payload":{"session_id":"'
+            + session_id.encode("utf-8")
+            + b'"}}\n'
+        )
+        payload, direct = self.catalog_inspect_output()
+        records = [
             self.response_item(
                 {
                     "type": "custom_tool_call_output",
@@ -2792,12 +2834,24 @@ class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
                         {"type": "input_text", "text": direct},
                         {
                             "type": "input_text",
-                            "text": "sibling tool evidence",
+                            "text": "sibling after artifact",
                         },
                     ],
                 }
-            )
-        )
+            ),
+            self.response_item(
+                {
+                    "type": "custom_tool_call_output",
+                    "output": [
+                        {
+                            "type": "input_text",
+                            "text": "sibling before artifact",
+                        },
+                        {"type": "input_text", "text": direct},
+                    ],
+                }
+            ),
+        ]
         connection, _, frozen = self.capture_and_claim(
             [header, *records],
             reviewed_boundary=len(header),
@@ -2814,7 +2868,21 @@ class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
             connection.close()
         self.assertEqual(
             [record.text for record in exported.records],
-            [*outputs, direct, "sibling tool evidence"],
+            ["sibling after artifact", "sibling before artifact"],
+        )
+        self.assertTrue(
+            all(
+                record.evidence_eligible
+                and record.scope == "delta"
+                for record in exported.records
+            )
+        )
+        exported_text = "\n".join(
+            record.text for record in exported.records
+        )
+        self.assertNotIn(str(payload["content"]), exported_text)
+        self.assertNotIn(
+            str(payload["inspection_proof"]), exported_text
         )
 
     def test_catalog_inspect_exclusion_checks_shape_types_and_bounds(
@@ -2831,10 +2899,22 @@ class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
         payload, maximum = self.catalog_inspect_output(
             content=maximum_content
         )
-        self.assertTrue(
-            self.runtime._contains_catalog_inspect_output(
+        self.assertEqual(
+            self.runtime._filter_catalog_inspect_output(
                 maximum, self.installation
-            )
+            ),
+            (True, ""),
+        )
+        _, direct = self.catalog_inspect_output()
+        large_prefix = "x" * (
+            self.runtime.CATALOG_INSPECT_RESPONSE_MAX_BYTES + 1
+        )
+        self.assertEqual(
+            self.runtime._filter_catalog_inspect_output(
+                f"{large_prefix}\nOutput:\n{direct}",
+                self.installation,
+            ),
+            (True, large_prefix),
         )
 
         extra_key = copy.deepcopy(payload)
@@ -2859,10 +2939,11 @@ class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
         }
         for label, value in variants.items():
             with self.subTest(label=label):
-                self.assertFalse(
-                    self.runtime._contains_catalog_inspect_output(
+                self.assertEqual(
+                    self.runtime._filter_catalog_inspect_output(
                         value, self.installation
-                    )
+                    ),
+                    (False, value),
                 )
 
     def test_response_items_export_textual_tool_session(self) -> None:
@@ -15058,6 +15139,7 @@ class ReviewDocumentationTests(unittest.TestCase):
             "non-secret owner digest used in that proof",
             "exact authenticated catalog-inspect response is excluded "
             "from later transcript export",
+            "preserves unrelated prefix and sibling fragment text",
             "malformed, noncanonical, or cryptographically invalid "
             "lookalike remains ordinary tool output",
             "top-level result keys are exactly `schema_version`, "
@@ -15130,6 +15212,7 @@ class ReviewDocumentationTests(unittest.TestCase):
             "non-secret owner digest used in that proof",
             "exact authenticated catalog-inspect response is excluded "
             "from later transcript export",
+            "preserves unrelated prefix and sibling fragment text",
             "malformed, noncanonical, or cryptographically invalid "
             "lookalike remains ordinary tool output",
             "top-level result keys are exactly `schema_version`, "

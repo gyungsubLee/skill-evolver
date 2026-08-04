@@ -149,11 +149,14 @@ model input and the human-operated skill workflow cannot diverge.
   candidate, evidence, audit, or schema state. Every validated proof is also a
   persisted-text deny marker, so copying it into candidate, classification, or
   evidence text fails before SQLite writes.
-- The transcript adapter excludes a direct, final `Output:`-wrapped, or
-  fragmented `catalog-inspect` tool response only when it has the exact
+- The transcript adapter filters a direct, final `Output:`-wrapped, or
+  fragmented `catalog-inspect` artifact only when it has the exact
   canonical seven-key shape (`schema_version`, `batch_id`, `owner_digest`,
   `target_identity`, `skill_sha256`, `inspection_proof`, `content`), bounded
   UTF-8 content, matching content SHA-256, and a valid installation HMAC.
+  Only that artifact is removed; unrelated prefix and sibling fragment text is
+  preserved with normal owner-token redaction, evidence eligibility, and
+  scope.
   Tampered content/proofs, noncanonical JSON, extra or missing keys, and
   general lookalikes remain ordinary tool output under the existing redaction
   and transcript limits. This changes the transcript adapter contract/digest
@@ -188,9 +191,10 @@ the changed contract:
 6. A proof copied into any persisted candidate/evidence text rotates the
    invalid result without candidate persistence or proof leakage, while a
    normal valid result still completes.
-7. Exact authenticated direct, wrapped, and fragmented catalog outputs are
-   excluded from transcript export; tampered, noncanonical, and general
-   lookalikes remain ordinary tool output.
+7. Exact authenticated direct, wrapped, and fragmented catalog artifacts are
+   removed from transcript export while unrelated prefix and sibling fragments
+   remain eligible; tampered, noncanonical, and general lookalikes remain
+   ordinary tool output.
 8. A one-candidate quality fixture labeled `false/false/false` terminalizes as
    `FAIL`, preserves the exact thresholds, and returns
    `open_changed_quality_epoch`.

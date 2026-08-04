@@ -2188,7 +2188,7 @@ def transcript_adapter_contract(
                 "direct-or-final-output-suffix-v1-strict-owner-hmac"
             ),
             "catalog_inspect_tool_output": (
-                "direct-or-final-output-suffix-v1-strict-owner-digest-hmac"
+                "exact-artifact-filter-v2-owner-digest-hmac-preserve-siblings"
             ),
             "structured_text_security": (
                 "concatenated-scan-before-fragment-export-v1"
@@ -2543,30 +2543,24 @@ def _parse_catalog_inspect_output_json(
     return parsed
 
 
-def _contains_catalog_inspect_output(
+def _filter_catalog_inspect_output(
     value: str,
     installation: Installation,
-) -> bool:
-    try:
-        if (
-            len(value.encode("utf-8"))
-            > CATALOG_INSPECT_RESPONSE_MAX_BYTES
-        ):
-            return False
-    except UnicodeEncodeError:
-        return False
+) -> tuple[bool, str]:
     parsed = _parse_catalog_inspect_output_json(value)
-    if parsed is None:
-        _prefix, marker, candidate = value.rpartition("\nOutput:\n")
-        if not marker:
-            return False
-        parsed = _parse_catalog_inspect_output_json(candidate)
-    return (
-        parsed is not None
-        and _is_exact_catalog_inspect_output(
-            parsed, installation
-        )
-    )
+    if parsed is not None and _is_exact_catalog_inspect_output(
+        parsed, installation
+    ):
+        return True, ""
+    prefix, marker, candidate = value.rpartition("\nOutput:\n")
+    if not marker:
+        return False, value
+    parsed = _parse_catalog_inspect_output_json(candidate)
+    if parsed is not None and _is_exact_catalog_inspect_output(
+        parsed, installation
+    ):
+        return True, prefix
+    return False, value
 
 
 def _canonical_transcript_records(
@@ -2747,10 +2741,28 @@ def _classify_transcript_object(
                 output, installation
             )
             for output in (*raw_outputs, combined_raw)
-        ) or _contains_catalog_inspect_output(
-            combined_raw, installation
         ):
             return []
+        catalog_matched, catalog_preserved = (
+            _filter_catalog_inspect_output(
+                combined_raw, installation
+            )
+        )
+        if catalog_matched:
+            raw_outputs = (
+                [catalog_preserved] if catalog_preserved else []
+            )
+        else:
+            filtered_outputs: list[str] = []
+            for output in raw_outputs:
+                matched, preserved = (
+                    _filter_catalog_inspect_output(
+                        output, installation
+                    )
+                )
+                if not matched or preserved:
+                    filtered_outputs.append(preserved)
+            raw_outputs = filtered_outputs
         outputs = [
             _redact_transcript_record_text(output)
             for output in raw_outputs

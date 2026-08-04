@@ -30,11 +30,12 @@ Q-004 open.
 > correction supersedes the earlier “Review result shape unchanged” assumption
 > without adding database state or a transcript invocation schema.
 > The response now also carries the non-secret `owner_digest`; the transcript
-> adapter excludes direct, final `Output:`-wrapped, or fragmented responses
-> only when the exact canonical seven-key payload, content digest, and HMAC all
-> validate. Proofs copied into persisted candidate/evidence text fail before
-> SQLite writes. Malformed or unauthenticated lookalikes remain ordinary tool
-> output.
+> adapter filters direct, final `Output:`-wrapped, or fragmented artifacts only
+> when the exact canonical seven-key payload, content digest, and HMAC all
+> validate. It removes only the authenticated artifact and preserves unrelated
+> prefix and sibling fragments with their normal redaction and evidence scope.
+> Proofs copied into persisted candidate/evidence text fail before SQLite
+> writes. Malformed or unauthenticated lookalikes remain ordinary tool output.
 
 **Tech Stack:** `/usr/bin/python3` 3.9+, Python standard library, SQLite
 schema v1, `unittest`, local Codex plugin marketplace, Git worktree.

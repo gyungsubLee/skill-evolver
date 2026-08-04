@@ -46,6 +46,7 @@ then request approval for that exact read and installation data root. Never
 inspect another path under that approval.
 The response also returns the non-secret owner digest used in that proof.
 An exact authenticated catalog-inspect response is excluded from later transcript export; a malformed, noncanonical, or cryptographically invalid lookalike remains ordinary tool output.
+The filter removes only the authenticated artifact and preserves unrelated prefix and sibling fragment text with normal redaction, eligibility, and scope.
 
 ## Approval boundaries
 
