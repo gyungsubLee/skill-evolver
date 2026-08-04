@@ -62,6 +62,8 @@ CATALOG_INSPECT_RESPONSE_MAX_BYTES = (
     * 6
     + 8_192
 )
+CATALOG_INSPECT_SCAN_ATTEMPTS_MAX = 32
+CATALOG_INSPECT_CANONICAL_START = '{"batch_id":'
 CATALOG_DISPLAY_NAME_MAX_BYTES = 128
 CATALOG_DESCRIPTION_MAX_BYTES = 384
 RUNTIME_REFERENCE_MAX_BYTES = 8_192
@@ -2188,7 +2190,10 @@ def transcript_adapter_contract(
                 "direct-or-final-output-suffix-v1-strict-owner-hmac"
             ),
             "catalog_inspect_tool_output": (
-                "exact-artifact-filter-v2-owner-digest-hmac-preserve-siblings"
+                "all-authenticated-span-filter-v3-owner-digest-hmac-preserve-siblings"
+            ),
+            "catalog_inspect_scan_attempts": (
+                CATALOG_INSPECT_SCAN_ATTEMPTS_MAX
             ),
             "structured_text_security": (
                 "concatenated-scan-before-fragment-export-v1"
@@ -2524,43 +2529,64 @@ def _is_exact_catalog_inspect_output(
     )
 
 
-def _parse_catalog_inspect_output_json(
-    value: str,
-) -> Optional[object]:
-    candidate = value[:-1] if value.endswith("\n") else value
-    if not candidate or candidate.endswith("\n"):
-        return None
-    try:
-        parsed = _load_bounded_json(
-            candidate,
-            CATALOG_INSPECT_RESPONSE_MAX_BYTES,
-            "invalid_catalog_inspect_output",
-        )
-        if canonical_json_bytes(parsed).decode("utf-8") != candidate:
-            return None
-    except (RecursionError, TypeError, UnicodeError, ValueError):
-        return None
-    return parsed
-
-
 def _filter_catalog_inspect_output(
     value: str,
     installation: Installation,
 ) -> tuple[bool, str]:
-    parsed = _parse_catalog_inspect_output_json(value)
-    if parsed is not None and _is_exact_catalog_inspect_output(
-        parsed, installation
-    ):
-        return True, ""
-    prefix, marker, candidate = value.rpartition("\nOutput:\n")
-    if not marker:
+    decoder = json.JSONDecoder()
+    marker = "\nOutput:\n"
+    spans: list[tuple[int, int]] = []
+    attempts = 0
+    cursor = 0
+    while True:
+        start = value.find(
+            CATALOG_INSPECT_CANONICAL_START, cursor
+        )
+        if start < 0:
+            break
+        attempts += 1
+        if attempts > CATALOG_INSPECT_SCAN_ATTEMPTS_MAX:
+            raise _transcript_error("unsupported_transcript")
+        next_cursor = start + len(
+            CATALOG_INSPECT_CANONICAL_START
+        )
+        try:
+            parsed, candidate_end = decoder.raw_decode(
+                value, start
+            )
+            candidate = value[start:candidate_end]
+            encoded = candidate.encode("utf-8")
+            canonical = canonical_json_bytes(parsed).decode("utf-8")
+        except (RecursionError, TypeError, UnicodeError, ValueError):
+            cursor = next_cursor
+            continue
+        if (
+            len(encoded) > CATALOG_INSPECT_RESPONSE_MAX_BYTES
+            or canonical != candidate
+            or not _is_exact_catalog_inspect_output(
+                parsed, installation
+            )
+        ):
+            cursor = candidate_end
+            continue
+        span_start = start
+        marker_start = start - len(marker)
+        if (
+            marker_start >= 0
+            and value[marker_start:start] == marker
+        ):
+            span_start = marker_start
+        spans.append((span_start, candidate_end))
+        cursor = candidate_end
+    if not spans:
         return False, value
-    parsed = _parse_catalog_inspect_output_json(candidate)
-    if parsed is not None and _is_exact_catalog_inspect_output(
-        parsed, installation
-    ):
-        return True, prefix
-    return False, value
+    pieces: list[str] = []
+    cursor = 0
+    for span_start, span_end in spans:
+        pieces.append(value[cursor:span_start])
+        cursor = span_end
+    pieces.append(value[cursor:])
+    return True, "".join(pieces)
 
 
 def _canonical_transcript_records(
@@ -2750,19 +2776,10 @@ def _classify_transcript_object(
         )
         if catalog_matched:
             raw_outputs = (
-                [catalog_preserved] if catalog_preserved else []
+                [catalog_preserved]
+                if catalog_preserved.strip()
+                else []
             )
-        else:
-            filtered_outputs: list[str] = []
-            for output in raw_outputs:
-                matched, preserved = (
-                    _filter_catalog_inspect_output(
-                        output, installation
-                    )
-                )
-                if not matched or preserved:
-                    filtered_outputs.append(preserved)
-            raw_outputs = filtered_outputs
         outputs = [
             _redact_transcript_record_text(output)
             for output in raw_outputs

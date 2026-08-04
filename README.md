@@ -156,6 +156,7 @@ target identity, and installation data root require a separate read approval.
 The response also returns the non-secret owner digest used in that proof.
 An exact authenticated catalog-inspect response is excluded from later transcript export; a malformed, noncanonical, or cryptographically invalid lookalike remains ordinary tool output.
 The filter removes only the authenticated artifact and preserves unrelated prefix and sibling fragment text with normal redaction, eligibility, and scope.
+The bounded all-occurrence filter removes every authenticated catalog-inspect artifact span and scans at most 32 canonical start candidates; saturation fails closed as unsupported transcript.
 
 A strong signal alone never authorizes target selection. Never infer target use from catalog similarity. Before any candidate, request one separately
 approved catalog-inspect per distinct proposed target, with at most three distinct candidate targets per batch, and reuse the inspected body for repeated targets. If use or causality is unclear, the exact target read is not

@@ -47,6 +47,7 @@ inspect another path under that approval.
 The response also returns the non-secret owner digest used in that proof.
 An exact authenticated catalog-inspect response is excluded from later transcript export; a malformed, noncanonical, or cryptographically invalid lookalike remains ordinary tool output.
 The filter removes only the authenticated artifact and preserves unrelated prefix and sibling fragment text with normal redaction, eligibility, and scope.
+The bounded all-occurrence filter removes every authenticated catalog-inspect artifact span and scans at most 32 canonical start candidates; saturation fails closed as unsupported transcript.
 
 ## Approval boundaries
 

@@ -30,10 +30,13 @@ Q-004 open.
 > correction supersedes the earlier “Review result shape unchanged” assumption
 > without adding database state or a transcript invocation schema.
 > The response now also carries the non-secret `owner_digest`; the transcript
-> adapter filters direct, final `Output:`-wrapped, or fragmented artifacts only
-> when the exact canonical seven-key payload, content digest, and HMAC all
-> validate. It removes only the authenticated artifact and preserves unrelated
-> prefix and sibling fragments with their normal redaction and evidence scope.
+> adapter scans the combined tool output and filters every direct, wrapped,
+> fragmented, or repeated artifact only when the exact canonical seven-key
+> payload, content digest, and HMAC all validate. It removes only authenticated
+> spans and their immediately preceding `Output:` markers, preserving all
+> unmatched prefix, between-artifact, suffix, and sibling text byte-for-byte
+> with normal redaction and evidence scope. Scanning is capped at 32 canonical
+> start candidates and saturation fails closed as unsupported transcript.
 > Proofs copied into persisted candidate/evidence text fail before SQLite
 > writes. Malformed or unauthenticated lookalikes remain ordinary tool output.
 

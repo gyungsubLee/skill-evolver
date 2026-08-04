@@ -2601,8 +2601,9 @@ class FrozenTranscriptBoundedReadTests(FrozenTranscriptTestCase):
                         "direct-or-final-output-suffix-v1-strict-owner-hmac"
                     ),
                     "catalog_inspect_tool_output": (
-                        "exact-artifact-filter-v2-owner-digest-hmac-preserve-siblings"
+                        "all-authenticated-span-filter-v3-owner-digest-hmac-preserve-siblings"
                     ),
+                    "catalog_inspect_scan_attempts": 32,
                     "structured_text_security": (
                         "concatenated-scan-before-fragment-export-v1"
                     ),
@@ -2739,7 +2740,7 @@ class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
             [record.text for record in exported.records],
             [
                 "sibling tool evidence "
-                "owner_token=[REDACTED:owner-token]",
+                "owner_token=[REDACTED:owner-token]\n",
                 "ordinary tool evidence",
             ],
         )
@@ -2885,6 +2886,65 @@ class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
             str(payload["inspection_proof"]), exported_text
         )
 
+    def test_catalog_filter_removes_every_authenticated_artifact(
+        self,
+    ) -> None:
+        session_id = "catalog-inspect-all-artifacts"
+        header = (
+            b'{"type":"session_meta","payload":{"session_id":"'
+            + session_id.encode("utf-8")
+            + b'"}}\n'
+        )
+        payload, direct = self.catalog_inspect_output()
+        record = self.response_item(
+            {
+                "type": "custom_tool_call_output",
+                "output": [
+                    {"type": "input_text", "text": direct},
+                    {
+                        "type": "input_text",
+                        "text": "sibling before final\nOutput:\n",
+                    },
+                    {"type": "input_text", "text": direct},
+                ],
+            }
+        )
+        connection, _, frozen = self.capture_and_claim(
+            [header, record],
+            reviewed_boundary=len(header),
+            session_id=session_id,
+        )
+        try:
+            exported = self.runtime.read_frozen_transcript(
+                self.installation,
+                frozen,
+                self.config,
+                self.review,
+            )
+        finally:
+            connection.close()
+        self.assertEqual(
+            [record.text for record in exported.records],
+            ["sibling before final"],
+        )
+        self.assertEqual(
+            [
+                (record.evidence_eligible, record.scope)
+                for record in exported.records
+            ],
+            [(True, "delta")],
+        )
+        exported_text = "\n".join(
+            record.text for record in exported.records
+        )
+        for private in (
+            payload["content"],
+            payload["inspection_proof"],
+            payload["owner_digest"],
+            payload["skill_sha256"],
+        ):
+            self.assertNotIn(str(private), exported_text)
+
     def test_catalog_inspect_exclusion_checks_shape_types_and_bounds(
         self,
     ) -> None:
@@ -2945,6 +3005,89 @@ class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
                     ),
                     (False, value),
                 )
+
+    def test_catalog_filter_removes_all_spans_and_keeps_unmatched_text(
+        self,
+    ) -> None:
+        payload, direct = self.catalog_inspect_output()
+        tampered = copy.deepcopy(payload)
+        tampered["inspection_proof"] = "0" * 64
+        tampered_text = self.runtime.canonical_json_bytes(
+            tampered
+        ).decode()
+        cases = {
+            "multiple-wrappers": (
+                (
+                    f"before one\nOutput:\n{direct}\nafter one"
+                    f"\nbefore two\nOutput:\n{direct}\nafter two"
+                ),
+                "before one\nafter one\nbefore two\nafter two",
+            ),
+            "between-siblings": (
+                f"left sibling{direct}right sibling",
+                "left siblingright sibling",
+            ),
+            "tampered-beside-valid": (
+                f"{tampered_text}|{direct}",
+                f"{tampered_text}|",
+            ),
+        }
+        for label, (value, expected) in cases.items():
+            with self.subTest(label=label):
+                self.assertEqual(
+                    self.runtime._filter_catalog_inspect_output(
+                        value, self.installation
+                    ),
+                    (True, expected),
+                )
+        nested_lookalike = self.runtime.canonical_json_bytes(
+            {"batch_id": 0, "nested": payload}
+        ).decode()
+        self.assertEqual(
+            self.runtime._filter_catalog_inspect_output(
+                nested_lookalike, self.installation
+            ),
+            (False, nested_lookalike),
+        )
+        oversized_lookalike = self.runtime.canonical_json_bytes(
+            {
+                "batch_id": 0,
+                "nested": payload,
+                "padding": "x"
+                * self.runtime.CATALOG_INSPECT_RESPONSE_MAX_BYTES,
+            }
+        ).decode()
+        matched, preserved = (
+            self.runtime._filter_catalog_inspect_output(
+                oversized_lookalike, self.installation
+            )
+        )
+        self.assertFalse(matched)
+        self.assertEqual(
+            hashlib.sha256(preserved.encode()).digest(),
+            hashlib.sha256(oversized_lookalike.encode()).digest(),
+        )
+
+    def test_catalog_filter_scan_saturation_fails_closed(self) -> None:
+        token = '{"batch_id":'
+        attempts = self.runtime.CATALOG_INSPECT_SCAN_ATTEMPTS_MAX
+        at_limit = token * attempts
+        self.assertEqual(
+            self.runtime._filter_catalog_inspect_output(
+                at_limit, self.installation
+            ),
+            (False, at_limit),
+        )
+        with self.assertRaises(
+            self.runtime.TranscriptAdapterError
+        ) as saturated:
+            self.runtime._filter_catalog_inspect_output(
+                token * (attempts + 1), self.installation
+            )
+        self.assertEqual(
+            saturated.exception.code, "unsupported_transcript"
+        )
+        self.assertFalse(saturated.exception.retryable)
 
     def test_response_items_export_textual_tool_session(self) -> None:
         session_id = "response-item-tool-session"
@@ -15140,6 +15283,8 @@ class ReviewDocumentationTests(unittest.TestCase):
             "exact authenticated catalog-inspect response is excluded "
             "from later transcript export",
             "preserves unrelated prefix and sibling fragment text",
+            "removes every authenticated catalog-inspect artifact span",
+            "scans at most 32 canonical start candidates",
             "malformed, noncanonical, or cryptographically invalid "
             "lookalike remains ordinary tool output",
             "top-level result keys are exactly `schema_version`, "
@@ -15213,6 +15358,8 @@ class ReviewDocumentationTests(unittest.TestCase):
             "exact authenticated catalog-inspect response is excluded "
             "from later transcript export",
             "preserves unrelated prefix and sibling fragment text",
+            "removes every authenticated catalog-inspect artifact span",
+            "scans at most 32 canonical start candidates",
             "malformed, noncanonical, or cryptographically invalid "
             "lookalike remains ordinary tool output",
             "top-level result keys are exactly `schema_version`, "
