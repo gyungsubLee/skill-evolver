@@ -13,7 +13,7 @@ progress:
 
 ## Project Reference
 
-See: `.planning/PROJECT.md` (updated 2026-08-02)
+See: `.planning/PROJECT.md` (updated 2026-08-05)
 
 **Core value:** 관찰은 최소화하고 판단과 스킬 변경 권한은 사용자에게 남긴다.
 **Current focus:** Phase 5 — Read-only Quality Gate
@@ -22,14 +22,14 @@ See: `.planning/PROJECT.md` (updated 2026-08-02)
 
 Phase: 5 of 11 (Read-only Quality Gate)
 Plan: 0 of 1 in current phase
-Status: `0.1.3` is installed with source/cache parity and the Codex `0.146.0`
-transcript adapter. `Q-002` terminalized `INVALID` for provenance drift.
-`Q-003` terminalized `FAIL` after the user labeled `C-001` not evaluation
-worthy and incorrectly attributed. Phase 6 remains blocked while Phase 4
-policy attribution is corrected and a changed-provenance successor `Q-004`
-collects a new real sample.
-Last activity: 2026-08-04 — preserved Q-003 terminal FAIL and approved the
-target-attribution remediation design for a corrective 0.1.4 release and Q-004
+Status: `0.1.4` is installed with source/cache parity, causal-attribution
+policy, and at most three distinct candidate targets per review batch. `Q-003`
+remains immutable terminal `FAIL`. `Q-004` opened from its exact terminal
+digest and is `COLLECTING` with zero sessions, candidates, and labels. Phase 6
+remains blocked until Q-004 has at least ten distinct real sessions, explicit
+Review, user-only labels, and terminal `PASS`.
+Last activity: 2026-08-05 — verified installed 0.1.4 parity and opened Q-004
+from the exact Q-003 terminal digest
 
 Progress: [████░░░░░░] 36%
 
@@ -50,13 +50,12 @@ Progress: [████░░░░░░] 36%
 | 4. Review and Inbox | 1/1 | Not recorded | Not recorded |
 
 **Recent Trend:** Four sequential phase gates recorded; Phase 2, Phase 3 and
-Phase 4 are PASS; installed `0.1.3` has real Desktop capture/import and
-current transcript-adapter proof. Phase 5 measured its first complete sealed
-sample: `Q-003` failed because its only candidate was neither evaluation
-worthy nor correctly attributed. The source branch already contains Korean-default label
-display and direct-user-language candidate authoring in `e520b8d`, `5ee8d29`,
-and `68f8660`; release/install remains at `0.1.3` until the corrective 0.1.4
-plan replaces the now-impossible Q-003-PASS release precondition
+Phase 4 are PASS; installed `0.1.4` has source/cache parity, real Desktop
+capture/import, Korean-default labels, direct-user-language candidate
+authoring, and corrected attribution provenance. Phase 5 measured its first
+complete sealed sample: `Q-003` failed because its only candidate was neither
+evaluation worthy nor correctly attributed. `Q-004` is now collecting a new
+real post-open sample under the corrected provenance
 
 ## Accumulated Context
 
@@ -83,7 +82,8 @@ plan replaces the now-impossible Q-003-PASS release precondition
 - The `0.1.0` production capture assumption regressed. Release `0.1.2`
   introduced the pinned plugin-data route and release `0.1.3` added the
   Codex `0.146.0` transcript adapter.
-- Installed plugin, runtime and source release identity are `0.1.3`.
+- Installed plugin, runtime and source release identity are `0.1.4`; source and
+  cache script, policy, and skill digests match.
 - `Q-001` terminalized `INVALID` for `quality_provenance_drift` with report
   digest `2759c55fcc9262ef7ae83b55eb30b95466e932ce6621761dd305fa0d80a51bc1`.
 - `Q-002` opened from that exact predecessor digest at
@@ -99,6 +99,9 @@ plan replaces the now-impossible Q-003-PASS release precondition
 - Q-003 passed sample, label completeness, provenance, subject integrity, and
   external-content checks. It failed evaluation-worth and target-attribution
   ratios; the canonical next action is `open_changed_quality_epoch`.
+- `Q-004` opened at `2026-08-05T07:46:47Z` from exact predecessor
+  `Q-003@512aa6cb395e7a4d6c94a51ad2b9950fb8cada381381784370d3edecda01ac1a`
+  and is `COLLECTING` with zero sessions, candidates, and labels.
 - The Phase 4 contract proves only catalog membership for `target_identity`;
   no trusted skill-invocation record is bound to candidate evidence. The first
   remediation is therefore a fail-closed causal-attribution policy and
@@ -114,13 +117,9 @@ plan replaces the now-impossible Q-003-PASS release precondition
 
 ### Pending Todos
 
-- Finish the reviewed remediation plan by integrating and installing `0.1.4`,
-  verifying source/cache parity, and opening `Q-004` from the exact Q-003
-  terminal digest.
-- Release and install corrective `0.1.4`, then verify source/cache parity and
-  changed policy/runtime provenance.
-- Open `Q-004` from the exact Q-003 terminal digest, collect at least ten new
-  real sessions, explicitly review them, and obtain user-only labels.
+- Collect at least ten distinct real post-open sessions in `Q-004`.
+- Explicitly Review the Q-004 sample, seal it, obtain every user-only label,
+  and run the immutable quality gate.
 - Refresh the Phase 6 runner plan only after a successor quality epoch passes.
 - Keep Runner, Prepare, Evaluate and Apply disabled until `QUALITY-01` passes.
 
@@ -150,7 +149,7 @@ plan replaces the now-impossible Q-003-PASS release precondition
 
 ## Session Continuity
 
-Last session: 2026-08-04
-Stopped at: `0.1.3` and immutable Q-003 terminal FAIL; target-attribution
-remediation design approved, ready to write its execution plan
+Last session: 2026-08-05
+Stopped at: `0.1.4` installed with source/cache parity and Q-004 `COLLECTING`;
+waiting for distinct real post-open sessions
 Resume file: None

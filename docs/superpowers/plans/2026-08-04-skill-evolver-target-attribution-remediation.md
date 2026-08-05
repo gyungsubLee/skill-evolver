@@ -759,7 +759,7 @@ git commit -m "chore(skill-evolver): release attribution fix 0.1.4"
 - Produces: main/source/cache parity at version `0.1.4` and changed Q-003 retry
   provenance.
 
-- [ ] **Step 1: Run independent read-only reviews**
+- [x] **Step 1: Run independent read-only reviews**
 
 Dispatch two reviewers:
 
@@ -771,7 +771,7 @@ Dispatch two reviewers:
 Apply only verified findings. Every behavioral correction starts with a
 failing focused regression.
 
-- [ ] **Step 2: Re-run the full verification after review**
+- [x] **Step 2: Re-run the full verification after review**
 
 Repeat every Task 3 Step 4 command and require a clean worktree afterward.
 Record the release commit returned by:
@@ -783,7 +783,7 @@ git status --short
 
 Expected: one 40-hex commit and no worktree output.
 
-- [ ] **Step 3: Verify fast-forward integration is safe**
+- [x] **Step 3: Verify fast-forward integration is safe**
 
 Run from the main worktree:
 
@@ -797,7 +797,7 @@ Expected: main has only the pre-existing untracked `n8n/` and `neo4j/`, and
 the ancestry check exits `0`. Any tracked change or non-fast-forward state
 stops this task for inspection.
 
-- [ ] **Step 4: Fast-forward main without touching unrelated files**
+- [x] **Step 4: Fast-forward main without touching unrelated files**
 
 ```bash
 git -C /Users/igyeongseob/Documents/오픈소스 merge --ff-only \
@@ -807,7 +807,7 @@ git -C /Users/igyeongseob/Documents/오픈소스 merge --ff-only \
 Expected: fast-forward succeeds; `n8n/` and `neo4j/` remain untracked and
 unchanged.
 
-- [ ] **Step 5: Install the local marketplace release**
+- [x] **Step 5: Install the local marketplace release**
 
 Request filesystem approval for exactly:
 
@@ -819,7 +819,7 @@ Run it once from `/Users/igyeongseob/Documents/오픈소스`.
 Expected JSON: plugin `skill-evolver`, marketplace `skill-evolver-dev`, version
 `0.1.4`, installed/enabled true.
 
-- [ ] **Step 6: Verify installed identity and source/cache parity**
+- [x] **Step 6: Verify installed identity and source/cache parity**
 
 ```bash
 codex plugin list --json
@@ -840,7 +840,7 @@ digests. The script digest differs from Q-003 runtime digest
 and the policy digest differs from Q-003 policy digest
 `2a90a7c6d9fa39f31d41d2efe9de47bbb5a3de832caac3863fe10310c18ee362`.
 
-- [ ] **Step 7: Verify installed CLI and terminal history without judgments**
+- [x] **Step 7: Verify installed CLI and terminal history without judgments**
 
 ```bash
 /usr/bin/python3 -I \
@@ -878,7 +878,7 @@ quality status still reports immutable Q-003 `FAIL`. Do not invoke
 - Produces: Q-004 in `collecting` state with exact failed predecessor.
 - Does not produce: real sessions, candidates, labels, seal, or quality PASS.
 
-- [ ] **Step 1: Recheck immutable predecessor read-only**
+- [x] **Step 1: Recheck immutable predecessor read-only**
 
 Run the installed `quality-status` command from Task 4 Step 7 and verify:
 
@@ -892,7 +892,7 @@ Run the installed `quality-status` command from Task 4 Step 7 and verify:
 The actual response may include additional aggregate fields. It must have no
 active collecting epoch and must not report Q-003 as invalid or mutable.
 
-- [ ] **Step 2: Present and separately approve the exact Q-004 open**
+- [x] **Step 2: Present and separately approve the exact Q-004 open**
 
 The only allowed command is:
 
@@ -909,7 +909,7 @@ digest, or guessed epoch.
 Expected: exit `0`, `epoch_id` exactly `Q-004`, state `collecting`, predecessor
 state `failed`, and the exact Q-003 report digest.
 
-- [ ] **Step 3: Verify Q-004 read-only**
+- [x] **Step 3: Verify Q-004 read-only**
 
 ```bash
 /usr/bin/python3 -I \
@@ -921,7 +921,7 @@ state `failed`, and the exact Q-003 report digest.
 Expected: `epoch_id=Q-004`, `status=COLLECTING`, zero or naturally observed
 initial sample counts, and no mutation of Q-003.
 
-- [ ] **Step 4: Record only verified checkpoint facts**
+- [x] **Step 4: Record only verified checkpoint facts**
 
 Update GSD documents with these facts after Step 3 succeeds:
 
@@ -938,7 +938,7 @@ Update GSD documents with these facts after Step 3 succeeds:
 Do not copy transcript text, owner tokens, candidate text, or labels into GSD
 documents.
 
-- [ ] **Step 5: Commit the checkpoint**
+- [x] **Step 5: Commit the checkpoint**
 
 ```bash
 git add .planning/STATE.md .planning/ROADMAP.md .planning/PROJECT.md
@@ -948,7 +948,7 @@ git commit -m "docs(skill-evolver): open corrected quality epoch"
 Run `git status --short` and require only the main worktree's unrelated
 untracked `n8n/` and `neo4j/` outside this project.
 
-- [ ] **Step 6: Fast-forward the checkpoint commit into main**
+- [x] **Step 6: Fast-forward the checkpoint commit into main**
 
 ```bash
 git -C /Users/igyeongseob/Documents/오픈소스 merge-base --is-ancestor \

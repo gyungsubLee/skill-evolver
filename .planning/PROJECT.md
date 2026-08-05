@@ -67,10 +67,18 @@ CLI와 Desktop 모두에서 경계가 명확한 session metadata를 수집하고
 
 - Phase 1의 최초 Feasibility `FAIL`은 Phase 2 session-level amendment로 보완됐고 amended report는 `PASS`다.
 - Phase 3 Runtime Queue와 Phase 4 Review/Inbox는 canonical report `PASS`로 완료됐다.
-- 설치된 plugin/runtime은 `0.1.3`이며 Codex `0.146.0` transcript adapter provenance를 사용한다.
+- 설치된 plugin/runtime/source는 `0.1.4`이며 source/cache parity,
+  Codex `0.146.0` transcript adapter, causal-attribution 정책과 review
+  batch당 최대 3개 distinct candidate target 제한을 포함한다.
 - `Q-002`는 adapter provenance drift로 terminal `INVALID` 처리됐다.
-- 현재 단계는 Phase 5 Read-only Quality Gate remediation이다. `Q-003`은 12 distinct real sessions와 candidate `C-001` 1건을 측정한 뒤 evaluation-worth와 target-attribution 기준에서 terminal `FAIL`했다.
-- Phase 6 Evaluate Runner Spike는 Phase 4 attribution policy를 교정한 successor epoch의 terminal `PASS` 전까지 차단된다.
+- 현재 단계는 Phase 5 Read-only Quality Gate다. `Q-003`은 12 distinct
+  real sessions와 candidate `C-001` 1건을 측정한 뒤 evaluation-worth와
+  target-attribution 기준에서 terminal `FAIL`했다. `Q-004`는 exact
+  predecessor `Q-003@512aa6cb395e7a4d6c94a51ad2b9950fb8cada381381784370d3edecda01ac1a`
+  에서 열렸고 현재 `COLLECTING`이다.
+- Phase 6 Evaluate Runner Spike는 Q-004의 최소 10개 distinct real
+  sessions, explicit Review, user-only labels, terminal `PASS` 전까지
+  차단된다.
 
 ## Sources of Truth
 
