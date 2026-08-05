@@ -123,9 +123,12 @@ Its exact aggregate body is preserved in the matching content-addressed
 repository report.
 The sample and safety checks passed, while evaluation-worth and target
 attribution failed. Corrective `0.1.4` is installed with source/cache parity,
-and `Q-004` opened from the exact Q-003 terminal digest. Phase 6 stays blocked
-until Q-004 has at least ten distinct real sessions, explicit Review,
-user-only labels, and terminal `PASS`.
+and `Q-004` opened from the exact Q-003 terminal digest. Batches 12-17 then
+quarantined 30 stale transcript generations as `transcript_changed` and
+terminalized `failed`; regression `a1aac8e` proves these failed witnesses do
+not block a later ten-session seal. Phase 6 stays blocked until Q-004 has at
+least ten distinct real sessions, explicit Review, user-only labels, and
+terminal `PASS`.
 **Failure Route**: Phase 4 transcript adapter 또는 improvement policy로 돌아간다.
 **Success Criteria** (what must be TRUE):
   1. 개발자가 최소 10 sessions 또는 30 review items에 대한 complete label set을 확인할 수 있다.

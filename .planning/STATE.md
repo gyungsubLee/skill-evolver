@@ -27,9 +27,14 @@ policy, and at most three distinct candidate targets per review batch. `Q-003`
 remains immutable terminal `FAIL`. `Q-004` opened from its exact terminal
 digest and is `COLLECTING` with zero sessions, candidates, and labels. Phase 6
 remains blocked until Q-004 has at least ten distinct real sessions, explicit
-Review, user-only labels, and terminal `PASS`.
-Last activity: 2026-08-05 — verified installed 0.1.4 parity and opened Q-004
-from the exact Q-003 terminal digest
+Review, user-only labels, and terminal `PASS`. Review batches 12 through 17
+terminalized `failed` after quarantining 30 stale transcript generations as
+`transcript_changed`; those failed batches are valid seal witnesses but add no
+quality observations. Read-only status still reports 55 pending sessions
+because it includes the quarantined rows, while two newer authenticated Stops
+remain in the plugin spool.
+Last activity: 2026-08-05 — proved failed review batches do not block a later
+quality seal and committed the regression as `a1aac8e`
 
 Progress: [████░░░░░░] 36%
 
@@ -102,6 +107,13 @@ real post-open sample under the corrected provenance
 - `Q-004` opened at `2026-08-05T07:46:47Z` from exact predecessor
   `Q-003@512aa6cb395e7a4d6c94a51ad2b9950fb8cada381381784370d3edecda01ac1a`
   and is `COLLECTING` with zero sessions, candidates, and labels.
+- Review batches 12 through 17 each returned `no_exportable_sessions`. Their
+  30 generations are retained as pending but quarantined with
+  `transcript_changed`, so subsequent claims skip them. The seal contract
+  accepts these terminal failed batches and requires observations only for
+  completed batches; regression commit `a1aac8e` proves a failed witness
+  followed by two completed five-session batches seals with 10 distinct
+  sessions and one candidate.
 - The Phase 4 contract proves only catalog membership for `target_identity`;
   no trusted skill-invocation record is bound to candidate evidence. The first
   remediation is therefore a fail-closed causal-attribution policy and
@@ -118,6 +130,8 @@ real post-open sample under the corrected provenance
 ### Pending Todos
 
 - Collect at least ten distinct real post-open sessions in `Q-004`.
+- Continue the remaining imported review queue only after explicit approval
+  for repeated `review-claim`; import the two verified spool files separately.
 - Explicitly Review the Q-004 sample, seal it, obtain every user-only label,
   and run the immutable quality gate.
 - Refresh the Phase 6 runner plan only after a successor quality epoch passes.
@@ -129,6 +143,10 @@ real post-open sample under the corrected provenance
 - Phase 4 PASS proves deterministic mechanics and safety only; candidate quality remains unmeasured until Phase 5.
 - Phase 5 cannot use fixtures, subagents, repeated generations in this task, or
   empty generated tasks as substitutes for 10 distinct real sessions.
+- Read-only `status.pending_sessions` includes retryable transcript failures;
+  it does not currently expose the smaller `error_code IS NULL` claimable
+  subset. Six repeated claims already quarantined 30 stale generations, so
+  further repeated mutation requires an explicit bounded approval.
 - `Q-003` is an immutable terminal `FAIL`; do not relabel, rewrite, or
   reinterpret it. An unchanged-provenance successor is rejected.
 - The first remediation intentionally stays inside the Phase 4 policy boundary.
@@ -150,6 +168,7 @@ real post-open sample under the corrected provenance
 ## Session Continuity
 
 Last session: 2026-08-05
-Stopped at: `0.1.4` installed with source/cache parity and Q-004 `COLLECTING`;
-waiting for distinct real post-open sessions
+Stopped at: Q-004 remains `COLLECTING`; batches 12-17 quarantined 30 stale
+transcript generations, regression `a1aac8e` proves failed witnesses do not
+block a later seal, and repeated claims await explicit bounded approval
 Resume file: None

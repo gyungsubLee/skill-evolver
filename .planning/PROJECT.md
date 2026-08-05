@@ -75,7 +75,11 @@ CLI와 Desktop 모두에서 경계가 명확한 session metadata를 수집하고
   real sessions와 candidate `C-001` 1건을 측정한 뒤 evaluation-worth와
   target-attribution 기준에서 terminal `FAIL`했다. `Q-004`는 exact
   predecessor `Q-003@512aa6cb395e7a4d6c94a51ad2b9950fb8cada381381784370d3edecda01ac1a`
-  에서 열렸고 현재 `COLLECTING`이다.
+  에서 열렸고 현재 `COLLECTING`이다. Review batches 12-17은 오래된
+  transcript generation 30개를 `transcript_changed`로 격리하며 terminal
+  `failed`가 됐지만, 이 배치들은 seal witness로 유효하고 표본에는
+  포함되지 않는다. Regression commit `a1aac8e`가 이후 2개 완료 배치의
+  10개 session으로 정상 seal되는 경로를 검증한다.
 - Phase 6 Evaluate Runner Spike는 Q-004의 최소 10개 distinct real
   sessions, explicit Review, user-only labels, terminal `PASS` 전까지
   차단된다.
