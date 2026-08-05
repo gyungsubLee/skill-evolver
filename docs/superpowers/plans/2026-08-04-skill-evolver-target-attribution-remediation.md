@@ -159,7 +159,7 @@ schema v1, `unittest`, local Codex plugin marketplace, Git worktree.
 - Preserves: database and persisted candidate schemas, catalog membership
   checks, evidence checks, candidate fingerprints, and atomic commit behavior.
 
-- [ ] **Step 1: Add failing policy and fixed-instruction assertions**
+- [x] **Step 1: Add failing policy and fixed-instruction assertions**
 
 Extend
 `ReviewRuntimeContractTests.test_fixed_runtime_reference_and_policy_are_bounded`
@@ -212,7 +212,7 @@ for expected in (
     self.assertIn(expected, instructions)
 ```
 
-- [ ] **Step 2: Add the failing distinct-target validator test**
+- [x] **Step 2: Add the failing distinct-target validator test**
 
 Add this method to `ReviewCandidateValidationTests`:
 
@@ -276,7 +276,7 @@ def test_more_than_three_distinct_candidate_targets_fail_closed(
 This test deliberately uses four valid catalog identities and four eligible
 same-session records. It must fail only on the new shared target-count guard.
 
-- [ ] **Step 3: Add failing documentation-boundary assertions**
+- [x] **Step 3: Add failing documentation-boundary assertions**
 
 Extend `ReviewDocumentationTests` so both `SKILL.md` and README must contain:
 
@@ -295,7 +295,7 @@ for phrase in (
 Keep the existing assertions that command shapes are not approvals and every
 actual target read receives its own exact approval.
 
-- [ ] **Step 4: Run Review tests and verify RED**
+- [x] **Step 4: Run Review tests and verify RED**
 
 Run:
 
@@ -307,7 +307,7 @@ Run:
 Expected: failures name missing causal-attribution text and
 `too_many_candidate_targets`; no unrelated test fails.
 
-- [ ] **Step 5: Add the minimal shared validator guard**
+- [x] **Step 5: Add the minimal shared validator guard**
 
 Beside the current result bounds in `evolver.py`, add:
 
@@ -333,7 +333,7 @@ Keep `RESULT_TOP_LEVEL_KEYS` at its corrected exact four-key set containing
 `schema_version`, `contract_digest`, `target_inspection_proofs`, and
 `sessions`.
 
-- [ ] **Step 6: Strengthen the model-facing policy**
+- [x] **Step 6: Strengthen the model-facing policy**
 
 Insert this decision rule after the existing strong-signal list in
 `improvement-policy.md`:
@@ -362,7 +362,7 @@ same failure in materially different future tasks. Use
 Keep every existing untrusted-content, language-selection, evidence-source,
 privacy, and no-mutation rule.
 
-- [ ] **Step 7: Mirror the rule in fixed result instructions**
+- [x] **Step 7: Mirror the rule in fixed result instructions**
 
 Append these strings to `REVIEW_RESULT_SCHEMA_INSTRUCTIONS["instructions"]`
 before the authoring-language rules:
@@ -390,7 +390,7 @@ before the authoring-language rules:
 ),
 ```
 
-- [ ] **Step 8: Make target inspection mandatory and bounded in the skill**
+- [x] **Step 8: Make target inspection mandatory and bounded in the skill**
 
 Replace the optional single-target wording in `SKILL.md` Explicit review with
 this exact workflow:
@@ -417,7 +417,7 @@ owner-token or exact-command boundaries. Update the overview sentence to say
 “up to three separately approved bounded catalog-inspect results, one per
 distinct proposed target.”
 
-- [ ] **Step 9: Mirror the workflow in README**
+- [x] **Step 9: Mirror the workflow in README**
 
 In `README.md` Explicit session review, replace the singular optional wording
 with:
@@ -436,7 +436,7 @@ no_reusable_improvement or one_off.
 Retain the existing statement that `catalog-inspect` is read-only and one
 actual command approves only one exact target.
 
-- [ ] **Step 10: Verify Task 1 GREEN and safety scans**
+- [x] **Step 10: Verify Task 1 GREEN and safety scans**
 
 Run:
 
@@ -453,7 +453,7 @@ git diff --check
 Expected: Review suite `OK`; compile and diff checks succeed; privacy scan
 shows only deliberate test/policy patterns and no credential value.
 
-- [ ] **Step 11: Commit Task 1**
+- [x] **Step 11: Commit Task 1**
 
 ```bash
 git add \
@@ -482,7 +482,7 @@ git commit -m "fix(skill-evolver): require causal target attribution"
   `false/false/false` terminal FAIL, exact predecessor binding, unchanged
   provenance rejection, and changed-policy successor creation.
 
-- [ ] **Step 1: Add the sparse failed-sample helper**
+- [x] **Step 1: Add the sparse failed-sample helper**
 
 Add to `QualityTerminalGateTests`:
 
@@ -538,7 +538,7 @@ def fail_one_candidate_sample(
     )
 ```
 
-- [ ] **Step 2: Add the joined terminal and successor regression**
+- [x] **Step 2: Add the joined terminal and successor regression**
 
 Add to the same class:
 
@@ -613,7 +613,7 @@ def test_sparse_failed_sample_requires_changed_policy_successor(
     )
 ```
 
-- [ ] **Step 3: Run the characterization test**
+- [x] **Step 3: Run the characterization test**
 
 Run:
 
@@ -626,7 +626,7 @@ Expected: `OK`. This is a characterization test for existing correct quality
 mechanics. If it fails, stop and diagnose the shared lifecycle; do not add
 production code or weaken a threshold merely to satisfy the test.
 
-- [ ] **Step 4: Commit Task 2**
+- [x] **Step 4: Commit Task 2**
 
 ```bash
 git add skills/skill-evolver/tests/test_quality_gate.py
@@ -652,7 +652,7 @@ git commit -m "test(skill-evolver): cover failed quality successor"
   and CLI all identify `0.1.4`.
 - Preserves: SQLite schema v1 and Q-003 external runtime state.
 
-- [ ] **Step 1: Change only the release assertions to 0.1.4**
+- [x] **Step 1: Change only the release assertions to 0.1.4**
 
 In `ProductionSurfaceTests.test_only_main_stop_is_an_automatic_writer`, set:
 
@@ -665,7 +665,7 @@ self.assertEqual(
 )
 ```
 
-- [ ] **Step 2: Run capture tests and verify RED**
+- [x] **Step 2: Run capture tests and verify RED**
 
 ```bash
 /usr/bin/python3 -I -m unittest discover \
@@ -675,7 +675,7 @@ self.assertEqual(
 Expected: FAIL only at the three `0.1.4` assertions because source identity is
 still `0.1.3`.
 
-- [ ] **Step 3: Bump every fixed release identity together**
+- [x] **Step 3: Bump every fixed release identity together**
 
 Change `evolver.py`:
 
@@ -706,7 +706,7 @@ language, and requires causal target attribution plus bounded target
 inspection before a candidate.
 ```
 
-- [ ] **Step 4: Run focused and full verification**
+- [x] **Step 4: Run focused and full verification**
 
 ```bash
 /usr/bin/python3 -I -m unittest discover \
@@ -729,7 +729,7 @@ git diff --check
 Expected: every suite is `OK` with only the three documented historical skips;
 compile/JSON/diff checks succeed; CLI prints `skill-evolver 0.1.4`.
 
-- [ ] **Step 5: Commit Task 3**
+- [x] **Step 5: Commit Task 3**
 
 ```bash
 git add \

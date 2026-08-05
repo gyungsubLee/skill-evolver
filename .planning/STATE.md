@@ -114,7 +114,9 @@ plan replaces the now-impossible Q-003-PASS release precondition
 
 ### Pending Todos
 
-- Write and execute the target-attribution remediation plan.
+- Finish the reviewed remediation plan by integrating and installing `0.1.4`,
+  verifying source/cache parity, and opening `Q-004` from the exact Q-003
+  terminal digest.
 - Release and install corrective `0.1.4`, then verify source/cache parity and
   changed policy/runtime provenance.
 - Open `Q-004` from the exact Q-003 terminal digest, collect at least ten new
