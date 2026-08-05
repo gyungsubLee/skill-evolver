@@ -993,6 +993,62 @@ class QualitySealTests(CandidateBatchFixture):
         )
         self.assertRegex(sealed["seal_digest"], r"\A[0-9a-f]{64}\Z")
 
+    def test_seal_accepts_failed_batch_before_completed_sample(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        self.open_epoch(now)
+        for number in range(1, 6):
+            self.insert_pending(
+                self.connection,
+                number,
+                text=f"unexportable-session-{number}\n",
+                now=now + 1,
+            )
+        self.next_session_number = 6
+        error = self.runtime.TranscriptAdapterError(
+            "transcript_changed",
+            retryable=True,
+        )
+        with mock.patch.object(
+            self.runtime,
+            "read_frozen_transcript",
+            side_effect=error,
+        ):
+            failed = self.runtime.claim_review_batch(
+                self.connection,
+                self.installation,
+                self.config,
+                now + 1,
+            )
+        first = self.collect_batch(5, now + 2)
+        second = self.collect_batch(5, now + 4)
+
+        result = self.runtime.seal_quality_epoch(
+            self.connection,
+            self.installation,
+            now + 6,
+        )
+        sealed = result["sealed"]
+
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["error_code"], "no_exportable_sessions")
+        self.assertEqual(result["state"], "sealed")
+        self.assertEqual(
+            [item["batch_id"] for item in sealed["batches"]],
+            [failed["batch_id"], first["batch_id"], second["batch_id"]],
+        )
+        self.assertEqual(
+            [item["terminal_status"] for item in sealed["batches"]],
+            ["failed", "completed", "completed"],
+        )
+        self.assertEqual(
+            [item["batch_id"] for item in sealed["observations"]],
+            [first["batch_id"], second["batch_id"]],
+        )
+        self.assertEqual(sealed["distinct_session_count"], 10)
+        self.assertEqual(sealed["candidate_count"], 1)
+
     def test_seal_deduplicates_session_refs_across_batches(
         self,
     ) -> None:
