@@ -155,24 +155,43 @@ model input and the human-operated skill workflow cannot diverge.
   seven-key shape (`schema_version`, `batch_id`, `owner_digest`,
   `target_identity`, `skill_sha256`, `inspection_proof`, `content`), bounded
   UTF-8 content, matching content SHA-256, and a valid installation HMAC.
+  If the decoded whole top-level object is semantically authenticated by those
+  fields but its raw bytes are noncanonical, the transcript fails closed; the
+  body and proof are not exported as an ordinary lookalike.
+  The decoder uses an object-pairs hook that preserves every value of a
+  duplicate decoded key at every nesting level, including Unicode-escaped
+  equivalents. The bounded nested scan traverses every preserved value. A
+  duplicate-key object whose decoded key set contains all seven catalog
+  response keys fails closed, while other duplicate-key JSON remains
+  unchanged ordinary tool output.
   A decoded non-artifact outer object or array is traversed iteratively within
   fixed 4096-node and 64-level bounds. Any cryptographically valid nested exact
   seven-key response fails the transcript closed as `unsupported_transcript`;
   it is neither exported nor surgically deleted. Nested tampered and general
   lookalikes remain byte-for-byte ordinary tool output. For a decode failure,
-  a quote/escape-aware bracket scan preserves an entire balanced invalid outer
-  container only when it contains no canonical catalog start. A
-  balanced-invalid, mismatched, or unclosed ambiguous outer containing that
-  start fails closed.
+  an overlap-aware quote scan tries every raw quote as an independent JSON
+  string-token start and counts only valid tokens followed by optional JSON
+  whitespace and a colon as object keys. Each token attempt is bounded by the
+  longest possible raw JSON encoding of one catalog key, preventing quadratic
+  rescans and malformed quote pairing from shifting later keys. A
+  balanced-invalid, mismatched, or unclosed outer containing all seven decoded
+  catalog response keys fails closed, including Unicode-escaped equivalents.
+  A catalog-like string value or malformed object containing only a subset of
+  those keys remains ordinary tool output. Independently, every raw object or
+  array start inside the syntax-error span is retried with the same
+  duplicate-preserving decoder. A semantically authenticated response, nested
+  authenticated response, or duplicate catalog-shaped object found by a retry
+  fails closed. These retries share the existing 32-attempt budget with the
+  top-level scan, and saturation fails closed.
 - Only authenticated top-level containers and their immediately preceding
   `Output:` markers are removed. Unmatched prefix, between-container, suffix,
   and sibling text remains ordered and receives normal owner-token redaction,
-  evidence eligibility, and scope. The scan makes at most 32 top-level
-  object/array parse attempts and fails closed as `unsupported_transcript` on
-  saturation.
-  Tampered content/proofs, noncanonical JSON, extra or missing keys, and
-  general lookalikes remain ordinary tool output under the existing redaction
-  and transcript limits. Fragment boundaries are concatenated before this
+  evidence eligibility, and scope. Top-level scanning and syntax-error retries
+  share one 32-attempt object/array parse budget and fail closed as
+  `unsupported_transcript` on saturation.
+  Tampered content/proofs, cryptographically invalid noncanonical JSON, extra
+  or missing keys, and general lookalikes remain ordinary tool output under
+  the existing redaction and transcript limits. Fragment boundaries are concatenated before this
   scan: fragments that form one top-level authenticated response are removed,
   while fragments that form an outer object or array containing an
   authenticated nested response fail closed. This changes the transcript
@@ -212,8 +231,11 @@ the changed contract:
    unmatched text remains eligible. Valid, noncanonical, and oversized outer
    objects or arrays containing an authenticated nested response fail closed,
    while nested tampered lookalikes remain byte-for-byte. Balanced-invalid,
-   mismatched, or unclosed ambiguous outers containing a catalog start,
-   nested-scan saturation, and container-attempt saturation also fail closed.
+   mismatched, or unclosed ambiguous outers containing all seven decoded
+   catalog response keys, decoded duplicate-key catalog-shaped objects,
+   semantically
+   authenticated noncanonical top-level objects, nested-scan saturation, and
+   container-attempt saturation also fail closed.
 8. A one-candidate quality fixture labeled `false/false/false` terminalizes as
    `FAIL`, preserves the exact thresholds, and returns
    `open_changed_quality_epoch`.

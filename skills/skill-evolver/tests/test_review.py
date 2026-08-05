@@ -2601,11 +2601,17 @@ class FrozenTranscriptBoundedReadTests(FrozenTranscriptTestCase):
                         "direct-or-final-output-suffix-v1-strict-owner-hmac"
                     ),
                     "catalog_inspect_tool_output": (
-                        "top-level-authenticated-container-filter-v4-reject-nested-auth"
+                        "top-level-authenticated-container-filter-v6-preserve-duplicate-pairs"
                     ),
                     "catalog_inspect_scan_attempts": 32,
                     "catalog_inspect_nested_scan_max_nodes": 4096,
                     "catalog_inspect_nested_scan_max_depth": 64,
+                    "catalog_inspect_duplicate_keys": (
+                        "preserve-all-values-reject-catalog-ambiguity-v2"
+                    ),
+                    "catalog_inspect_noncanonical_authenticated_root": (
+                        "reject-v1"
+                    ),
                     "structured_text_security": (
                         "concatenated-scan-before-fragment-export-v1"
                     ),
@@ -2764,7 +2770,49 @@ class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
         ):
             self.assertNotIn(str(private), exported_text)
 
-    def test_tampered_and_noncanonical_catalog_outputs_are_exported(
+    def test_duplicate_escaped_catalog_output_fails_export(
+        self,
+    ) -> None:
+        session_id = "duplicate-escaped-catalog-output"
+        header = (
+            b'{"type":"session_meta","payload":{"session_id":"'
+            + session_id.encode("utf-8")
+            + b'"}}\n'
+        )
+        _payload, direct = self.catalog_inspect_output()
+        escaped = direct.replace(
+            '"batch_id"', '"b\\u0061tch_id"', 1
+        )
+        ambiguous = f'{{"nested":{escaped},"nested":0}}'
+        record = self.response_item(
+            {
+                "type": "custom_tool_call_output",
+                "output": ambiguous,
+            }
+        )
+        connection, _transcript, frozen = self.capture_and_claim(
+            [header, record],
+            reviewed_boundary=len(header),
+            session_id=session_id,
+        )
+        try:
+            with self.assertRaises(
+                self.runtime.TranscriptAdapterError
+            ) as rejected:
+                self.runtime.read_frozen_transcript(
+                    self.installation,
+                    frozen,
+                    self.config,
+                    self.review,
+                )
+        finally:
+            connection.close()
+        self.assertEqual(
+            rejected.exception.code, "unsupported_transcript"
+        )
+        self.assertFalse(rejected.exception.retryable)
+
+    def test_tampered_and_general_catalog_lookalikes_are_exported(
         self,
     ) -> None:
         session_id = "catalog-inspect-output-lookalikes"
@@ -2778,10 +2826,13 @@ class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
         bad_proof["inspection_proof"] = "0" * 64
         bad_content = copy.deepcopy(payload)
         bad_content["content"] = str(payload["content"]) + "tampered"
+        noncanonical_tampered = json.dumps(
+            bad_proof, ensure_ascii=False, indent=2
+        )
         outputs = [
             self.runtime.canonical_json_bytes(bad_proof).decode(),
             self.runtime.canonical_json_bytes(bad_content).decode(),
-            json.dumps(payload, ensure_ascii=False, indent=2),
+            noncanonical_tampered,
             json.dumps(
                 {
                     "schema_version": 1,
@@ -2791,7 +2842,7 @@ class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
                 separators=(",", ":"),
             ),
         ]
-        self.assertNotEqual(outputs[2], direct)
+        self.assertNotEqual(noncanonical_tampered, direct)
         records = [
             self.response_item(
                 {
@@ -2818,6 +2869,127 @@ class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
         self.assertEqual(
             [record.text for record in exported.records], outputs
         )
+
+    def test_catalog_filter_rejects_noncanonical_authenticated_root(
+        self,
+    ) -> None:
+        payload, direct = self.catalog_inspect_output()
+        variants = {
+            "indented": json.dumps(
+                payload, ensure_ascii=False, indent=2
+            ),
+            "insertion-order": json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            "oversized-whitespace": (
+                direct[:-1]
+                + " "
+                * (
+                    self.runtime.CATALOG_INSPECT_RESPONSE_MAX_BYTES
+                    + 1
+                )
+                + "}"
+            ),
+        }
+        for label, value in variants.items():
+            self.assertNotEqual(value, direct)
+            with self.subTest(label=label):
+                with self.assertRaises(
+                    self.runtime.TranscriptAdapterError
+                ) as rejected:
+                    self.runtime._filter_catalog_inspect_output(
+                        value, self.installation
+                    )
+                self.assertEqual(
+                    rejected.exception.code,
+                    "unsupported_transcript",
+                )
+                self.assertFalse(rejected.exception.retryable)
+
+    def test_catalog_filter_rejects_duplicate_decoded_keys(
+        self,
+    ) -> None:
+        _, direct = self.catalog_inspect_output()
+        escaped_batch_id = direct.replace(
+            '"batch_id"', '"b\\u0061tch_id"', 1
+        )
+        all_escaped_keys = direct
+        for source, escaped in (
+            ('"batch_id"', '"b\\u0061tch_id"'),
+            ('"content"', '"c\\u006fntent"'),
+            ('"inspection_proof"', '"inspecti\\u006fn_proof"'),
+            ('"owner_digest"', '"owner_dig\\u0065st"'),
+            ('"schema_version"', '"schema_versi\\u006fn"'),
+            ('"skill_sha256"', '"skill_sh\\u0061256"'),
+            ('"target_identity"', '"target_identit\\u0079"'),
+        ):
+            all_escaped_keys = all_escaped_keys.replace(
+                source, escaped, 1
+            )
+        ambiguous = {
+            "forward-object": (
+                f'{{"nested":{direct},"nested":0}}'
+            ),
+            "forward-array-value": (
+                f'{{"nested":[{direct}],"nested":0}}'
+            ),
+            "forward-inside-array": (
+                f'[{{"nested":{direct},"nested":0}}]'
+            ),
+            "reverse-object": (
+                f'{{"nested":0,"nested":{direct}}}'
+            ),
+            "escaped-object": (
+                f'{{"nested":{direct},"n\\u0065sted":0}}'
+            ),
+            "escaped-array-value": (
+                f'{{"nested":[{direct}],"n\\u0065sted":0}}'
+            ),
+            "escaped-payload-forward": (
+                f'{{"nested":{escaped_batch_id},"nested":0}}'
+            ),
+            "escaped-payload-reverse": (
+                f'{{"nested":0,"nested":{escaped_batch_id}}}'
+            ),
+            "escaped-payload-inside-array": (
+                f'[{{"nested":{escaped_batch_id},"nested":0}}]'
+            ),
+            "all-escaped-payload": (
+                f'{{"nested":{all_escaped_keys},"nested":0}}'
+            ),
+            "duplicate-catalog-root": (
+                direct[:-1] + ',"content":"shadow"}'
+            ),
+        }
+        for label, value in ambiguous.items():
+            with self.subTest(label=label):
+                with self.assertRaises(
+                    self.runtime.TranscriptAdapterError
+                ) as rejected:
+                    self.runtime._filter_catalog_inspect_output(
+                        value, self.installation
+                    )
+                self.assertEqual(
+                    rejected.exception.code,
+                    "unsupported_transcript",
+                )
+                self.assertFalse(rejected.exception.retryable)
+
+        ordinary_duplicates = (
+            '{"name":1,"name":2}',
+            '{"name":1,"n\\u0061me":2}',
+            '[{"name":1,"name":2}]',
+            '{"outer":{"name":1,"n\\u0061me":2}}',
+        )
+        for value in ordinary_duplicates:
+            self.assertEqual(
+                self.runtime._filter_catalog_inspect_output(
+                    value, self.installation
+                ),
+                (False, value),
+            )
 
     def test_catalog_inspect_fragments_preserve_siblings_in_order(
         self,
@@ -3124,22 +3296,36 @@ class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
         self,
     ) -> None:
         _, direct = self.catalog_inspect_output()
-        balanced_invalid = (
-            '{"broken": invalid, "literal":"}]\\\"{", '
-            '"nested":'
-            + direct
-            + "}"
+        escaped_direct = direct.replace(
+            '"batch_id"', '"b\\u0061tch_id"', 1
         )
-        with self.assertRaises(
-            self.runtime.TranscriptAdapterError
-        ) as rejected:
-            self.runtime._filter_catalog_inspect_output(
-                balanced_invalid, self.installation
-            )
-        self.assertEqual(
-            rejected.exception.code, "unsupported_transcript"
-        )
-        self.assertFalse(rejected.exception.retryable)
+        ambiguous = {
+            "canonical-key": (
+                '{"broken": invalid, "literal":"}]\\\"{", '
+                '"nested":'
+                + direct
+                + "}"
+            ),
+            "escaped-key": (
+                '{"broken": invalid, "literal":"}]\\\"{", '
+                '"nested":'
+                + escaped_direct
+                + "}"
+            ),
+        }
+        for label, value in ambiguous.items():
+            with self.subTest(label=label):
+                with self.assertRaises(
+                    self.runtime.TranscriptAdapterError
+                ) as rejected:
+                    self.runtime._filter_catalog_inspect_output(
+                        value, self.installation
+                    )
+                self.assertEqual(
+                    rejected.exception.code,
+                    "unsupported_transcript",
+                )
+                self.assertFalse(rejected.exception.retryable)
         balanced_without_token = (
             '{"broken": invalid, "literal":"}]\\\"{", '
             '"nested":{"batch":7}}'
@@ -3150,19 +3336,43 @@ class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
             ),
             (False, balanced_without_token),
         )
+        ordinary_sensitive_strings = (
+            '{"broken": invalid, "content":"ordinary"}',
+            '{"broken": invalid, "note":"content"}',
+            (
+                '{"broken": invalid, '
+                '"note":"b\\u0061tch_id"}'
+            ),
+        )
+        for value in ordinary_sensitive_strings:
+            self.assertEqual(
+                self.runtime._filter_catalog_inspect_output(
+                    value, self.installation
+                ),
+                (False, value),
+            )
 
     def test_catalog_filter_preserves_malformed_no_token_boundaries(
         self,
     ) -> None:
-        unclosed_without_token = "{" * (
-            self.runtime.CATALOG_INSPECT_SCAN_ATTEMPTS_MAX + 1
-        )
+        attempts = self.runtime.CATALOG_INSPECT_SCAN_ATTEMPTS_MAX
+        unclosed_without_token = "{" * attempts
         self.assertEqual(
             self.runtime._filter_catalog_inspect_output(
                 unclosed_without_token, self.installation
             ),
             (False, unclosed_without_token),
         )
+        with self.assertRaises(
+            self.runtime.TranscriptAdapterError
+        ) as saturated:
+            self.runtime._filter_catalog_inspect_output(
+                "{" * (attempts + 1), self.installation
+            )
+        self.assertEqual(
+            saturated.exception.code, "unsupported_transcript"
+        )
+        self.assertFalse(saturated.exception.retryable)
         mismatched_without_token = "{]|ordinary evidence"
         self.assertEqual(
             self.runtime._filter_catalog_inspect_output(
@@ -3175,24 +3385,39 @@ class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
         self,
     ) -> None:
         _, direct = self.catalog_inspect_output()
+        escaped_direct = direct.replace(
+            '"batch_id"', '"b\\u0061tch_id"', 1
+        )
         malformed = {
             "unclosed": '{"nested":' + direct,
             "mismatched": '{"nested":' + direct + "]",
             "mismatch-before-nested": (
                 '{"broken":],"nested":' + direct + "}"
             ),
+            "escaped-unclosed": '{"nested":' + escaped_direct,
+            "escaped-mismatch-before-nested": (
+                '{"broken":],"nested":' + escaped_direct + "}"
+            ),
+            "dangling-quote-escaped": (
+                '{"broken":"' + escaped_direct
+            ),
+            "dangling-quote-trailing-comma": (
+                '{"broken":"' + direct[:-1] + ",}"
+            ),
         }
         for label, value in malformed.items():
-            with self.subTest(label=label), self.assertRaises(
-                self.runtime.TranscriptAdapterError
-            ) as rejected:
-                self.runtime._filter_catalog_inspect_output(
-                    value, self.installation
+            with self.subTest(label=label):
+                with self.assertRaises(
+                    self.runtime.TranscriptAdapterError
+                ) as rejected:
+                    self.runtime._filter_catalog_inspect_output(
+                        value, self.installation
+                    )
+                self.assertEqual(
+                    rejected.exception.code,
+                    "unsupported_transcript",
                 )
-            self.assertEqual(
-                rejected.exception.code, "unsupported_transcript"
-            )
-            self.assertFalse(rejected.exception.retryable)
+                self.assertFalse(rejected.exception.retryable)
 
     def test_catalog_filter_scan_saturation_fails_closed(self) -> None:
         attempts = self.runtime.CATALOG_INSPECT_SCAN_ATTEMPTS_MAX
@@ -15485,16 +15710,26 @@ class ReviewDocumentationTests(unittest.TestCase):
             "inspected body for repeated targets",
             "target_inspection_proofs",
             "non-secret owner digest used in that proof",
-            "exact authenticated top-level catalog-inspect response is excluded "
+            "exact canonical authenticated top-level catalog-inspect response "
+            "is excluded "
             "from later transcript export",
+            "semantically authenticated but noncanonical top-level response "
+            "fails closed",
             "preserves unrelated prefix and sibling fragment text",
             "removes every authenticated top-level catalog-inspect container",
-            "makes at most 32 top-level object/array parse attempts",
+            "makes at most 32 object/array parse attempts across top-level "
+            "scanning and syntax-error retries",
+            "Duplicate decoded object keys, including Unicode-escaped "
+            "equivalents, preserve every value for bounded inspection",
+            "duplicate-key object containing all seven decoded catalog "
+            "response keys fails closed",
             "authenticated nested catalog response fails closed as "
             "unsupported transcript",
             "nested tampered or lookalike values remain ordinary tool output",
-            "balanced invalid outer without a catalog start remains ordinary "
-            "tool output",
+            "balanced invalid outer without all seven decoded catalog "
+            "object keys remains ordinary tool output",
+            "Saturation fails closed",
+            "Decoded-key fallback starts independently at every raw quote",
             "Nested inspection is bounded to 4096 nodes and 64 levels",
             "top-level result keys are exactly `schema_version`, "
             "`contract_digest`, `target_inspection_proofs`, and `sessions`",
@@ -15564,16 +15799,26 @@ class ReviewDocumentationTests(unittest.TestCase):
             "inspected body for repeated targets",
             "target_inspection_proofs",
             "non-secret owner digest used in that proof",
-            "exact authenticated top-level catalog-inspect response is excluded "
+            "exact canonical authenticated top-level catalog-inspect response "
+            "is excluded "
             "from later transcript export",
+            "semantically authenticated but noncanonical top-level response "
+            "fails closed",
             "preserves unrelated prefix and sibling fragment text",
             "removes every authenticated top-level catalog-inspect container",
-            "makes at most 32 top-level object/array parse attempts",
+            "makes at most 32 object/array parse attempts across top-level "
+            "scanning and syntax-error retries",
+            "Duplicate decoded object keys, including Unicode-escaped "
+            "equivalents, preserve every value for bounded inspection",
+            "duplicate-key object containing all seven decoded catalog "
+            "response keys fails closed",
             "authenticated nested catalog response fails closed as "
             "unsupported transcript",
             "nested tampered or lookalike values remain ordinary tool output",
-            "balanced invalid outer without a catalog start remains ordinary "
-            "tool output",
+            "balanced invalid outer without all seven decoded catalog "
+            "object keys remains ordinary tool output",
+            "Saturation fails closed",
+            "Decoded-key fallback starts independently at every raw quote",
             "Nested inspection is bounded to 4096 nodes and 64 levels",
             "top-level result keys are exactly `schema_version`, "
             "`contract_digest`, `target_inspection_proofs`, and `sessions`",

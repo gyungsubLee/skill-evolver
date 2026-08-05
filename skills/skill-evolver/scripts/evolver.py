@@ -63,7 +63,6 @@ CATALOG_INSPECT_RESPONSE_MAX_BYTES = (
     + 8_192
 )
 CATALOG_INSPECT_SCAN_ATTEMPTS_MAX = 32
-CATALOG_INSPECT_CANONICAL_START = '{"batch_id":'
 CATALOG_INSPECT_NESTED_SCAN_MAX_NODES = 4_096
 CATALOG_INSPECT_NESTED_SCAN_MAX_DEPTH = 64
 CATALOG_DISPLAY_NAME_MAX_BYTES = 128
@@ -2192,7 +2191,7 @@ def transcript_adapter_contract(
                 "direct-or-final-output-suffix-v1-strict-owner-hmac"
             ),
             "catalog_inspect_tool_output": (
-                "top-level-authenticated-container-filter-v4-reject-nested-auth"
+                "top-level-authenticated-container-filter-v6-preserve-duplicate-pairs"
             ),
             "catalog_inspect_scan_attempts": (
                 CATALOG_INSPECT_SCAN_ATTEMPTS_MAX
@@ -2202,6 +2201,12 @@ def transcript_adapter_contract(
             ),
             "catalog_inspect_nested_scan_max_depth": (
                 CATALOG_INSPECT_NESTED_SCAN_MAX_DEPTH
+            ),
+            "catalog_inspect_duplicate_keys": (
+                "preserve-all-values-reject-catalog-ambiguity-v2"
+            ),
+            "catalog_inspect_noncanonical_authenticated_root": (
+                "reject-v1"
             ),
             "structured_text_security": (
                 "concatenated-scan-before-fragment-export-v1"
@@ -2342,6 +2347,9 @@ CATALOG_INSPECT_OUTPUT_KEYS = frozenset(
         "inspection_proof",
         "content",
     }
+)
+CATALOG_INSPECT_KEY_TOKEN_MAX_CHARS = (
+    max(len(key) for key in CATALOG_INSPECT_OUTPUT_KEYS) * 6 + 2
 )
 
 
@@ -2537,11 +2545,128 @@ def _is_exact_catalog_inspect_output(
     )
 
 
+@dataclass(frozen=True)
+class _DuplicateJSONObject:
+    pairs: tuple[tuple[str, object], ...]
+
+
+def _preserve_duplicate_json_object_pairs(
+    pairs: list[tuple[str, object]],
+) -> object:
+    value: dict[str, object] = {}
+    duplicate = False
+    for key, item in pairs:
+        if key in value:
+            duplicate = True
+        value[key] = item
+    if duplicate:
+        return _DuplicateJSONObject(tuple(pairs))
+    return value
+
+
+def _contains_catalog_inspect_key_set(
+    value: str,
+    start: int,
+    end: int,
+) -> bool:
+    cursor = start
+    keys: set[str] = set()
+    while cursor < end:
+        quote_start = value.find('"', cursor, end)
+        if quote_start < 0:
+            return False
+        cursor = quote_start + 1
+        token_limit = min(
+            end,
+            quote_start + CATALOG_INSPECT_KEY_TOKEN_MAX_CHARS,
+        )
+        quote_end = quote_start + 1
+        escaped = False
+        while quote_end < token_limit:
+            character = value[quote_end]
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                break
+            quote_end += 1
+        if quote_end >= token_limit:
+            continue
+        token_end = quote_end + 1
+        try:
+            token = json.loads(value[quote_start:token_end])
+        except (RecursionError, ValueError):
+            pass
+        else:
+            separator = token_end
+            while (
+                separator < end
+                and value[separator] in " \t\r\n"
+            ):
+                separator += 1
+            if (
+                separator < end
+                and value[separator] == ":"
+                and token in CATALOG_INSPECT_OUTPUT_KEYS
+            ):
+                keys.add(token)
+                if CATALOG_INSPECT_OUTPUT_KEYS.issubset(keys):
+                    return True
+    return False
+
+
+def _scan_ambiguous_json_span(
+    value: str,
+    start: int,
+    end: int,
+    decoder: json.JSONDecoder,
+    installation: Installation,
+    attempts: int,
+) -> int:
+    cursor = start + 1
+    while cursor < end:
+        object_start = value.find("{", cursor, end)
+        array_start = value.find("[", cursor, end)
+        starts = tuple(
+            candidate
+            for candidate in (object_start, array_start)
+            if candidate >= 0
+        )
+        if not starts:
+            break
+        nested_start = min(starts)
+        attempts += 1
+        if attempts > CATALOG_INSPECT_SCAN_ATTEMPTS_MAX:
+            raise _transcript_error("unsupported_transcript")
+        try:
+            parsed, _candidate_end = decoder.raw_decode(
+                value, nested_start
+            )
+        except RecursionError:
+            raise _transcript_error(
+                "unsupported_transcript"
+            ) from None
+        except ValueError:
+            cursor = nested_start + 1
+            continue
+        if _is_exact_catalog_inspect_output(
+            parsed, installation
+        ) or _contains_nested_authenticated_catalog_output(
+            parsed, installation
+        ):
+            raise _transcript_error("unsupported_transcript")
+        cursor = nested_start + 1
+    return attempts
+
+
 def _filter_catalog_inspect_output(
     value: str,
     installation: Installation,
 ) -> tuple[bool, str]:
-    decoder = json.JSONDecoder()
+    decoder = json.JSONDecoder(
+        object_pairs_hook=_preserve_duplicate_json_object_pairs
+    )
     marker = "\nOutput:\n"
     spans: list[tuple[int, int]] = []
     attempts = 0
@@ -2570,34 +2695,41 @@ def _filter_catalog_inspect_output(
             candidate_end = _balanced_json_container_end(
                 value, start
             )
-            if candidate_end is not None:
-                if (
-                    CATALOG_INSPECT_CANONICAL_START
-                    in value[start:candidate_end]
-                ):
-                    raise _transcript_error(
-                        "unsupported_transcript"
-                    )
-                cursor = candidate_end
-                continue
-            if (
-                CATALOG_INSPECT_CANONICAL_START
-                in value[start:]
+            ambiguous_end = (
+                candidate_end
+                if candidate_end is not None
+                else len(value)
+            )
+            attempts = _scan_ambiguous_json_span(
+                value,
+                start,
+                ambiguous_end,
+                decoder,
+                installation,
+                attempts,
+            )
+            if _contains_catalog_inspect_key_set(
+                value, start, ambiguous_end
             ):
                 raise _transcript_error("unsupported_transcript")
+            if candidate_end is not None:
+                cursor = candidate_end
+                continue
             break
         candidate = value[start:candidate_end]
         try:
             encoded = candidate.encode("utf-8")
         except UnicodeEncodeError:
             raise _transcript_error("unsupported_transcript") from None
-        authenticated = (
-            len(encoded) <= CATALOG_INSPECT_RESPONSE_MAX_BYTES
-            and _is_exact_catalog_inspect_output(
+        semantically_authenticated = (
+            _is_exact_catalog_inspect_output(
                 parsed, installation
             )
         )
-        if authenticated:
+        authenticated = False
+        if semantically_authenticated:
+            if len(encoded) > CATALOG_INSPECT_RESPONSE_MAX_BYTES:
+                raise _transcript_error("unsupported_transcript")
             try:
                 canonical = canonical_json_bytes(parsed).decode(
                     "utf-8"
@@ -2608,9 +2740,12 @@ def _filter_catalog_inspect_output(
                 UnicodeError,
                 ValueError,
             ):
-                authenticated = False
-            else:
-                authenticated = canonical == candidate
+                raise _transcript_error(
+                    "unsupported_transcript"
+                ) from None
+            if canonical != candidate:
+                raise _transcript_error("unsupported_transcript")
+            authenticated = True
         if not authenticated:
             if _contains_nested_authenticated_catalog_output(
                 parsed, installation
@@ -2675,11 +2810,15 @@ def _contains_nested_authenticated_catalog_output(
     value: object,
     installation: Installation,
 ) -> bool:
-    if type(value) is dict:
-        children = value.values()
-    elif type(value) is list:
-        children = value
-    else:
+    if (
+        type(value) is _DuplicateJSONObject
+        and CATALOG_INSPECT_OUTPUT_KEYS.issubset(
+            key for key, _item in value.pairs
+        )
+    ):
+        return True
+    children = _json_container_values(value)
+    if children is None:
         return False
     pending: list[tuple[object, int]] = []
     scheduled = 0
@@ -2696,11 +2835,15 @@ def _contains_nested_authenticated_catalog_output(
             current, installation
         ):
             return True
-        if type(current) is dict:
-            nested = current.values()
-        elif type(current) is list:
-            nested = current
-        else:
+        if (
+            type(current) is _DuplicateJSONObject
+            and CATALOG_INSPECT_OUTPUT_KEYS.issubset(
+                key for key, _item in current.pairs
+            )
+        ):
+            return True
+        nested = _json_container_values(current)
+        if nested is None:
             continue
         for child in nested:
             scheduled += 1
@@ -2708,6 +2851,18 @@ def _contains_nested_authenticated_catalog_output(
                 raise _transcript_error("unsupported_transcript")
             pending.append((child, depth + 1))
     return False
+
+
+def _json_container_values(
+    value: object,
+) -> Optional[Sequence[object]]:
+    if type(value) is dict:
+        return tuple(value.values())
+    if type(value) is list:
+        return value
+    if type(value) is _DuplicateJSONObject:
+        return tuple(item for _key, item in value.pairs)
+    return None
 
 
 def _canonical_transcript_records(

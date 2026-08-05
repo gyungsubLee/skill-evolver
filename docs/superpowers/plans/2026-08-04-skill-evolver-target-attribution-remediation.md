@@ -34,16 +34,33 @@ Q-004 open.
 > containers. Each successfully decoded object or array is indivisible: only
 > an entire exact canonical seven-key response with a valid content digest and
 > HMAC is removed, together with its immediately preceding `Output:` marker.
+> A decoded whole top-level response that is semantically authenticated by its
+> seven fields, content SHA, and HMAC but whose raw bytes are noncanonical fails
+> closed instead of exporting the body and proof.
+> The decoder preserves every value of duplicate decoded object keys at every
+> nesting level, including Unicode-escaped equivalents, and the bounded scan
+> traverses every preserved value. A duplicate-key object containing all seven
+> decoded catalog response keys fails closed; other duplicate-key JSON remains
+> unchanged ordinary output.
 > A decoded non-artifact outer object or array is traversed within fixed
 > 4096-node and 64-level bounds. A cryptographically valid nested seven-key
 > response fails the transcript closed instead of being exported or surgically
 > removed; nested tampered and other lookalikes remain byte-for-byte ordinary
-> tool output. A quote/escape-aware bracket scan preserves a balanced invalid
-> outer only when it contains no canonical catalog start. Balanced-invalid,
-> mismatched, or unclosed ambiguous outers containing that start fail closed.
+> tool output. On decode failure, an overlap-aware scan tries every raw quote
+> as an independent JSON string-token start and accepts only valid tokens
+> followed by optional whitespace and a colon as object keys. Each attempt is
+> capped at the longest possible raw JSON encoding of one catalog key.
+> Balanced-invalid, mismatched, or unclosed outers containing all seven decoded
+> catalog response keys fail closed, including Unicode-escaped equivalents;
+> string values and malformed objects containing only a subset remain ordinary.
+> Every raw object or array start inside a syntax-error span is also retried
+> with the duplicate-preserving decoder. Those retries share the existing
+> 32-attempt budget and fail closed on authenticated, nested authenticated, or
+> duplicate catalog-shaped output and on saturation.
 > Unmatched prefix, between-container, suffix, and sibling text remains ordered
-> with normal redaction and evidence scope. Scanning is capped at 32 top-level
-> object/array parse attempts and saturation is unsupported transcript.
+> with normal redaction and evidence scope. Top-level scanning and
+> syntax-error retries share one 32-attempt object/array parse budget;
+> saturation is unsupported transcript.
 > Proofs copied into persisted candidate/evidence text fail before SQLite
 > writes. Unauthenticated nested values and unambiguous malformed lookalikes
 > remain ordinary tool output.
