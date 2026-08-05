@@ -31,8 +31,9 @@ Review, user-only labels, and terminal `PASS`. Review batches 12 through 17
 terminalized `failed` after quarantining 30 stale transcript generations as
 `transcript_changed`; those failed batches are valid seal witnesses but add no
 quality observations. Read-only status still reports 55 pending sessions
-because it includes the quarantined rows, while two newer authenticated Stops
-remain in the plugin spool.
+because it includes the quarantined rows. A subsequent maintenance invocation
+classified all three then-present spool files as duplicates, imported no new
+session, and left the spool empty.
 Last activity: 2026-08-05 — proved failed review batches do not block a later
 quality seal and committed the regression as `a1aac8e`
 
@@ -131,7 +132,7 @@ real post-open sample under the corrected provenance
 
 - Collect at least ten distinct real post-open sessions in `Q-004`.
 - Continue the remaining imported review queue only after explicit approval
-  for repeated `review-claim`; import the two verified spool files separately.
+  for repeated `review-claim`; the plugin spool is currently empty.
 - Explicitly Review the Q-004 sample, seal it, obtain every user-only label,
   and run the immutable quality gate.
 - Refresh the Phase 6 runner plan only after a successor quality epoch passes.
@@ -170,5 +171,6 @@ real post-open sample under the corrected provenance
 Last session: 2026-08-05
 Stopped at: Q-004 remains `COLLECTING`; batches 12-17 quarantined 30 stale
 transcript generations, regression `a1aac8e` proves failed witnesses do not
-block a later seal, and repeated claims await explicit bounded approval
+block a later seal, maintenance cleared three duplicate spool files, and
+repeated claims await explicit bounded approval
 Resume file: None
