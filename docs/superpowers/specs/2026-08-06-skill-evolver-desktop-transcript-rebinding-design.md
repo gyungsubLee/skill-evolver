@@ -1,6 +1,6 @@
 # Skill Evolver Desktop Transcript Rebinding Amendment
 
-**Status:** Draft — architecture approved; written specification awaiting review
+**Status:** Approved by the user on 2026-08-06
 
 **Date:** 2026-08-06
 
