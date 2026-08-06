@@ -30,12 +30,12 @@ remains blocked until Q-004 has at least ten distinct real sessions, explicit
 Review, user-only labels, and terminal `PASS`. Review batches 12 through 17
 terminalized `failed` after quarantining 30 stale transcript generations as
 `transcript_changed`; those failed batches are valid seal witnesses but add no
-quality observations. Read-only status still reports 55 pending sessions
-because it includes the quarantined rows. A subsequent maintenance invocation
-classified all three then-present spool files as duplicates, imported no new
-session, and left the spool empty.
-Last activity: 2026-08-05 — proved failed review batches do not block a later
-quality seal and committed the regression as `a1aac8e`
+quality observations. Read-only status now reports 61 pending sessions because
+it includes the quarantined rows plus six newly imported real sessions. The
+latest maintenance invocation classified two of eight spool files as
+duplicates, imported six, and left the spool empty.
+Last activity: 2026-08-06 — imported six new real sessions into the Q-004
+review queue; pending increased from 55 to 61
 
 Progress: [████░░░░░░] 36%
 
@@ -168,9 +168,9 @@ real post-open sample under the corrected provenance
 
 ## Session Continuity
 
-Last session: 2026-08-05
+Last session: 2026-08-06
 Stopped at: Q-004 remains `COLLECTING`; batches 12-17 quarantined 30 stale
 transcript generations, regression `a1aac8e` proves failed witnesses do not
-block a later seal, maintenance cleared three duplicate spool files, and
-repeated claims await explicit bounded approval
+block a later seal, maintenance imported six new sessions and cleared two
+duplicates, and repeated claims await explicit bounded approval
 Resume file: None
