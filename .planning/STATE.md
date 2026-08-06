@@ -27,15 +27,15 @@ policy, and at most three distinct candidate targets per review batch. `Q-003`
 remains immutable terminal `FAIL`. `Q-004` opened from its exact terminal
 digest and is `COLLECTING` with zero sessions, candidates, and labels. Phase 6
 remains blocked until Q-004 has at least ten distinct real sessions, explicit
-Review, user-only labels, and terminal `PASS`. Review batches 12 through 17
-terminalized `failed` after quarantining 30 stale transcript generations as
-`transcript_changed`; those failed batches are valid seal witnesses but add no
-quality observations. Read-only status now reports 61 pending sessions because
-it includes the quarantined rows plus six newly imported real sessions. The
-latest maintenance invocation classified two of eight spool files as
-duplicates, imported six, and left the spool empty.
-Last activity: 2026-08-06 — imported six new real sessions into the Q-004
-review queue; pending increased from 55 to 61
+Review, user-only labels, and terminal `PASS`. Review batches 12 through 22
+terminalized `failed` while quarantining stale transcript generations; those
+failed batches are valid seal witnesses but add no quality observations. The
+user-approved final five claims processed up to 25 additional generations.
+Read-only status still reports 61 pending sessions because it includes both
+quarantined rows and six newly imported real sessions. Three authenticated
+Stop files currently await separate maintenance classification.
+Last activity: 2026-08-06 — completed the user-approved five-call stale
+session quarantine as batches 18-22
 
 Progress: [████░░░░░░] 36%
 
@@ -115,6 +115,10 @@ real post-open sample under the corrected provenance
   completed batches; regression commit `a1aac8e` proves a failed witness
   followed by two completed five-session batches seals with 10 distinct
   sessions and one candidate.
+- The user explicitly approved five more bounded claims for the remaining old
+  queue. Batches 18 through 22 each returned `no_exportable_sessions`, so the
+  approved scope processed up to 25 additional stale generations without
+  producing observations or candidates.
 - The Phase 4 contract proves only catalog membership for `target_identity`;
   no trusted skill-invocation record is bound to candidate evidence. The first
   remediation is therefore a fail-closed causal-attribution policy and
@@ -131,8 +135,10 @@ real post-open sample under the corrected provenance
 ### Pending Todos
 
 - Collect at least ten distinct real post-open sessions in `Q-004`.
-- Continue the remaining imported review queue only after explicit approval
-  for repeated `review-claim`; the plugin spool is currently empty.
+- Obtain separate approval for the next actual `review-claim`; it is outside
+  the completed five-call quarantine scope and should reach the newer queue.
+- Classify the three currently verified spool files with a separately
+  approved maintenance invocation.
 - Explicitly Review the Q-004 sample, seal it, obtain every user-only label,
   and run the immutable quality gate.
 - Refresh the Phase 6 runner plan only after a successor quality epoch passes.
@@ -146,8 +152,8 @@ real post-open sample under the corrected provenance
   empty generated tasks as substitutes for 10 distinct real sessions.
 - Read-only `status.pending_sessions` includes retryable transcript failures;
   it does not currently expose the smaller `error_code IS NULL` claimable
-  subset. Six repeated claims already quarantined 30 stale generations, so
-  further repeated mutation requires an explicit bounded approval.
+  subset. Batches 12-22 are terminal failed witnesses; the next actual Review
+  remains a separately approved mutation.
 - `Q-003` is an immutable terminal `FAIL`; do not relabel, rewrite, or
   reinterpret it. An unchanged-provenance successor is rejected.
 - The first remediation intentionally stays inside the Phase 4 policy boundary.
@@ -169,8 +175,7 @@ real post-open sample under the corrected provenance
 ## Session Continuity
 
 Last session: 2026-08-06
-Stopped at: Q-004 remains `COLLECTING`; batches 12-17 quarantined 30 stale
-transcript generations, regression `a1aac8e` proves failed witnesses do not
-block a later seal, maintenance imported six new sessions and cleared two
-duplicates, and repeated claims await explicit bounded approval
+Stopped at: Q-004 remains `COLLECTING`; the user-approved quarantine ended
+with batches 18-22 terminal `failed`, six newer imported sessions remain
+unreviewed, and the next actual Review requires its own approval
 Resume file: None
