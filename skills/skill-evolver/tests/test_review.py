@@ -5138,6 +5138,77 @@ class FrozenTranscriptIdentityTests(FrozenTranscriptTestCase):
         finally:
             connection.close()
 
+    def test_retry_rejects_same_inode_rollback_after_reopen(
+        self,
+    ) -> None:
+        session_id = "retry-same-inode-rollback"
+        header = self.fixture_lines[0].replace(
+            b"fixture-session", session_id.encode()
+        )
+        delta = self.fixture_lines[5]
+        altered_delta = delta.replace(b"correction", b"reflection")
+        self.assertEqual(len(altered_delta), len(delta))
+        connection, transcript, frozen = self.capture_and_claim(
+            [header, delta],
+            reviewed_boundary=len(header),
+            session_id=session_id,
+        )
+        real_pread = os.pread
+        real_reopen = self.runtime._reopen_selected_transcript
+        appended = False
+        rewritten = False
+
+        def append_once(
+            descriptor: int, length: int, offset: int
+        ) -> bytes:
+            nonlocal appended
+            self.assertLessEqual(offset + length, frozen.frozen_to)
+            result = real_pread(descriptor, length, offset)
+            if not appended:
+                appended = True
+                with transcript.open("ab") as stream:
+                    stream.write(b'{"type":"event_msg","payload":{}}\n')
+            return result
+
+        def rewrite_after_reopen(*args, **kwargs):
+            nonlocal rewritten
+            descriptor = real_reopen(*args, **kwargs)
+            transcript.write_bytes(header + altered_delta + b"x")
+            current = os.fstat(descriptor)
+            self.assertEqual(
+                (current.st_dev, current.st_ino), args[3]
+            )
+            self.assertGreaterEqual(current.st_size, frozen.frozen_to)
+            self.assertLess(current.st_size, args[4][2])
+            rewritten = True
+            return descriptor
+
+        try:
+            with mock.patch.object(
+                self.runtime.os,
+                "pread",
+                side_effect=append_once,
+            ), mock.patch.object(
+                self.runtime,
+                "_reopen_selected_transcript",
+                side_effect=rewrite_after_reopen,
+            ):
+                with self.assertRaises(
+                    self.runtime.TranscriptAdapterError
+                ) as raised:
+                    self.runtime.read_frozen_transcript(
+                        self.installation,
+                        frozen,
+                        self.config,
+                        self.review,
+                    )
+            self.assertTrue(appended)
+            self.assertTrue(rewritten)
+            self.assertEqual(raised.exception.code, "transcript_changed")
+            self.assertTrue(raised.exception.retryable)
+        finally:
+            connection.close()
+
     def test_first_attempt_records_are_released_before_retry_reopen(
         self,
     ) -> None:
@@ -5190,6 +5261,85 @@ class FrozenTranscriptIdentityTests(FrozenTranscriptTestCase):
                 self.runtime,
                 "_parse_jsonl_records",
                 side_effect=append_after_delta_parse,
+            ), mock.patch.object(
+                self.runtime,
+                "_read_frozen_transcript_attempt",
+                side_effect=track_first_attempt,
+            ), mock.patch.object(
+                self.runtime,
+                "_reopen_selected_transcript",
+                side_effect=assert_released_before_reopen,
+            ) as reopen:
+                exported = self.runtime.read_frozen_transcript(
+                    self.installation,
+                    frozen,
+                    self.config,
+                    self.review,
+                )
+            reopen.assert_called_once()
+            self.assertEqual(
+                [record.text for record in exported.records],
+                ["sanitized direct correction"],
+            )
+        finally:
+            connection.close()
+
+    def test_error_attempt_records_are_released_before_retry_reopen(
+        self,
+    ) -> None:
+        session_id = "release-error-attempt"
+        header = self.fixture_lines[0].replace(
+            b"fixture-session", session_id.encode()
+        )
+        delta = self.fixture_lines[5]
+        connection, transcript, frozen = self.capture_and_claim(
+            [header, delta],
+            reviewed_boundary=len(header),
+            session_id=session_id,
+        )
+        real_context = self.runtime._bounded_reverse_context
+        real_attempt = self.runtime._read_frozen_transcript_attempt
+        real_reopen = self.runtime._reopen_selected_transcript
+        failed = False
+        attempt_reference = None
+        record_reference = None
+
+        def fail_once_after_delta(*args, **kwargs):
+            nonlocal failed
+            if not failed:
+                failed = True
+                with transcript.open("ab") as stream:
+                    stream.write(b'{"type":"event_msg","payload":{}}\n')
+                raise self.runtime._transcript_error(
+                    "transcript_partial"
+                )
+            return real_context(*args, **kwargs)
+
+        def track_first_attempt(*args, **kwargs):
+            nonlocal attempt_reference, record_reference
+            attempt = real_attempt(*args, **kwargs)
+            if attempt_reference is None:
+                self.assertTrue(attempt.records)
+                self.assertIsNotNone(attempt.error)
+                self.assertEqual(attempt.error.code, "transcript_partial")
+                self.assertTrue(attempt.error.retryable)
+                attempt_reference = weakref.ref(attempt)
+                record_reference = weakref.ref(attempt.records[-1])
+            return attempt
+
+        def assert_released_before_reopen(*args, **kwargs):
+            self.assertTrue(failed)
+            self.assertIsNotNone(attempt_reference)
+            self.assertIsNotNone(record_reference)
+            self.assertIsNone(attempt_reference())
+            self.assertIsNone(record_reference())
+            return real_reopen(*args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                self.runtime,
+                "_bounded_reverse_context",
+                side_effect=fail_once_after_delta,
             ), mock.patch.object(
                 self.runtime,
                 "_read_frozen_transcript_attempt",

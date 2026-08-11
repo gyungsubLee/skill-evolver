@@ -3776,7 +3776,9 @@ def _read_frozen_transcript_attempt(
     try:
         _initial_session_meta(descriptor, installation, frozen)
     except TranscriptAdapterError as error:
-        header_error = error
+        header_error = TranscriptAdapterError(
+            error.code, retryable=error.retryable
+        )
     after_header = _stable_frozen_descriptor_stat(
         descriptor, frozen, selected_identity, rebound
     )
@@ -3846,7 +3848,9 @@ def _read_frozen_transcript_attempt(
             if not remaining_records:
                 context_records = []
     except TranscriptAdapterError as error:
-        data_error = error
+        data_error = TranscriptAdapterError(
+            error.code, retryable=error.retryable
+        )
     after = _stable_frozen_descriptor_stat(
         descriptor, frozen, selected_identity, rebound
     )
@@ -3918,7 +3922,12 @@ def read_frozen_transcript(
             )
         finally:
             _close_transcript_descriptor(descriptor)
-        if attempt.before != attempt.after:
+        if (
+            attempt.before[:2] != selected_identity
+            or attempt.before[2] < minimum_stat[2]
+            or attempt.before[3] < minimum_stat[3]
+            or attempt.before != attempt.after
+        ):
             raise _transcript_error("transcript_changed")
     if attempt.error is not None:
         raise attempt.error
