@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -13,6 +14,76 @@ from test_review import CandidateBatchFixture
 
 
 class ProspectiveQualityEpochTests(CandidateBatchFixture):
+    def spool_stop(
+        self, raw_session_id: str, captured_at: float
+    ) -> tuple[object, str]:
+        plugin_data = self.base / "capture-plugin-data"
+        plugin_data.mkdir(mode=0o700, exist_ok=True)
+        spool = plugin_data / "stop-spool"
+        spool.mkdir(mode=0o700, exist_ok=True)
+        capture = replace(self.installation, spool=spool)
+        transcript = self.sessions / f"{raw_session_id}.jsonl"
+        transcript.write_text(
+            '{"payload":{"role":"user"}}\n', encoding="utf-8"
+        )
+        event = self.runtime.parse_session_stop(
+            json.dumps(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": raw_session_id,
+                    "cwd": str(self.workspace),
+                    "transcript_path": str(transcript),
+                }
+            ).encode(),
+            self.installation,
+            self.config,
+        )
+        assert event is not None
+        event = replace(
+            event,
+            observed_at_ns=int(captured_at * 1_000_000_000),
+        )
+        key = self.runtime.session_key(
+            self.installation, raw_session_id
+        )
+        assert self.runtime.spool_session_stop(
+            capture,
+            self.config,
+            event,
+            key,
+            captured_at,
+            coalesce=True,
+        )
+        return capture, key
+
+    def insert_pending_at(
+        self, number: int, captured_at: float
+    ) -> sqlite3.Row:
+        row = self.insert_pending(
+            self.connection,
+            number,
+            text=f"candidate-session-{number}\n",
+            now=captured_at - number,
+        )
+        self.assertEqual(
+            row["first_stop_at"], self.runtime.iso_utc(captured_at)
+        )
+        self.next_session_number = max(
+            self.next_session_number, number + 1
+        )
+        return row
+
+    def claim_without_transcript_read(
+        self, now: float
+    ) -> dict[str, object]:
+        with self.fixed_review_inputs():
+            return self.runtime.claim_review_batch(
+                self.connection,
+                self.installation,
+                self.config,
+                now,
+            )
+
     def open_epoch(
         self, now: float = 2_000_000_100.0
     ) -> dict[str, object]:
@@ -21,6 +92,309 @@ class ProspectiveQualityEpochTests(CandidateBatchFixture):
             self.installation,
             now,
             predecessor=None,
+        )
+
+    def test_pre_open_spool_imported_after_open_is_not_claimed(
+        self,
+    ) -> None:
+        cutoff = 2_000_000_100.0
+        capture, key = self.spool_stop("pre-open", cutoff - 1)
+        self.open_epoch(cutoff)
+
+        maintained = self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            cutoff + 1,
+            capture_installation=capture,
+        )
+        row = self.connection.execute(
+            "SELECT status,first_stop_at FROM review_items "
+            "WHERE session_key=?",
+            (key,),
+        ).fetchone()
+        claimed = self.claim_without_transcript_read(cutoff + 2)
+
+        self.assertEqual(maintained["spool_imported"], 1)
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(
+            row["first_stop_at"], self.runtime.iso_utc(cutoff - 1)
+        )
+        self.assertEqual(claimed["status"], "empty")
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM review_batches"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_oldest_ineligible_row_does_not_consume_batch_limit(
+        self,
+    ) -> None:
+        cutoff = 2_000_000_100.0
+        self.config = replace(self.config, review_batch_sessions=1)
+        self.review_runtime = replace(
+            self.review_runtime, review_batch_sessions=1
+        )
+        self.open_epoch(cutoff)
+        old = self.insert_pending_at(1, cutoff - 1)
+        fresh = self.insert_pending_at(2, cutoff + 1)
+
+        claimed = self.claim_ready_batch(
+            self.connection,
+            [self.make_export("fresh prospective session")],
+            now=cutoff + 2,
+        )
+        contract = self.runtime.load_review_contract(
+            self.connection, int(claimed["batch_id"]), "final"
+        )
+
+        self.assertEqual(len(contract["sessions"]), 1)
+        self.assertEqual(
+            contract["sessions"][0]["review_item_id"], fresh["id"]
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT status FROM review_items WHERE id=?", (old["id"],)
+            ).fetchone()["status"],
+            "pending",
+        )
+
+    def test_same_second_stop_is_ineligible(self) -> None:
+        cutoff = 2_000_000_100.0
+        self.open_epoch(cutoff)
+        row = self.insert_pending_at(1, cutoff)
+
+        claimed = self.claim_without_transcript_read(cutoff + 1)
+
+        self.assertEqual(claimed["status"], "empty")
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT status FROM review_items WHERE id=?", (row["id"],)
+            ).fetchone()["status"],
+            "pending",
+        )
+
+    def test_later_stop_preserves_pre_open_ineligibility(self) -> None:
+        cutoff = 2_000_000_100.0
+        capture, key = self.spool_stop("pre-open-repeat", cutoff - 1)
+        self.open_epoch(cutoff)
+        self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            cutoff + 1,
+            capture_installation=capture,
+        )
+        transcript = self.sessions / "pre-open-repeat.jsonl"
+        event = self.runtime.parse_session_stop(
+            json.dumps(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": "pre-open-repeat",
+                    "cwd": str(self.workspace),
+                    "transcript_path": str(transcript),
+                }
+            ).encode(),
+            self.installation,
+            self.config,
+        )
+        assert event is not None
+        event = replace(
+            event,
+            observed_at_ns=int((cutoff + 2) * 1_000_000_000),
+        )
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                capture,
+                self.config,
+                event,
+                key,
+                cutoff + 2,
+                coalesce=True,
+            )
+        )
+        self.runtime.run_maintenance(
+            self.connection,
+            self.installation,
+            self.config,
+            cutoff + 3,
+            capture_installation=capture,
+        )
+
+        row = self.connection.execute(
+            "SELECT status,first_stop_at,last_stop_at FROM review_items "
+            "WHERE session_key=?",
+            (key,),
+        ).fetchone()
+        claimed = self.claim_without_transcript_read(cutoff + 4)
+
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(
+            row["first_stop_at"], self.runtime.iso_utc(cutoff - 1)
+        )
+        self.assertEqual(
+            row["last_stop_at"], self.runtime.iso_utc(cutoff + 2)
+        )
+        self.assertEqual(claimed["status"], "empty")
+
+    def test_pending_row_is_claimable_without_collecting_epoch(
+        self,
+    ) -> None:
+        row = self.insert_pending_at(1, 2_000_000_000.0)
+
+        claimed = self.claim_ready_batch(
+            self.connection,
+            [self.make_export("existing behavior without epoch")],
+            now=2_000_000_001.0,
+        )
+        contract = self.runtime.load_review_contract(
+            self.connection, int(claimed["batch_id"]), "final"
+        )
+
+        self.assertEqual(
+            contract["sessions"][0]["review_item_id"], row["id"]
+        )
+
+    def test_pre_open_rows_cannot_satisfy_minimum_sample(self) -> None:
+        cutoff = 2_000_000_100.0
+        self.open_epoch(cutoff)
+        old_ids = [
+            int(self.insert_pending_at(number, cutoff - 1)["id"])
+            for number in range(1, 10)
+        ]
+        fresh = self.insert_pending_at(10, cutoff + 1)
+
+        claimed = self.claim_ready_batch(
+            self.connection,
+            [
+                self.make_export("prospective filtering fixture")
+                for _ in range(10)
+            ],
+            now=cutoff + 2,
+        )
+        contract = self.runtime.load_review_contract(
+            self.connection, int(claimed["batch_id"]), "final"
+        )
+        result_path = self.write_result(
+            claimed, self.result_payload(claimed)
+        )
+        self.commit(claimed, result_path, cutoff + 3)
+
+        self.assertEqual(
+            [item["review_item_id"] for item in contract["sessions"]],
+            [fresh["id"]],
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM review_items "
+                "WHERE id IN ({}) AND status='pending'".format(
+                    ",".join("?" for _ in old_ids)
+                ),
+                old_ids,
+            ).fetchone()[0],
+            9,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "quality_sample_too_small"
+        ):
+            self.runtime.seal_quality_epoch(
+                self.connection, self.installation, cutoff + 4
+            )
+
+    def assert_invalid_epoch_metadata_fails_before_allocation(
+        self, expected_error: str
+    ) -> None:
+        row = self.insert_pending_at(1, 2_000_000_101.0)
+        sequence = self.connection.execute(
+            "SELECT value FROM metadata WHERE key=?",
+            (self.runtime.REVIEW_NEXT_BATCH_ID_KEY,),
+        ).fetchone()
+        sequence_before = None if sequence is None else sequence["value"]
+        item_before = tuple(
+            self.connection.execute(
+                "SELECT status,generation,batch_id FROM review_items "
+                "WHERE id=?",
+                (row["id"],),
+            ).fetchone()
+        )
+        batches_before = self.connection.execute(
+            "SELECT COUNT(*) FROM review_batches"
+        ).fetchone()[0]
+
+        with self.assertRaisesRegex(ValueError, expected_error):
+            self.claim_without_transcript_read(2_000_000_102.0)
+
+        sequence = self.connection.execute(
+            "SELECT value FROM metadata WHERE key=?",
+            (self.runtime.REVIEW_NEXT_BATCH_ID_KEY,),
+        ).fetchone()
+        self.assertEqual(
+            None if sequence is None else sequence["value"],
+            sequence_before,
+        )
+        self.assertEqual(
+            tuple(
+                self.connection.execute(
+                    "SELECT status,generation,batch_id FROM review_items "
+                    "WHERE id=?",
+                    (row["id"],),
+                ).fetchone()
+            ),
+            item_before,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM review_batches"
+            ).fetchone()[0],
+            batches_before,
+        )
+        self.assertFalse(self.connection.in_transaction)
+
+    def test_malformed_active_pointer_fails_before_allocation(self) -> None:
+        self.connection.execute(
+            "INSERT INTO metadata(key,value) VALUES(?,?)",
+            (self.runtime.QUALITY_ACTIVE_EPOCH_KEY, "Q-001"),
+        )
+
+        self.assert_invalid_epoch_metadata_fails_before_allocation(
+            "invalid_quality_epoch_pointer"
+        )
+
+    def test_malformed_active_epoch_fails_before_allocation(self) -> None:
+        self.connection.execute(
+            "INSERT INTO metadata(key,value) VALUES(?,?)",
+            (self.runtime.quality_epoch_key("Q-001"), "{}"),
+        )
+        self.connection.execute(
+            "INSERT INTO metadata(key,value) VALUES(?,?)",
+            (self.runtime.QUALITY_ACTIVE_EPOCH_KEY, "Q-001"),
+        )
+
+        self.assert_invalid_epoch_metadata_fails_before_allocation(
+            "invalid_quality_epoch"
+        )
+
+    def test_quality_contract_binds_prospective_capture_cutoff(self) -> None:
+        payload = self.runtime.quality_contract_payload()
+
+        self.assertEqual(payload["version"], 2)
+        self.assertEqual(
+            payload["prospective_capture"],
+            {
+                "source": "review-items-first-stop-at",
+                "cutoff": "active-collecting-epoch-started-at",
+                "comparison": "strictly-after-utc-second",
+                "same_second": "exclude",
+                "later_stop": "preserve-earliest",
+                "pre_cutoff_disposition": (
+                    "pending-unclaimable-while-epoch-collecting"
+                ),
+            },
+        )
+        self.assertEqual(
+            self.runtime.quality_contract_digest(),
+            self.runtime.sha256_json(payload),
         )
 
     def terminalize_invalid_epoch(
@@ -452,13 +826,13 @@ class ProspectiveQualityEpochTests(CandidateBatchFixture):
     def test_orphaned_collecting_epoch_rolls_back_review(self) -> None:
         now = 2_000_000_000.0
         self.open_epoch(now)
-        self.connection.execute(
-            "DELETE FROM metadata WHERE key=?",
-            (self.runtime.QUALITY_ACTIVE_EPOCH_KEY,),
-        )
         claim = self.claim(1, now + 1)
         result_path = self.write_result(
             claim, self.result_payload(claim)
+        )
+        self.connection.execute(
+            "DELETE FROM metadata WHERE key=?",
+            (self.runtime.QUALITY_ACTIVE_EPOCH_KEY,),
         )
 
         with self.assertRaisesRegex(
@@ -700,13 +1074,13 @@ class ProspectiveQualityEpochTests(CandidateBatchFixture):
     def test_malformed_epoch_rolls_back_review(self) -> None:
         now = 2_000_000_000.0
         self.open_epoch(now)
-        self.connection.execute(
-            "UPDATE metadata SET value='{}' WHERE key=?",
-            (self.runtime.quality_epoch_key("Q-001"),),
-        )
         claim = self.claim(1, now + 1)
         result_path = self.write_result(
             claim, self.result_payload(claim)
+        )
+        self.connection.execute(
+            "UPDATE metadata SET value='{}' WHERE key=?",
+            (self.runtime.quality_epoch_key("Q-001"),),
         )
 
         with self.assertRaisesRegex(

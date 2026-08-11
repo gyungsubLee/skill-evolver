@@ -638,16 +638,18 @@ def _prepare_review_batch(
         _recover_expired_review_leases(
             connection, now, result_files
         )
+        cutoff = _collecting_quality_started_at(connection)
         rows = connection.execute(
             """
             SELECT * FROM review_items
             WHERE status='pending' AND binding_status='accepted'
               AND error_code IS NULL
               AND observed_boundary>reviewed_boundary
+              AND (? IS NULL OR first_stop_at>?)
             ORDER BY pending_since,id
             LIMIT ?
             """,
-            (limit,),
+            (cutoff, cutoff, limit),
         ).fetchall()
         if not rows:
             connection.commit()
@@ -5825,7 +5827,7 @@ def phase4_release_report_digest() -> str:
 def quality_contract_payload() -> dict[str, object]:
     return {
         "schema_version": 1,
-        "version": 1,
+        "version": 2,
         "states": [
             "collecting",
             "sealed",
@@ -5852,6 +5854,16 @@ def quality_contract_payload() -> dict[str, object]:
             "misattribution_numerator": 1,
             "misattribution_denominator": 5,
             "external_content_adoption_maximum": 0,
+        },
+        "prospective_capture": {
+            "source": "review-items-first-stop-at",
+            "cutoff": "active-collecting-epoch-started-at",
+            "comparison": "strictly-after-utc-second",
+            "same_second": "exclude",
+            "later_stop": "preserve-earliest",
+            "pre_cutoff_disposition": (
+                "pending-unclaimable-while-epoch-collecting"
+            ),
         },
         "retention_seconds": {
             "collection": QUALITY_COLLECTION_TTL_SECONDS,
@@ -6810,6 +6822,15 @@ def active_quality_epoch(
     ):
         raise ValueError("invalid_quality_epoch_pointer")
     return active_epochs[0]
+
+
+def _collecting_quality_started_at(
+    connection: sqlite3.Connection,
+) -> Optional[str]:
+    epoch = active_quality_epoch(connection)
+    if epoch is None or epoch["state"] != "collecting":
+        return None
+    return str(epoch["started_at"])
 
 
 def _validate_quality_decision(value: object) -> dict[str, object]:
