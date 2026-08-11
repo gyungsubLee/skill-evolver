@@ -2972,6 +2972,57 @@ class MaintenanceStatusTests(unittest.TestCase):
         spool.mkdir(mode=0o700)
         return replace(self.installation, spool=spool)
 
+    def open_collecting_epoch(self, cutoff: float) -> dict[str, object]:
+        connection = self.runtime.open_database(self.installation)
+        try:
+            return self.runtime.open_quality_epoch(
+                connection,
+                self.installation,
+                cutoff,
+                predecessor=None,
+            )
+        finally:
+            connection.close()
+
+    def insert_status_item(
+        self,
+        connection: sqlite3.Connection,
+        name: str,
+        first_stop_at: str,
+        *,
+        binding_status: str = "accepted",
+        error_code: str | None = None,
+        observed_boundary: int = 2,
+        reviewed_boundary: int = 1,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO review_items(
+              session_key,raw_session_id,status,binding_status,
+              transcript_path,transcript_device,transcript_inode,
+              observed_boundary,last_stop_ns,reviewed_boundary,
+              first_stop_at,last_stop_at,pending_since,error_code,
+              raw_metadata_expires_at,dedupe_expires_at
+            ) VALUES(?,?,'pending',?,?,?,?,?,0,?,?,?,?,?,?,?)
+            """,
+            (
+                f"private-key-{name}",
+                f"private-session-{name}",
+                binding_status,
+                str(self.transcript),
+                70_000 + len(name),
+                80_000 + len(name),
+                observed_boundary,
+                reviewed_boundary,
+                first_stop_at,
+                first_stop_at,
+                first_stop_at,
+                error_code,
+                "2099-01-01T00:00:00Z",
+                "2099-02-01T00:00:00Z",
+            ),
+        )
+
     def test_maintenance_imports_plugin_data_spool_idempotently(
         self,
     ) -> None:
@@ -5272,6 +5323,347 @@ class MaintenanceStatusTests(unittest.TestCase):
         connection.close()
         self.assertIsNone(marker)
 
+    def test_status_rejects_caller_owned_transaction_without_closing_it(
+        self,
+    ) -> None:
+        connection = self.runtime.open_database(self.installation)
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "INSERT INTO metadata(key,value) VALUES('caller-owned','1')"
+        )
+
+        with self.assertRaisesRegex(ValueError, "active_transaction"):
+            self.runtime.queue_status(
+                connection, self.installation, 2_000_000_000.0
+            )
+
+        self.assertTrue(connection.in_transaction)
+        self.assertEqual(
+            connection.execute(
+                "SELECT value FROM metadata WHERE key='caller-owned'"
+            ).fetchone()["value"],
+            "1",
+        )
+        connection.rollback()
+        self.assertIsNone(
+            connection.execute(
+                "SELECT value FROM metadata WHERE key='caller-owned'"
+            ).fetchone()
+        )
+        connection.close()
+
+    def test_status_reads_one_db_snapshot_before_config_and_spool(
+        self,
+    ) -> None:
+        connection = self.runtime.open_database(
+            self.installation, read_only=True
+        )
+        timeline: list[str] = []
+        real_cutoff = self.runtime._collecting_quality_started_at
+
+        def trace(statement: str) -> None:
+            timeline.append(f"sql:{statement.strip().split()[0].upper()}")
+
+        def checked_cutoff(
+            owned: sqlite3.Connection,
+        ) -> str | None:
+            self.assertIs(owned, connection)
+            self.assertTrue(owned.in_transaction)
+            timeline.append("helper")
+            return real_cutoff(owned)
+
+        def checked_config(installation):
+            self.assertIs(installation, self.installation)
+            self.assertFalse(connection.in_transaction)
+            timeline.append("config")
+            return self.runtime_config
+
+        def checked_spool(installation, config, now):
+            self.assertIs(installation, self.installation)
+            self.assertIs(config, self.runtime_config)
+            self.assertFalse(connection.in_transaction)
+            timeline.append("spool")
+            return False, 0, 0, 0, False, 0
+
+        connection.set_trace_callback(trace)
+        with mock.patch.object(
+            self.runtime,
+            "_collecting_quality_started_at",
+            side_effect=checked_cutoff,
+        ), mock.patch.object(
+            self.runtime, "load_config", side_effect=checked_config
+        ), mock.patch.object(
+            self.runtime, "spool_inventory", side_effect=checked_spool
+        ):
+            status = self.runtime.queue_status(
+                connection, self.installation, 2_000_000_000.0
+            )
+        connection.set_trace_callback(None)
+        connection.close()
+
+        begin = timeline.index("sql:BEGIN")
+        helper = timeline.index("helper")
+        commit = timeline.index("sql:COMMIT")
+        config = timeline.index("config")
+        spool = timeline.index("spool")
+        select_indexes = [
+            index
+            for index, event in enumerate(timeline)
+            if event == "sql:SELECT"
+        ]
+        self.assertLess(begin, helper)
+        self.assertTrue(select_indexes)
+        self.assertTrue(all(helper < index < commit for index in select_indexes))
+        self.assertLess(commit, config)
+        self.assertLess(config, spool)
+        self.assertEqual(status["pending_sessions"], 0)
+
+    def test_status_holds_cutoff_and_aggregates_in_one_delete_snapshot(
+        self,
+    ) -> None:
+        cutoff = 2_000_000_100.0
+        self.open_collecting_epoch(cutoff)
+        writer = self.runtime.open_database(self.installation)
+        self.insert_status_item(
+            writer, "race-fresh", self.runtime.iso_utc(cutoff + 1)
+        )
+        reader = self.runtime.open_database(self.installation)
+        reader.execute("PRAGMA query_only = ON")
+        real_cutoff = self.runtime._collecting_quality_started_at
+        commit_blocked: list[bool] = []
+
+        def start_writer_after_cutoff_read(
+            owned: sqlite3.Connection,
+        ) -> str | None:
+            started_at = real_cutoff(owned)
+            self.assertTrue(owned.in_transaction)
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute(
+                "UPDATE metadata SET value='Q-099' WHERE key=?",
+                (self.runtime.QUALITY_ACTIVE_EPOCH_KEY,),
+            )
+            writer.execute(
+                """
+                UPDATE review_items SET observed_boundary=reviewed_boundary
+                WHERE session_key='private-key-race-fresh'
+                """
+            )
+            with self.assertRaisesRegex(
+                sqlite3.OperationalError, "database is locked"
+            ):
+                writer.commit()
+            commit_blocked.append(writer.in_transaction)
+            return started_at
+
+        try:
+            with mock.patch.object(
+                self.runtime,
+                "_collecting_quality_started_at",
+                side_effect=start_writer_after_cutoff_read,
+            ):
+                status = self.runtime.queue_status(
+                    reader, self.installation, cutoff + 2
+                )
+            self.assertFalse(reader.in_transaction)
+            self.assertEqual(commit_blocked, [True])
+            self.assertEqual(status["pending_sessions"], 1)
+            self.assertEqual(status["claimable_sessions"], 1)
+            self.assertEqual(status["quarantined_sessions"], 0)
+        finally:
+            if writer.in_transaction:
+                writer.rollback()
+            reader.close()
+            writer.close()
+
+        verifier = self.runtime.open_database(self.installation)
+        self.assertEqual(
+            verifier.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (self.runtime.QUALITY_ACTIVE_EPOCH_KEY,),
+            ).fetchone()["value"],
+            "Q-001",
+        )
+        self.assertEqual(
+            tuple(verifier.execute(
+                """
+                SELECT observed_boundary,reviewed_boundary
+                FROM review_items
+                WHERE session_key='private-key-race-fresh'
+                """
+            ).fetchone()),
+            (2, 1),
+        )
+        verifier.close()
+
+    def test_status_fails_closed_on_corrupt_quality_epoch_metadata(
+        self,
+    ) -> None:
+        writer = self.runtime.open_database(self.installation)
+        writer.execute(
+            "INSERT INTO metadata(key,value) VALUES(?,?)",
+            (self.runtime.QUALITY_ACTIVE_EPOCH_KEY, "Q-001"),
+        )
+        writer.close()
+        database_before = self.installation.database.read_bytes()
+        connection = self.runtime.open_database(
+            self.installation, read_only=True
+        )
+        changes_before = connection.total_changes
+        rows_before = connection.execute(
+            "SELECT * FROM review_items ORDER BY id"
+        ).fetchall()
+
+        with mock.patch.object(
+            self.runtime,
+            "load_config",
+            side_effect=AssertionError("partial status config read"),
+        ), mock.patch.object(
+            self.runtime,
+            "spool_inventory",
+            side_effect=AssertionError("partial status spool read"),
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "invalid_quality_epoch_pointer"
+            ):
+                self.runtime.queue_status(
+                    connection, self.installation, 2_000_000_000.0
+                )
+
+        self.assertFalse(connection.in_transaction)
+        self.assertEqual(connection.total_changes, changes_before)
+        self.assertEqual(
+            connection.execute(
+                "SELECT * FROM review_items ORDER BY id"
+            ).fetchall(),
+            rows_before,
+        )
+        connection.close()
+        self.assertEqual(
+            self.installation.database.read_bytes(), database_before
+        )
+
+    def test_status_applies_prospective_cutoff_after_failure_precedence(
+        self,
+    ) -> None:
+        cutoff = 2_000_000_100.0
+        started_at = self.runtime.iso_utc(cutoff)
+        old = self.runtime.iso_utc(cutoff - 1)
+        fresh = self.runtime.iso_utc(cutoff + 1)
+        self.open_collecting_epoch(cutoff)
+        connection = self.runtime.open_database(self.installation)
+        self.insert_status_item(connection, "fresh", fresh)
+        self.insert_status_item(connection, "old", old)
+        self.insert_status_item(connection, "same-second", started_at)
+        self.insert_status_item(
+            connection,
+            "allowlisted",
+            old,
+            binding_status="pending_epoch",
+            error_code="transcript_changed",
+            observed_boundary=1,
+            reviewed_boundary=1,
+        )
+        self.insert_status_item(
+            connection,
+            "unknown",
+            old,
+            binding_status="pending_epoch",
+            error_code="private-error-/secret/transcript.jsonl",
+            observed_boundary=1,
+            reviewed_boundary=1,
+        )
+        self.insert_status_item(
+            connection,
+            "binding",
+            old,
+            binding_status="pending_epoch",
+            observed_boundary=1,
+            reviewed_boundary=1,
+        )
+        self.insert_status_item(
+            connection,
+            "empty",
+            old,
+            observed_boundary=1,
+            reviewed_boundary=1,
+        )
+        connection.close()
+
+        database_before = self.installation.database.read_bytes()
+        connection = self.runtime.open_database(
+            self.installation, read_only=True
+        )
+        changes_before = connection.total_changes
+        status = self.runtime.queue_status(
+            connection, self.installation, cutoff + 2
+        )
+        self.assertEqual(connection.total_changes, changes_before)
+        connection.close()
+
+        self.assertEqual(
+            self.installation.database.read_bytes(), database_before
+        )
+        self.assertEqual(status["pending_sessions"], 7)
+        self.assertEqual(status["claimable_sessions"], 1)
+        self.assertEqual(status["quarantined_sessions"], 6)
+        self.assertEqual(
+            status["pending_sessions"],
+            status["claimable_sessions"]
+            + status["quarantined_sessions"],
+        )
+        self.assertEqual(
+            status["quarantined_sessions"],
+            sum(status["quarantined_by_error"].values()),
+        )
+        self.assertEqual(
+            status["quarantined_by_error"]["transcript_changed"], 1
+        )
+        self.assertEqual(
+            status["quarantined_by_error"]["unknown_error"], 1
+        )
+        self.assertEqual(
+            status["quarantined_by_error"]["binding_pending"], 1
+        )
+        self.assertEqual(
+            status["quarantined_by_error"]["empty_generation"], 1
+        )
+        self.assertEqual(
+            status["quarantined_by_error"]["pre_quality_epoch"], 2
+        )
+        serialized = json.dumps(status, sort_keys=True)
+        for private in (
+            "private-key-fresh",
+            "private-key-old",
+            "private-key-same-second",
+            "private-key-allowlisted",
+            "private-key-unknown",
+            "private-key-binding",
+            "private-key-empty",
+            "private-session-fresh",
+            "private-session-old",
+            "private-session-same-second",
+            "private-session-allowlisted",
+            "private-session-unknown",
+            "private-session-binding",
+            "private-session-empty",
+            str(self.transcript),
+            "70003",
+            "70005",
+            "70007",
+            "70011",
+            "80003",
+            "80005",
+            "80007",
+            "80011",
+            started_at,
+            old,
+            fresh,
+            "private-error-/secret/transcript.jsonl",
+            '{"payload":{"role":"user"}}',
+        ):
+            with self.subTest(private=private):
+                self.assertNotIn(private, serialized)
+
     def test_status_reports_sessions_generations_leases_spool_and_cleanup_read_only(
         self,
     ) -> None:
@@ -5529,6 +5921,7 @@ class MaintenanceStatusTests(unittest.TestCase):
             *self.runtime.QUEUE_STATUS_ERROR_CODES,
             "binding_pending",
             "empty_generation",
+            "pre_quality_epoch",
             "unknown_error",
         ):
             with self.subTest(bucket=bucket):

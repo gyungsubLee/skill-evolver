@@ -14635,114 +14635,133 @@ def queue_status(
     installation: Installation,
     now: float,
 ) -> dict[str, object]:
-    queue_rows = connection.execute(
-        """
-        WITH classified AS (
-          SELECT pending_since,
-            CASE
-              WHEN binding_status='accepted'
-               AND error_code IS NULL
-               AND observed_boundary>reviewed_boundary
-              THEN 'claimable'
-              WHEN error_code IN (?,?,?,?,?) THEN error_code
-              WHEN error_code IS NOT NULL THEN 'unknown_error'
-              WHEN binding_status!='accepted' THEN 'binding_pending'
-              ELSE 'empty_generation'
-            END AS bucket
-          FROM review_items
-          WHERE status='pending'
-        )
-        SELECT bucket,COUNT(*) AS count,
-               (SELECT MIN(pending_since) FROM classified) AS oldest
-        FROM classified
-        GROUP BY bucket
-        """,
-        QUEUE_STATUS_ERROR_CODES,
-    )
-    counts: dict[str, int] = {}
-    oldest: Optional[str] = None
-    for row in queue_rows:
-        counts[str(row["bucket"])] = int(row["count"])
-        if row["oldest"] is not None:
-            oldest = str(row["oldest"])
-    pending_sessions = sum(counts.values())
-    claimable_sessions = counts.pop("claimable", 0)
-    quarantined_by_error = {
-        **{code: 0 for code in QUEUE_STATUS_ERROR_CODES},
-        "binding_pending": 0,
-        "empty_generation": 0,
-        "unknown_error": 0,
-    }
-    for bucket, count in counts.items():
-        if bucket not in quarantined_by_error:
-            raise sqlite3.DatabaseError("invalid_queue_status_partition")
-        quarantined_by_error[bucket] = count
-    quarantined_sessions = sum(counts.values())
-    if (
-        pending_sessions != claimable_sessions + quarantined_sessions
-        or quarantined_sessions != sum(quarantined_by_error.values())
-    ):
-        raise sqlite3.DatabaseError("invalid_queue_status_partition")
-    generations = int(
-        connection.execute(
-            "SELECT COALESCE(SUM(generation),0) FROM review_items"
-        ).fetchone()[0]
-    )
-    status_counts = {
-        str(row["status"]): int(row["count"])
-        for row in connection.execute(
+    if connection.in_transaction:
+        raise ValueError("active_transaction")
+    connection.execute("BEGIN")
+    try:
+        cutoff = _collecting_quality_started_at(connection)
+        queue_rows = connection.execute(
             """
-            SELECT status,COUNT(*) AS count
-            FROM review_items GROUP BY status
-            """
-        )
-    }
-    leases = connection.execute(
-        """
-        SELECT
-          COALESCE(SUM(CASE WHEN lease_expires_at>=? THEN 1 ELSE 0 END),0)
-            AS active,
-          COALESCE(SUM(CASE WHEN lease_expires_at<? THEN 1 ELSE 0 END),0)
-            AS expired
-        FROM review_items WHERE status='reviewing'
-        """,
-        (iso_utc(now), iso_utc(now)),
-    ).fetchone()
-    binding_failures = int(
-        connection.execute(
-            """
-            SELECT COUNT(*) FROM review_items
-            WHERE binding_status='pending_epoch'
-               OR error_code IN (
-                 'transcript_rebind_required',
-                 'session_binding_unavailable'
-               )
-            """
-        ).fetchone()[0]
-    )
-    overdue_raw = int(
-        connection.execute(
-            """
-            SELECT COUNT(*) FROM review_items
-            WHERE raw_redacted_at IS NULL
-              AND raw_metadata_expires_at <= ?
-            """,
-            (iso_utc(now),),
-        ).fetchone()[0]
-    )
-    metadata = {
-        str(row["key"]): str(row["value"])
-        for row in connection.execute(
-            """
-            SELECT key,value FROM metadata
-            WHERE key IN (
-              'last_hook_success_at',
-              'last_maintenance_at',
-              'capacity_expired_count'
+            WITH classified AS (
+              SELECT pending_since,
+                CASE
+                  WHEN binding_status='accepted'
+                   AND error_code IS NULL
+                   AND observed_boundary>reviewed_boundary
+                   AND (? IS NULL OR first_stop_at>?)
+                  THEN 'claimable'
+                  WHEN error_code IN (?,?,?,?,?) THEN error_code
+                  WHEN error_code IS NOT NULL THEN 'unknown_error'
+                  WHEN binding_status!='accepted' THEN 'binding_pending'
+                  WHEN observed_boundary<=reviewed_boundary
+                  THEN 'empty_generation'
+                  ELSE 'pre_quality_epoch'
+                END AS bucket
+              FROM review_items
+              WHERE status='pending'
             )
-            """
+            SELECT bucket,COUNT(*) AS count,
+                   (SELECT MIN(pending_since) FROM classified) AS oldest
+            FROM classified
+            GROUP BY bucket
+            """,
+            (cutoff, cutoff, *QUEUE_STATUS_ERROR_CODES),
+        ).fetchall()
+        counts: dict[str, int] = {}
+        oldest: Optional[str] = None
+        for row in queue_rows:
+            counts[str(row["bucket"])] = int(row["count"])
+            if row["oldest"] is not None:
+                oldest = str(row["oldest"])
+        pending_sessions = sum(counts.values())
+        claimable_sessions = counts.pop("claimable", 0)
+        quarantined_by_error = {
+            **{code: 0 for code in QUEUE_STATUS_ERROR_CODES},
+            "binding_pending": 0,
+            "empty_generation": 0,
+            "pre_quality_epoch": 0,
+            "unknown_error": 0,
+        }
+        for bucket, count in counts.items():
+            if bucket not in quarantined_by_error:
+                raise sqlite3.DatabaseError(
+                    "invalid_queue_status_partition"
+                )
+            quarantined_by_error[bucket] = count
+        quarantined_sessions = sum(counts.values())
+        if (
+            pending_sessions
+            != claimable_sessions + quarantined_sessions
+            or quarantined_sessions
+            != sum(quarantined_by_error.values())
+        ):
+            raise sqlite3.DatabaseError(
+                "invalid_queue_status_partition"
+            )
+        generations = int(
+            connection.execute(
+                "SELECT COALESCE(SUM(generation),0) FROM review_items"
+            ).fetchone()[0]
         )
-    }
+        status_counts = {
+            str(row["status"]): int(row["count"])
+            for row in connection.execute(
+                """
+                SELECT status,COUNT(*) AS count
+                FROM review_items GROUP BY status
+                """
+            )
+        }
+        leases = connection.execute(
+            """
+            SELECT
+              COALESCE(SUM(CASE WHEN lease_expires_at>=? THEN 1 ELSE 0 END),0)
+                AS active,
+              COALESCE(SUM(CASE WHEN lease_expires_at<? THEN 1 ELSE 0 END),0)
+                AS expired
+            FROM review_items WHERE status='reviewing'
+            """,
+            (iso_utc(now), iso_utc(now)),
+        ).fetchone()
+        binding_failures = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM review_items
+                WHERE binding_status='pending_epoch'
+                   OR error_code IN (
+                     'transcript_rebind_required',
+                     'session_binding_unavailable'
+                   )
+                """
+            ).fetchone()[0]
+        )
+        overdue_raw = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM review_items
+                WHERE raw_redacted_at IS NULL
+                  AND raw_metadata_expires_at <= ?
+                """,
+                (iso_utc(now),),
+            ).fetchone()[0]
+        )
+        metadata = {
+            str(row["key"]): str(row["value"])
+            for row in connection.execute(
+                """
+                SELECT key,value FROM metadata
+                WHERE key IN (
+                  'last_hook_success_at',
+                  'last_maintenance_at',
+                  'capacity_expired_count'
+                )
+                """
+            )
+        }
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
     config = load_config(installation)
     (
         spool_available,
