@@ -1,6 +1,6 @@
 {
   "name": "skill-evolver",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Queue bounded Codex sessions for explicit skill-improvement review.",
   "skills": "./skills/",
   "hooks": "./hooks/hooks.json"

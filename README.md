@@ -5,11 +5,12 @@ explicit Review/Inbox surface. The Hook does not run a model, analyze
 transcript bytes, create a candidate automatically, or change an installed
 skill.
 
-Version `0.1.5` recognizes the text and control response items emitted by
+Version `0.1.6` recognizes the text and control response items emitted by
 Codex `0.146.0`, defaults the user-only quality-label display to Korean, keeps
 `--locale en`, preserves new candidate summaries in the direct user's
 language, and requires causal target attribution plus bounded target
-inspection before a candidate.
+inspection before a candidate. During a collecting quality epoch, it admits
+only sessions whose earliest Stop is strictly after the epoch start.
 
 ## Gate
 
@@ -157,6 +158,11 @@ result to the exact bound result path.
 - `status` separates `pending_sessions` into `claimable_sessions` and
   `quarantined_sessions`, with sanitized aggregate
   `quarantined_by_error` counts.
+- During a collecting quality epoch, only sessions whose earliest Stop is
+  strictly after the epoch start are claimable. Otherwise-claimable rows from
+  before or equal to that boundary remain pending and appear only in the
+  aggregate `quarantined_by_error.pre_quality_epoch` count. Status remains
+  read-only, and Review remains explicit.
 
 catalog-inspect opens one allowlisted target and returns bounded content plus
 an installation-HMAC `inspection_proof`. Before that read, it opens SQLite

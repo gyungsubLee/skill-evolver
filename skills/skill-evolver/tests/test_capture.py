@@ -1702,11 +1702,16 @@ class ProductionSurfaceTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(manifest["version"], "0.1.5")
-        self.assertEqual(runtime["version"], "0.1.5")
+        self.assertEqual(manifest["version"], "0.1.6")
+        self.assertEqual(runtime["version"], "0.1.6")
+        loaded_runtime = load_runtime()
         self.assertEqual(
-            load_runtime().VERSION,
-            "skill-evolver 0.1.5",
+            loaded_runtime.VERSION,
+            "skill-evolver 0.1.6",
+        )
+        self.assertIsInstance(
+            loaded_runtime.load_review_runtime(),
+            loaded_runtime.ReviewRuntime,
         )
         self.assertEqual(set(hooks["hooks"]), {"Stop"})
         self.assertNotIn("matcher", hooks["hooks"]["Stop"][0])

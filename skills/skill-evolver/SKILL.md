@@ -33,7 +33,11 @@ opens SQLite read-only. They do not run maintenance, clean result files,
 import spool files, or open transcripts. Inspection shows only the sanitized
 candidate and aggregate evidence. In status, `spool.files` is raw diagnostic
 inventory and `spool.verified_files` is the HMAC/schema-verified capture
-count.
+count. During a collecting quality epoch, only sessions whose earliest Stop
+is strictly after the epoch start are claimable. Otherwise-claimable rows from
+before or equal to that boundary remain pending in the aggregate
+`quarantined_by_error.pre_quality_epoch` bucket. Status remains read-only,
+and Review remains explicit.
 `C-NNN` is the display grammar; replace it with the exact ID returned by
 Python for an actual invocation.
 
