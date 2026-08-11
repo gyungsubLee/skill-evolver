@@ -2009,6 +2009,267 @@ class GenerationStateTests(unittest.TestCase):
         self.assertEqual(event.observed_at_ns, 123_456_789)
         self.assertEqual(order, ["time", "open"])
 
+    def test_strictly_newer_stop_refreshes_unreviewed_first_locator(
+        self,
+    ) -> None:
+        connection = self.runtime.open_database(self.installation)
+        before = connection.execute(
+            "SELECT * FROM review_items WHERE session_key=?",
+            (self.key,),
+        ).fetchone()
+        replacement = (self.sessions / "replacement-first.jsonl").resolve()
+        replacement.write_bytes(self.transcript.read_bytes())
+        raw = json.dumps(
+            {**self.payload, "transcript_path": str(replacement)}
+        ).encode()
+        event = self.runtime.parse_session_stop(
+            raw, self.installation, self.runtime_config
+        )
+        assert event is not None
+        event = replace(
+            event, observed_at_ns=int(before["last_stop_ns"]) + 1
+        )
+        connection.execute(
+            "UPDATE review_items SET error_code='transcript_changed' "
+            "WHERE session_key=?",
+            (self.key,),
+        )
+        connection.commit()
+
+        outcome = self.runtime.upsert_session(
+            connection,
+            event,
+            self.key,
+            self.runtime_config,
+            2_000_000_001.0,
+        )
+        row = connection.execute(
+            "SELECT * FROM review_items WHERE session_key=?",
+            (self.key,),
+        ).fetchone()
+        connection.close()
+
+        self.assertEqual(outcome, "advanced")
+        self.assertEqual(row["transcript_path"], str(replacement))
+        self.assertEqual(row["transcript_inode"], replacement.stat().st_ino)
+        self.assertEqual(row["generation"], 1)
+        self.assertEqual(row["transcript_epoch"], 0)
+        self.assertEqual(row["reviewed_boundary"], 0)
+        self.assertEqual(row["binding_status"], "accepted")
+        self.assertIsNone(row["error_code"])
+        self.assertEqual(row["pending_since"], before["pending_since"])
+
+    def test_newer_stop_keeps_ineligible_first_rows_pending_epoch(self) -> None:
+        cases = (
+            (
+                "reviewing",
+                {"status": "reviewing"},
+                ("reviewing", 1, 0, 0, "pending_epoch"),
+            ),
+            (
+                "generation_2",
+                {"generation": 2},
+                ("pending", 2, 0, 0, "pending_epoch"),
+            ),
+            (
+                "epoch_1",
+                {"transcript_epoch": 1},
+                ("pending", 1, 1, 0, "pending_epoch"),
+            ),
+            (
+                "reviewed_1",
+                {"reviewed_boundary": 1},
+                ("pending", 1, 0, 1, "pending_epoch"),
+            ),
+        )
+        connection = self.runtime.open_database(self.installation)
+        initial = self.transcript.stat()
+        for name, update, expected in cases:
+            with self.subTest(name=name):
+                connection.execute(
+                    """
+                    UPDATE review_items
+                    SET status='pending',generation=1,transcript_epoch=0,
+                        reviewed_boundary=0,binding_status='accepted',
+                        error_code=NULL,transcript_path=?,transcript_size=?,
+                        transcript_mtime_ns=?,transcript_device=?,
+                        transcript_inode=?,observed_boundary=?
+                    WHERE session_key=?
+                    """,
+                    (
+                        str(self.transcript),
+                        initial.st_size,
+                        initial.st_mtime_ns,
+                        initial.st_dev,
+                        initial.st_ino,
+                        initial.st_size,
+                        self.key,
+                    ),
+                )
+                column, value = next(iter(update.items()))
+                connection.execute(
+                    f"UPDATE review_items SET {column}=? WHERE session_key=?",
+                    (value, self.key),
+                )
+                before = connection.execute(
+                    "SELECT * FROM review_items WHERE session_key=?",
+                    (self.key,),
+                ).fetchone()
+                replacement = self.sessions / f"replacement-{name}.jsonl"
+                replacement.write_bytes(self.transcript.read_bytes())
+                event = self.runtime.parse_session_stop(
+                    json.dumps(
+                        {**self.payload, "transcript_path": str(replacement)}
+                    ).encode(),
+                    self.installation,
+                    self.runtime_config,
+                )
+                assert event is not None
+                event = replace(
+                    event, observed_at_ns=int(before["last_stop_ns"]) + 1
+                )
+                connection.commit()
+
+                self.runtime.upsert_session(
+                    connection,
+                    event,
+                    self.key,
+                    self.runtime_config,
+                    2_000_000_001.0,
+                )
+                row = connection.execute(
+                    """
+                    SELECT status,generation,transcript_epoch,reviewed_boundary,
+                      binding_status,error_code
+                    FROM review_items WHERE session_key=?
+                    """,
+                    (self.key,),
+                ).fetchone()
+                self.assertEqual(tuple(row)[:5], expected)
+                self.assertEqual(
+                    row["error_code"], "transcript_rebind_required"
+                )
+        connection.close()
+
+    def test_newer_stop_recovers_pending_first_row_on_same_inode(self) -> None:
+        connection = self.runtime.open_database(self.installation)
+        before = connection.execute(
+            "SELECT * FROM review_items WHERE session_key=?",
+            (self.key,),
+        ).fetchone()
+        connection.execute(
+            """
+            UPDATE review_items
+            SET binding_status='pending_epoch',
+                error_code='transcript_rebind_required'
+            WHERE session_key=?
+            """,
+            (self.key,),
+        )
+        connection.commit()
+        event = self.runtime.parse_session_stop(
+            self.raw, self.installation, self.runtime_config
+        )
+        assert event is not None
+        event = replace(
+            event, observed_at_ns=int(before["last_stop_ns"]) + 1
+        )
+
+        outcome = self.runtime.upsert_session(
+            connection,
+            event,
+            self.key,
+            self.runtime_config,
+            2_000_000_001.0,
+        )
+        row = connection.execute(
+            """
+            SELECT generation,transcript_epoch,reviewed_boundary,binding_status,
+              error_code,pending_since
+            FROM review_items WHERE session_key=?
+            """,
+            (self.key,),
+        ).fetchone()
+        connection.close()
+
+        self.assertEqual(outcome, "advanced")
+        self.assertEqual(
+            tuple(row),
+            (1, 0, 0, "accepted", None, before["pending_since"]),
+        )
+
+    def test_stale_or_equal_stop_cannot_recover_pending_first_row(self) -> None:
+        connection = self.runtime.open_database(self.installation)
+        before = connection.execute(
+            "SELECT * FROM review_items WHERE session_key=?",
+            (self.key,),
+        ).fetchone()
+        for name, raw, offset in (
+            (
+                "stale",
+                json.dumps(
+                    {
+                        **self.payload,
+                        "transcript_path": str(
+                            self.sessions / "stale-replacement.jsonl"
+                        ),
+                    }
+                ).encode(),
+                -1,
+            ),
+            ("equal", self.raw, 0),
+        ):
+            with self.subTest(name=name):
+                connection.execute(
+                    """
+                    UPDATE review_items
+                    SET binding_status='pending_epoch',
+                        error_code='transcript_rebind_required'
+                    WHERE session_key=?
+                    """,
+                    (self.key,),
+                )
+                if name == "stale":
+                    (self.sessions / "stale-replacement.jsonl").write_bytes(
+                        self.transcript.read_bytes()
+                    )
+                event = self.runtime.parse_session_stop(
+                    raw,
+                    self.installation,
+                    self.runtime_config,
+                )
+                assert event is not None
+                event = replace(
+                    event,
+                    observed_at_ns=int(before["last_stop_ns"]) + offset,
+                )
+                connection.commit()
+
+                outcome = self.runtime.upsert_session(
+                    connection,
+                    event,
+                    self.key,
+                    self.runtime_config,
+                    2_000_000_001.0,
+                )
+                row = connection.execute(
+                    """
+                    SELECT binding_status,error_code,last_stop_ns
+                    FROM review_items WHERE session_key=?
+                    """,
+                    (self.key,),
+                ).fetchone()
+                self.assertEqual(outcome, "stale")
+                self.assertEqual(
+                    tuple(row),
+                    (
+                        "pending_epoch",
+                        "transcript_rebind_required",
+                        before["last_stop_ns"],
+                    ),
+                )
+        connection.close()
+
     def test_same_size_mtime_change_requires_epoch_binding(self) -> None:
         connection = self.runtime.open_database(self.installation)
         before = self.transcript.stat()
@@ -4538,7 +4799,95 @@ class MaintenanceStatusTests(unittest.TestCase):
         self.assertEqual(
             row["last_stop_ns"], 2_000_000_000_250_000_002
         )
-        self.assertEqual(row["binding_status"], "pending_epoch")
+        self.assertEqual(row["binding_status"], "accepted")
+
+    def test_signed_spool_locator_refresh_stays_metadata_only(self) -> None:
+        now = 2_000_000_000.0
+        first = replace(
+            self.event("metadata-only-refresh"),
+            observed_at_ns=2_000_000_000_000_000_000,
+        )
+        key = self.runtime.session_key(self.installation, first.session_id)
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                self.installation,
+                self.runtime_config,
+                first,
+                key,
+                now,
+            )
+        )
+        connection = self.runtime.open_database(self.installation)
+        replacement = (
+            self.sessions / "metadata-only-replacement.jsonl"
+        ).resolve()
+        replacement.write_bytes(self.transcript.read_bytes())
+        second = self.runtime.parse_session_stop(
+            json.dumps(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": first.session_id,
+                    "cwd": str(self.workspace),
+                    "transcript_path": str(replacement),
+                }
+            ).encode(),
+            self.installation,
+            self.runtime_config,
+        )
+        assert second is not None
+        second = replace(
+            second, observed_at_ns=first.observed_at_ns + 1
+        )
+        with mock.patch.object(
+            self.runtime,
+            "_initial_session_meta",
+            side_effect=AssertionError("initial metadata read"),
+        ), mock.patch.object(
+            self.runtime,
+            "read_frozen_transcript",
+            side_effect=AssertionError("transcript read"),
+        ):
+            first_import = self.runtime.import_spool(
+                connection, self.installation, self.runtime_config, now + 1
+            )
+            self.assertTrue(
+                self.runtime.spool_session_stop(
+                    self.installation,
+                    self.runtime_config,
+                    second,
+                    key,
+                    now + 2,
+                )
+            )
+            second_import = self.runtime.import_spool(
+                connection, self.installation, self.runtime_config, now + 3
+            )
+        row = connection.execute(
+            """
+            SELECT status,binding_status,transcript_path,transcript_inode
+            FROM review_items WHERE session_key=?
+            """,
+            (key,),
+        ).fetchone()
+        claimable = connection.execute(
+            """
+            SELECT COUNT(*) FROM review_items
+            WHERE session_key=? AND status='pending'
+              AND binding_status='accepted'
+            """,
+            (key,),
+        ).fetchone()[0]
+        connection.close()
+
+        self.assertEqual(first_import["spool_imported"], 1)
+        self.assertEqual(second_import["spool_duplicates"], 1)
+        self.assertEqual(tuple(row), (
+            "pending",
+            "accepted",
+            str(replacement),
+            replacement.stat().st_ino,
+        ))
+        self.assertEqual(claimable, 1)
 
     def test_maintenance_expires_pending_and_spool_raw_data_then_dedupe_row(
         self,

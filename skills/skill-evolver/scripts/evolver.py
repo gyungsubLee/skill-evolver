@@ -11434,18 +11434,39 @@ def upsert_session(
                     and same_boundary
                     and (not same_path or not same_mtime)
                 )
-                needs_rebind = (
+                status = str(row["status"])
+                generation = int(row["generation"])
+                transcript_epoch = int(row["transcript_epoch"])
+                reviewed_boundary = int(row["reviewed_boundary"])
+                raw_needs_rebind = (
                     pending_binding
                     or not same_identity
                     or shrank
                     or same_size_locator_change
                 )
-                new_work = needs_rebind or (
-                    same_identity
-                    and event.transcript_size > int(row["reviewed_boundary"])
+                refreshable_first_generation = (
+                    status == "pending"
+                    and generation == 1
+                    and transcript_epoch == 0
+                    and reviewed_boundary == 0
                 )
-                status = str(row["status"])
-                generation = int(row["generation"])
+                refreshes_locator = (
+                    refreshable_first_generation
+                    and event_time_ns > prior_time_ns
+                    and (
+                        not same_identity
+                        or (
+                            pending_binding
+                            and not shrank
+                            and not same_size_locator_change
+                        )
+                    )
+                )
+                needs_rebind = raw_needs_rebind and not refreshes_locator
+                new_work = raw_needs_rebind or (
+                    same_identity
+                    and event.transcript_size > reviewed_boundary
+                )
                 pending_since = row["pending_since"]
                 excluded_reason = row["excluded_reason"]
                 if status not in {"pending", "reviewing"} and new_work:
@@ -11456,12 +11477,22 @@ def upsert_session(
                     excluded_reason = None
                 elif status == "pending" and pending_since is None:
                     pending_since = now_text
-                binding_status = (
-                    "pending_epoch" if needs_rebind else "accepted"
+                stored_error = row["error_code"]
+                locator_refresh_errors = (
+                    TRANSCRIPT_RETRYABLE_CODES | {"transcript_rebind_required"}
                 )
-                error_code = (
-                    "transcript_rebind_required" if needs_rebind else None
-                )
+                binding_status = "pending_epoch" if needs_rebind else "accepted"
+                if needs_rebind:
+                    error_code = "transcript_rebind_required"
+                elif refreshes_locator:
+                    error_code = (
+                        None
+                        if stored_error is None
+                        or stored_error in locator_refresh_errors
+                        else str(stored_error)
+                    )
+                else:
+                    error_code = None
                 connection.execute(
                     """
                     UPDATE review_items
