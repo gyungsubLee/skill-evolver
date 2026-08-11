@@ -2059,6 +2059,54 @@ class GenerationStateTests(unittest.TestCase):
         self.assertIsNone(row["error_code"])
         self.assertEqual(row["pending_since"], before["pending_since"])
 
+    def test_newer_stop_preserves_unknown_first_row_error(self) -> None:
+        connection = self.runtime.open_database(self.installation)
+        before = connection.execute(
+            "SELECT * FROM review_items WHERE session_key=?",
+            (self.key,),
+        ).fetchone()
+        replacement = (self.sessions / "replacement-unknown.jsonl").resolve()
+        replacement.write_bytes(self.transcript.read_bytes())
+        event = self.runtime.parse_session_stop(
+            json.dumps(
+                {**self.payload, "transcript_path": str(replacement)}
+            ).encode(),
+            self.installation,
+            self.runtime_config,
+        )
+        assert event is not None
+        event = replace(
+            event, observed_at_ns=int(before["last_stop_ns"]) + 1
+        )
+        connection.execute(
+            "UPDATE review_items SET error_code='sentinel_error' "
+            "WHERE session_key=?",
+            (self.key,),
+        )
+        connection.commit()
+
+        outcome = self.runtime.upsert_session(
+            connection,
+            event,
+            self.key,
+            self.runtime_config,
+            2_000_000_001.0,
+        )
+        row = connection.execute(
+            """
+            SELECT transcript_path,binding_status,error_code
+            FROM review_items WHERE session_key=?
+            """,
+            (self.key,),
+        ).fetchone()
+        connection.close()
+
+        self.assertEqual(outcome, "advanced")
+        self.assertEqual(
+            tuple(row),
+            (str(replacement), "accepted", "sentinel_error"),
+        )
+
     def test_newer_stop_keeps_ineligible_first_rows_pending_epoch(self) -> None:
         cases = (
             (
@@ -4818,26 +4866,6 @@ class MaintenanceStatusTests(unittest.TestCase):
             )
         )
         connection = self.runtime.open_database(self.installation)
-        replacement = (
-            self.sessions / "metadata-only-replacement.jsonl"
-        ).resolve()
-        replacement.write_bytes(self.transcript.read_bytes())
-        second = self.runtime.parse_session_stop(
-            json.dumps(
-                {
-                    "hook_event_name": "Stop",
-                    "session_id": first.session_id,
-                    "cwd": str(self.workspace),
-                    "transcript_path": str(replacement),
-                }
-            ).encode(),
-            self.installation,
-            self.runtime_config,
-        )
-        assert second is not None
-        second = replace(
-            second, observed_at_ns=first.observed_at_ns + 1
-        )
         with mock.patch.object(
             self.runtime,
             "_initial_session_meta",
@@ -4850,6 +4878,16 @@ class MaintenanceStatusTests(unittest.TestCase):
             first_import = self.runtime.import_spool(
                 connection, self.installation, self.runtime_config, now + 1
             )
+            original_inode = self.transcript.stat().st_ino
+            replacement = self.sessions / "metadata-only-replacement.jsonl"
+            replacement.write_bytes(self.transcript.read_bytes())
+            replacement_inode = replacement.stat().st_ino
+            replacement.replace(self.transcript)
+            second = replace(
+                self.event(first.session_id),
+                observed_at_ns=first.observed_at_ns + 1,
+            )
+            self.assertEqual(second.transcript_path, first.transcript_path)
             self.assertTrue(
                 self.runtime.spool_session_stop(
                     self.installation,
@@ -4864,7 +4902,8 @@ class MaintenanceStatusTests(unittest.TestCase):
             )
         row = connection.execute(
             """
-            SELECT status,binding_status,transcript_path,transcript_inode
+            SELECT status,binding_status,error_code,transcript_path,
+              transcript_inode
             FROM review_items WHERE session_key=?
             """,
             (key,),
@@ -4874,6 +4913,8 @@ class MaintenanceStatusTests(unittest.TestCase):
             SELECT COUNT(*) FROM review_items
             WHERE session_key=? AND status='pending'
               AND binding_status='accepted'
+              AND error_code IS NULL
+              AND observed_boundary > reviewed_boundary
             """,
             (key,),
         ).fetchone()[0]
@@ -4881,11 +4922,13 @@ class MaintenanceStatusTests(unittest.TestCase):
 
         self.assertEqual(first_import["spool_imported"], 1)
         self.assertEqual(second_import["spool_duplicates"], 1)
+        self.assertNotEqual(original_inode, replacement_inode)
         self.assertEqual(tuple(row), (
             "pending",
             "accepted",
-            str(replacement),
-            replacement.stat().st_ino,
+            None,
+            str(second.transcript_path),
+            replacement_inode,
         ))
         self.assertEqual(claimable, 1)
 
