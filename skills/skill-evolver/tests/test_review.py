@@ -10218,6 +10218,167 @@ class ReviewBatchMaintenanceTests(BatchExportTestCase):
 
 
 class ReviewBatchIntegrationTests(BatchExportTestCase):
+    def test_spooled_stop_replaced_before_import_exports_first_generation(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        session_id = "spooled-replacement"
+        header = (
+            TEST_ROOT / "fixtures/review-current-layout.jsonl"
+        ).read_bytes().splitlines(keepends=True)[0].replace(
+            b"fixture-session", session_id.encode()
+        )
+        delta = (
+            TEST_ROOT / "fixtures/review-current-layout.jsonl"
+        ).read_bytes().splitlines(keepends=True)[5]
+        transcript = self.sessions / f"{session_id}.jsonl"
+        transcript.write_bytes(header + delta)
+        payload = {
+            "hook_event_name": "Stop",
+            "session_id": session_id,
+            "cwd": str(self.workspace),
+            "transcript_path": str(transcript),
+        }
+        event = self.runtime.parse_session_stop(
+            json.dumps(payload).encode(), self.installation, self.config
+        )
+        assert event is not None
+        event = replace(
+            event, observed_at_ns=int(now * 1_000_000_000)
+        )
+        key = self.runtime.session_key(self.installation, session_id)
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                self.installation,
+                self.config,
+                event,
+                key,
+                now,
+                coalesce=True,
+            )
+        )
+        preserved = self.base / "captured-before-import.jsonl"
+        transcript.rename(preserved)
+        replacement_delta = delta.replace(b"correction", b"reflection")
+        transcript.write_bytes(header + replacement_delta)
+
+        connection = self.runtime.open_database(self.installation)
+        imported = self.runtime.import_spool(
+            connection, self.installation, self.config, now + 1
+        )
+        real_read = self.runtime._read_exact_at
+
+        def bounded_read(descriptor: int, start: int, length: int) -> bytes:
+            self.assertLessEqual(start + length, event.transcript_size)
+            return real_read(descriptor, start, length)
+
+        with self.fixed_review_inputs(), mock.patch.object(
+            self.runtime, "_read_exact_at", side_effect=bounded_read
+        ):
+            result = self.runtime.claim_review_batch(
+                connection,
+                self.installation,
+                self.config,
+                now + 2,
+            )
+        contract = self.runtime.load_review_contract(
+            connection, int(result["batch_id"]), "final"
+        )
+        connection.close()
+
+        self.assertEqual(imported["spool_imported"], 1)
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(len(contract["sessions"]), 1)
+        self.assertEqual(contract["sessions"][0]["frozen_from"], 0)
+        self.assertEqual(
+            contract["sessions"][0]["frozen_to"], event.transcript_size
+        )
+        self.assertTrue(contract["sessions"][0]["records"])
+
+    def test_spooled_stop_replaced_before_import_rejects_hmac_mismatch(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        session_id = "spooled-replacement"
+        header = (
+            TEST_ROOT / "fixtures/review-current-layout.jsonl"
+        ).read_bytes().splitlines(keepends=True)[0].replace(
+            b"fixture-session", session_id.encode()
+        )
+        delta = (
+            TEST_ROOT / "fixtures/review-current-layout.jsonl"
+        ).read_bytes().splitlines(keepends=True)[5]
+        transcript = self.sessions / f"{session_id}.jsonl"
+        transcript.write_bytes(header + delta)
+        payload = {
+            "hook_event_name": "Stop",
+            "session_id": session_id,
+            "cwd": str(self.workspace),
+            "transcript_path": str(transcript),
+        }
+        event = self.runtime.parse_session_stop(
+            json.dumps(payload).encode(), self.installation, self.config
+        )
+        assert event is not None
+        event = replace(
+            event, observed_at_ns=int(now * 1_000_000_000)
+        )
+        key = self.runtime.session_key(self.installation, session_id)
+        self.assertTrue(
+            self.runtime.spool_session_stop(
+                self.installation,
+                self.config,
+                event,
+                key,
+                now,
+                coalesce=True,
+            )
+        )
+        preserved = self.base / "captured-before-import.jsonl"
+        transcript.rename(preserved)
+        replacement_header = header.replace(
+            b"spooled-replacement", b"spooled-replacemenx"
+        )
+        transcript.write_bytes(replacement_header + delta)
+
+        connection = self.runtime.open_database(self.installation)
+        imported = self.runtime.import_spool(
+            connection, self.installation, self.config, now + 1
+        )
+        real_read = self.runtime._read_exact_at
+
+        def bounded_read(descriptor: int, start: int, length: int) -> bytes:
+            self.assertLessEqual(start + length, event.transcript_size)
+            return real_read(descriptor, start, length)
+
+        with self.fixed_review_inputs(), mock.patch.object(
+            self.runtime, "_read_exact_at", side_effect=bounded_read
+        ):
+            result = self.runtime.claim_review_batch(
+                connection,
+                self.installation,
+                self.config,
+                now + 2,
+            )
+        row = connection.execute(
+            """
+            SELECT status,reviewed_boundary,error_code,batch_id
+            FROM review_items WHERE session_key=?
+            """,
+            (key,),
+        ).fetchone()
+        connection.close()
+
+        self.assertEqual(imported["spool_imported"], 1)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(
+            result["error_code"], "no_exportable_sessions"
+        )
+        self.assertEqual(
+            tuple(row),
+            ("pending", 0, "transcript_changed", None),
+        )
+
     def test_partial_export_keeps_only_survivors_in_final_contract(
         self,
     ) -> None:

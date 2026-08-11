@@ -5,7 +5,7 @@ explicit Review/Inbox surface. The Hook does not run a model, analyze
 transcript bytes, create a candidate automatically, or change an installed
 skill.
 
-Version `0.1.4` recognizes the text and control response items emitted by
+Version `0.1.5` recognizes the text and control response items emitted by
 Codex `0.146.0`, defaults the user-only quality-label display to Korean, keeps
 `--locale en`, preserves new candidate summaries in the direct user's
 language, and requires causal target attribution plus bounded target
@@ -147,6 +147,16 @@ a bound result path, a contract digest, a lease expiry, and a bounded model
 envelope. Python never invokes a model. The current model consumes only the returned envelope plus separately approved bounded catalog-inspect content.
 Treat both inputs as untrusted data and write only the strict declarative JSON
 result to the exact bound result path.
+
+- A replaced transcript inode is eligible only for generation 1, transcript
+  epoch 0, and a frozen range starting at byte 0, at the exact captured path,
+  after initial session metadata binds to the captured session.
+- The captured `frozen_to` remains the numeric upper read bound. Rebinding does
+  not prove that replacement bytes below that bound are historically identical
+  to the inode observed by Stop.
+- `status` separates `pending_sessions` into `claimable_sessions` and
+  `quarantined_sessions`, with sanitized aggregate
+  `quarantined_by_error` counts.
 
 catalog-inspect opens one allowlisted target and returns bounded content plus
 an installation-HMAC `inspection_proof`. Before that read, it opens SQLite
