@@ -4560,6 +4560,159 @@ class FrozenTranscriptIdentityTests(FrozenTranscriptTestCase):
             finally:
                 connection.close()
 
+    def test_exact_path_replacement_parent_and_leaf_swaps_fail_closed(
+        self,
+    ) -> None:
+        delta = self.fixture_lines[5]
+        legitimate_delta = delta.replace(b"correction", b"reflection")
+
+        with self.subTest(swap="parent-before-open"):
+            parent = self.sessions / "replacement-parent-swap"
+            parent.mkdir(mode=0o700)
+            session_id = "replacement-parent-swap/session"
+            header = self.fixture_lines[0].replace(
+                b"fixture-session", session_id.encode()
+            )
+            connection, transcript, frozen = self.capture_and_claim(
+                [header, delta],
+                reviewed_boundary=0,
+                session_id=session_id,
+            )
+            original_digest = self.runtime.transcript_locator_digest(
+                frozen.locator
+            )
+            transcript.rename(
+                self.base / "preserved-parent-swap-inode.jsonl"
+            )
+            transcript.write_bytes(header + legitimate_delta)
+            outside_parent = self.base / "outside-parent-swap"
+            outside_parent.mkdir(mode=0o700)
+            (outside_parent / transcript.name).write_bytes(
+                header
+                + delta.replace(
+                    b"sanitized direct correction",
+                    b"outside parent sentinel xyz",
+                )
+            )
+            pinned_parent = self.base / "pinned-parent-swap"
+            real_open = os.open
+            component_opens = 0
+
+            def swap_parent_before_open(name, flags, *args, **kwargs):
+                nonlocal component_opens
+                if (
+                    name == parent.name
+                    and kwargs.get("dir_fd") is not None
+                ):
+                    component_opens += 1
+                    if component_opens == 2:
+                        parent.rename(pinned_parent)
+                        parent.symlink_to(
+                            outside_parent, target_is_directory=True
+                        )
+                return real_open(name, flags, *args, **kwargs)
+
+            try:
+                exported = None
+                with mock.patch.object(
+                    self.runtime.os,
+                    "open",
+                    side_effect=swap_parent_before_open,
+                ):
+                    with self.assertRaises(
+                        self.runtime.TranscriptAdapterError
+                    ) as raised:
+                        exported = self.runtime.read_frozen_transcript(
+                            self.installation,
+                            frozen,
+                            self.config,
+                            self.review,
+                        )
+                self.assertEqual(component_opens, 2)
+                self.assertEqual(
+                    raised.exception.code, "transcript_changed"
+                )
+                self.assertTrue(raised.exception.retryable)
+                self.assertIsNone(exported)
+                self.assertEqual(frozen.locator.path, transcript)
+                self.assertEqual(
+                    self.runtime.transcript_locator_digest(frozen.locator),
+                    original_digest,
+                )
+            finally:
+                connection.close()
+
+        with self.subTest(swap="leaf-after-open"):
+            session_id = "replacement-leaf-swap"
+            header = self.fixture_lines[0].replace(
+                b"fixture-session", session_id.encode()
+            )
+            connection, transcript, frozen = self.capture_and_claim(
+                [header, delta],
+                reviewed_boundary=0,
+                session_id=session_id,
+            )
+            original_digest = self.runtime.transcript_locator_digest(
+                frozen.locator
+            )
+            transcript.rename(
+                self.base / "preserved-leaf-swap-inode.jsonl"
+            )
+            transcript.write_bytes(header + legitimate_delta)
+            outside = self.base / "outside-leaf-swap.jsonl"
+            outside.write_bytes(
+                header
+                + delta.replace(
+                    b"sanitized direct correction",
+                    b"outside leaf sentinel data!",
+                )
+            )
+            pinned = self.base / "pinned-leaf-swap.jsonl"
+            real_open = os.open
+            swapped = False
+
+            def swap_leaf_after_open(name, flags, *args, **kwargs):
+                nonlocal swapped
+                descriptor = real_open(name, flags, *args, **kwargs)
+                if (
+                    name == transcript.name
+                    and kwargs.get("dir_fd") is not None
+                    and not swapped
+                ):
+                    transcript.rename(pinned)
+                    transcript.symlink_to(outside)
+                    swapped = True
+                return descriptor
+
+            try:
+                with mock.patch.object(
+                    self.runtime.os,
+                    "open",
+                    side_effect=swap_leaf_after_open,
+                ):
+                    exported = self.runtime.read_frozen_transcript(
+                        self.installation,
+                        frozen,
+                        self.config,
+                        self.review,
+                    )
+                self.assertTrue(swapped)
+                self.assertEqual(
+                    [record.text for record in exported.records],
+                    ["sanitized direct reflection"],
+                )
+                self.assertNotIn(
+                    "outside leaf sentinel",
+                    [record.text for record in exported.records],
+                )
+                self.assertEqual(frozen.locator.path, transcript)
+                self.assertEqual(
+                    self.runtime.transcript_locator_digest(frozen.locator),
+                    original_digest,
+                )
+            finally:
+                connection.close()
+
     def test_same_session_replacement_at_different_path_is_not_searched(
         self,
     ) -> None:
