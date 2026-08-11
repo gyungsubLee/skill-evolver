@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
@@ -5137,6 +5138,81 @@ class FrozenTranscriptIdentityTests(FrozenTranscriptTestCase):
         finally:
             connection.close()
 
+    def test_first_attempt_records_are_released_before_retry_reopen(
+        self,
+    ) -> None:
+        session_id = "release-first-attempt"
+        header = self.fixture_lines[0].replace(
+            b"fixture-session", session_id.encode()
+        )
+        delta = self.fixture_lines[5]
+        connection, transcript, frozen = self.capture_and_claim(
+            [header, delta],
+            reviewed_boundary=len(header),
+            session_id=session_id,
+        )
+        real_parse = self.runtime._parse_jsonl_records
+        real_attempt = self.runtime._read_frozen_transcript_attempt
+        real_reopen = self.runtime._reopen_selected_transcript
+        appended = False
+        attempt_reference = None
+        record_reference = None
+
+        def append_after_delta_parse(*args, **kwargs):
+            nonlocal appended
+            records = real_parse(*args, **kwargs)
+            if kwargs["evidence_eligible"] and not appended:
+                self.assertTrue(records)
+                appended = True
+                with transcript.open("ab") as stream:
+                    stream.write(b'{"type":"event_msg","payload":{}}\n')
+            return records
+
+        def track_first_attempt(*args, **kwargs):
+            nonlocal attempt_reference, record_reference
+            attempt = real_attempt(*args, **kwargs)
+            if attempt_reference is None:
+                self.assertTrue(attempt.records)
+                attempt_reference = weakref.ref(attempt)
+                record_reference = weakref.ref(attempt.records[-1])
+            return attempt
+
+        def assert_released_before_reopen(*args, **kwargs):
+            self.assertTrue(appended)
+            self.assertIsNotNone(attempt_reference)
+            self.assertIsNotNone(record_reference)
+            self.assertIsNone(attempt_reference())
+            self.assertIsNone(record_reference())
+            return real_reopen(*args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                self.runtime,
+                "_parse_jsonl_records",
+                side_effect=append_after_delta_parse,
+            ), mock.patch.object(
+                self.runtime,
+                "_read_frozen_transcript_attempt",
+                side_effect=track_first_attempt,
+            ), mock.patch.object(
+                self.runtime,
+                "_reopen_selected_transcript",
+                side_effect=assert_released_before_reopen,
+            ) as reopen:
+                exported = self.runtime.read_frozen_transcript(
+                    self.installation,
+                    frozen,
+                    self.config,
+                    self.review,
+                )
+            reopen.assert_called_once()
+            self.assertEqual(
+                [record.text for record in exported.records],
+                ["sanitized direct correction"],
+            )
+        finally:
+            connection.close()
+
     def test_retry_identity_swap_is_retryable_changed(self) -> None:
         session_id = "retry-identity-swap"
         header = self.fixture_lines[0].replace(
@@ -5152,6 +5228,7 @@ class FrozenTranscriptIdentityTests(FrozenTranscriptTestCase):
         real_reopen = self.runtime._reopen_selected_transcript
         real_open_frozen = self.runtime._open_frozen_transcript
         real_relocate = self.runtime._find_relocated_transcript
+        real_rebind = self.runtime._open_exact_path_replacement
         appended = False
         relocated = self.sessions / "retry-relocated"
         relocated.mkdir(mode=0o700)
@@ -5187,6 +5264,10 @@ class FrozenTranscriptIdentityTests(FrozenTranscriptTestCase):
                 wraps=real_relocate,
             ) as relocate, mock.patch.object(
                 self.runtime,
+                "_open_exact_path_replacement",
+                wraps=real_rebind,
+            ) as rebind, mock.patch.object(
+                self.runtime,
                 "_reopen_selected_transcript",
                 side_effect=swap_before_reopen,
             ) as reopen:
@@ -5207,6 +5288,7 @@ class FrozenTranscriptIdentityTests(FrozenTranscriptTestCase):
             relocate.assert_called_once_with(
                 self.installation, frozen
             )
+            rebind.assert_not_called()
             self.assertEqual(reopen.call_args.args[0], selected_path)
             self.assertEqual(
                 reopen.call_args.args[3],

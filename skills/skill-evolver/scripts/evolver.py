@@ -3888,12 +3888,14 @@ def read_frozen_transcript(
     if attempt.before != attempt.after:
         if not _same_identity_growth(attempt.before, attempt.after):
             raise _transcript_error("transcript_changed")
+        minimum_stat = attempt.after
+        del attempt
         descriptor = _reopen_selected_transcript(
             resolved_path,
             installation,
             frozen,
             selected_identity,
-            attempt.after,
+            minimum_stat,
         )
         try:
             attempt = _read_frozen_transcript_attempt(
