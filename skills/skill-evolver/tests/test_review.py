@@ -10223,14 +10223,17 @@ class ReviewBatchIntegrationTests(BatchExportTestCase):
     ) -> None:
         now = 2_000_000_000.0
         session_id = "spooled-replacement"
-        header = (
+        fixture_lines = (
             TEST_ROOT / "fixtures/review-current-layout.jsonl"
-        ).read_bytes().splitlines(keepends=True)[0].replace(
+        ).read_bytes().splitlines(keepends=True)
+        header = fixture_lines[0].replace(
             b"fixture-session", session_id.encode()
         )
-        delta = (
-            TEST_ROOT / "fixtures/review-current-layout.jsonl"
-        ).read_bytes().splitlines(keepends=True)[5]
+        delta = fixture_lines[5]
+        sentinel_text = "post-boundary export sentinel"
+        sentinel = fixture_lines[6].replace(
+            b"sanitized assistant context", sentinel_text.encode()
+        )
         transcript = self.sessions / f"{session_id}.jsonl"
         transcript.write_bytes(header + delta)
         payload = {
@@ -10260,7 +10263,9 @@ class ReviewBatchIntegrationTests(BatchExportTestCase):
         preserved = self.base / "captured-before-import.jsonl"
         transcript.rename(preserved)
         replacement_delta = delta.replace(b"correction", b"reflection")
-        transcript.write_bytes(header + replacement_delta)
+        replacement_prefix = header + replacement_delta
+        self.assertEqual(len(replacement_prefix), event.transcript_size)
+        transcript.write_bytes(replacement_prefix + sentinel)
 
         connection = self.runtime.open_database(self.installation)
         imported = self.runtime.import_spool(
@@ -10291,9 +10296,28 @@ class ReviewBatchIntegrationTests(BatchExportTestCase):
         self.assertEqual(len(contract["sessions"]), 1)
         self.assertEqual(contract["sessions"][0]["frozen_from"], 0)
         self.assertEqual(
-            contract["sessions"][0]["frozen_to"], event.transcript_size
+            contract["sessions"][0]["frozen_to"], len(replacement_prefix)
         )
-        self.assertTrue(contract["sessions"][0]["records"])
+        envelope_records = result["envelope"]["sessions"][0]["records"]
+        contract_records = contract["sessions"][0]["records"]
+        self.assertEqual(
+            [record["content"] for record in envelope_records],
+            ["sanitized direct reflection"],
+        )
+        self.assertNotIn(
+            sentinel_text,
+            [record["content"] for record in envelope_records],
+        )
+        self.assertEqual(
+            [record["record_ref"] for record in contract_records],
+            [record["record_ref"] for record in envelope_records],
+        )
+        self.assertEqual(
+            result["envelope"]["claim_contract"], contract
+        )
+        contract_text = json.dumps(contract, sort_keys=True)
+        self.assertNotIn("sanitized direct reflection", contract_text)
+        self.assertNotIn(sentinel_text, contract_text)
 
     def test_spooled_stop_replaced_before_import_rejects_hmac_mismatch(
         self,
