@@ -2035,6 +2035,15 @@ TRANSCRIPT_EVIDENCE_SHAPE_MAX_DEPTH = 64
 TRANSCRIPT_RETRYABLE_CODES = frozenset(
     {"transcript_missing", "transcript_changed", "transcript_partial"}
 )
+QUEUE_STATUS_ERROR_CODES = tuple(
+    sorted(
+        TRANSCRIPT_RETRYABLE_CODES
+        | {
+            "transcript_rebind_required",
+            "session_binding_unavailable",
+        }
+    )
+)
 TRANSCRIPT_TERMINAL_CODES = frozenset(
     {"oversized_session", "unsupported_transcript"}
 )
@@ -14596,12 +14605,54 @@ def queue_status(
     installation: Installation,
     now: float,
 ) -> dict[str, object]:
-    pending = connection.execute(
+    queue_rows = connection.execute(
         """
-        SELECT COUNT(*) AS sessions,MIN(pending_since) AS oldest
-        FROM review_items WHERE status='pending'
-        """
-    ).fetchone()
+        WITH classified AS (
+          SELECT pending_since,
+            CASE
+              WHEN binding_status='accepted'
+               AND error_code IS NULL
+               AND observed_boundary>reviewed_boundary
+              THEN 'claimable'
+              WHEN error_code IN (?,?,?,?,?) THEN error_code
+              WHEN error_code IS NOT NULL THEN 'unknown_error'
+              WHEN binding_status!='accepted' THEN 'binding_pending'
+              ELSE 'empty_generation'
+            END AS bucket
+          FROM review_items
+          WHERE status='pending'
+        )
+        SELECT bucket,COUNT(*) AS count,
+               (SELECT MIN(pending_since) FROM classified) AS oldest
+        FROM classified
+        GROUP BY bucket
+        """,
+        QUEUE_STATUS_ERROR_CODES,
+    )
+    counts: dict[str, int] = {}
+    oldest: Optional[str] = None
+    for row in queue_rows:
+        counts[str(row["bucket"])] = int(row["count"])
+        if row["oldest"] is not None:
+            oldest = str(row["oldest"])
+    pending_sessions = sum(counts.values())
+    claimable_sessions = counts.pop("claimable", 0)
+    quarantined_by_error = {
+        **{code: 0 for code in QUEUE_STATUS_ERROR_CODES},
+        "binding_pending": 0,
+        "empty_generation": 0,
+        "unknown_error": 0,
+    }
+    for bucket, count in counts.items():
+        if bucket not in quarantined_by_error:
+            raise sqlite3.DatabaseError("invalid_queue_status_partition")
+        quarantined_by_error[bucket] = count
+    quarantined_sessions = sum(counts.values())
+    if (
+        pending_sessions != claimable_sessions + quarantined_sessions
+        or quarantined_sessions != sum(quarantined_by_error.values())
+    ):
+        raise sqlite3.DatabaseError("invalid_queue_status_partition")
     generations = int(
         connection.execute(
             "SELECT COALESCE(SUM(generation),0) FROM review_items"
@@ -14673,11 +14724,13 @@ def queue_status(
     ) = spool_inventory(
         installation, config, now
     )
-    oldest = pending["oldest"]
     return {
         "schema_version": SCHEMA_VERSION,
-        "pending_sessions": int(pending["sessions"]),
-        "pending_generations": int(pending["sessions"]),
+        "pending_sessions": pending_sessions,
+        "claimable_sessions": claimable_sessions,
+        "quarantined_sessions": quarantined_sessions,
+        "quarantined_by_error": quarantined_by_error,
+        "pending_generations": pending_sessions,
         "generation_count_total": generations,
         "oldest_pending_age_seconds": (
             max(0, int(now - parse_iso_utc(str(oldest))))

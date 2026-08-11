@@ -5349,6 +5349,191 @@ class MaintenanceStatusTests(unittest.TestCase):
         self.assertTrue(captured[0]["spool"]["available"])
         self.assertTrue(waiting.exists())
 
+    def test_status_partitions_pending_inventory_without_private_data(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        pending_since = self.runtime.iso_utc(now - 10)
+        connection = self.runtime.open_database(self.installation)
+        connection.executemany(
+            """
+            INSERT INTO review_items(
+              session_key,raw_session_id,status,binding_status,
+              transcript_path,transcript_device,transcript_inode,
+              observed_boundary,last_stop_ns,reviewed_boundary,
+              first_stop_at,last_stop_at,pending_since,error_code,
+              raw_metadata_expires_at,dedupe_expires_at
+            ) VALUES(?,?, 'pending', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "claimable-key",
+                    "private-claimable-session",
+                    "accepted",
+                    str(self.transcript),
+                    70_001,
+                    80_001,
+                    2,
+                    1,
+                    pending_since,
+                    pending_since,
+                    pending_since,
+                    None,
+                    self.runtime.iso_utc(now + 1),
+                    self.runtime.iso_utc(now + 2),
+                ),
+                (
+                    "changed-key",
+                    "private-changed-session",
+                    "accepted",
+                    str(self.transcript),
+                    70_002,
+                    80_002,
+                    2,
+                    1,
+                    pending_since,
+                    pending_since,
+                    pending_since,
+                    "transcript_changed",
+                    self.runtime.iso_utc(now + 1),
+                    self.runtime.iso_utc(now + 2),
+                ),
+                (
+                    "stored-error-key",
+                    "private-stored-error-session",
+                    "pending_epoch",
+                    str(self.transcript),
+                    70_003,
+                    80_003,
+                    2,
+                    1,
+                    pending_since,
+                    pending_since,
+                    pending_since,
+                    "transcript_missing",
+                    self.runtime.iso_utc(now + 1),
+                    self.runtime.iso_utc(now + 2),
+                ),
+                (
+                    "binding-key",
+                    "private-binding-session",
+                    "pending_epoch",
+                    str(self.transcript),
+                    70_004,
+                    80_004,
+                    2,
+                    1,
+                    pending_since,
+                    pending_since,
+                    pending_since,
+                    None,
+                    self.runtime.iso_utc(now + 1),
+                    self.runtime.iso_utc(now + 2),
+                ),
+                (
+                    "empty-key",
+                    "private-empty-session",
+                    "accepted",
+                    str(self.transcript),
+                    70_005,
+                    80_005,
+                    1,
+                    1,
+                    pending_since,
+                    pending_since,
+                    pending_since,
+                    None,
+                    self.runtime.iso_utc(now + 1),
+                    self.runtime.iso_utc(now + 2),
+                ),
+                (
+                    "unknown-key",
+                    "private-unknown-session",
+                    "accepted",
+                    str(self.transcript),
+                    70_006,
+                    80_006,
+                    2,
+                    1,
+                    pending_since,
+                    pending_since,
+                    pending_since,
+                    "private-error-/secret/transcript.jsonl",
+                    self.runtime.iso_utc(now + 1),
+                    self.runtime.iso_utc(now + 2),
+                ),
+            ],
+        )
+        connection.close()
+
+        database_before = self.installation.database.read_bytes()
+        connection = self.runtime.open_database(
+            self.installation, read_only=True
+        )
+        changes_before = connection.total_changes
+        status = self.runtime.queue_status(connection, self.installation, now)
+        self.assertEqual(connection.total_changes, changes_before)
+        connection.close()
+        self.assertEqual(self.installation.database.read_bytes(), database_before)
+        self.assertEqual(status["pending_sessions"], 6)
+        self.assertEqual(status["claimable_sessions"], 1)
+        self.assertEqual(status["quarantined_sessions"], 5)
+        self.assertEqual(
+            status["pending_sessions"],
+            status["claimable_sessions"] + status["quarantined_sessions"],
+        )
+        self.assertEqual(
+            status["quarantined_sessions"],
+            sum(status["quarantined_by_error"].values()),
+        )
+        self.assertEqual(status["quarantined_by_error"]["binding_pending"], 1)
+        self.assertEqual(status["quarantined_by_error"]["empty_generation"], 1)
+        self.assertEqual(status["quarantined_by_error"]["unknown_error"], 1)
+        self.assertEqual(status["quarantined_by_error"]["transcript_changed"], 1)
+        self.assertEqual(status["quarantined_by_error"]["transcript_missing"], 1)
+        serialized = json.dumps(status, sort_keys=True)
+        for private in (
+            "private-claimable-session",
+            "private-changed-session",
+            "private-stored-error-session",
+            "private-binding-session",
+            "private-empty-session",
+            "private-unknown-session",
+            "claimable-key",
+            str(self.transcript),
+            "70_001",
+            "80_001",
+            pending_since,
+            '{"payload":{"role":"user"}}',
+            "private-error-/secret/transcript.jsonl",
+        ):
+            with self.subTest(private=private):
+                self.assertNotIn(private, serialized)
+
+    def test_status_reports_empty_claimable_and_quarantined_inventory(
+        self,
+    ) -> None:
+        connection = self.runtime.open_database(
+            self.installation, read_only=True
+        )
+        status = self.runtime.queue_status(
+            connection, self.installation, 2_000_000_000.0
+        )
+        connection.close()
+
+        self.assertEqual(status["pending_sessions"], 0)
+        self.assertEqual(status["claimable_sessions"], 0)
+        self.assertEqual(status["quarantined_sessions"], 0)
+        self.assertIsNone(status["oldest_pending_age_seconds"])
+        for bucket in (
+            *self.runtime.QUEUE_STATUS_ERROR_CODES,
+            "binding_pending",
+            "empty_generation",
+            "unknown_error",
+        ):
+            with self.subTest(bucket=bucket):
+                self.assertEqual(status["quarantined_by_error"][bucket], 0)
+
     def test_status_reports_bounded_partial_inventory_when_saturated(
         self,
     ) -> None:
