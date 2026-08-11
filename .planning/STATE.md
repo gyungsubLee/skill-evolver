@@ -116,7 +116,7 @@ runtime digest `91613f7d7c681ec9ab6da64ccedf2364bd61d2dbe4aad607157040c62b90b996
   labels. Its transcript-adapter digest is
   `0fc96fa4a58f06221736200f2d4b7ec393269c42fc488c5aebd7822eac74509b`; runtime
   digest is `91613f7d7c681ec9ab6da64ccedf2364bd61d2dbe4aad607157040c62b90b996`.
-- Historical pre-Q005 review batches 12 through 17 each returned
+- Historical pre-Q-005 review batches 12 through 17 each returned
   `no_exportable_sessions`. Their 30 generations were retained but quarantined with
   `transcript_changed`, so subsequent claims skip them. The seal contract
   accepts these terminal failed batches and requires observations only for
@@ -135,7 +135,7 @@ runtime digest `91613f7d7c681ec9ab6da64ccedf2364bd61d2dbe4aad607157040c62b90b996
   its directory. The exact pinned root was initialized once as a user-owned
   mode-`0700` directory; the Hook remains fail-closed for an absent or unsafe
   root.
-- Historical pre-Q005 read-only status proved two authenticated ingress files
+- Historical pre-Q-005 read-only status proved two authenticated ingress files
   with `pending_sessions=0` and `spool.verified_files=2`. One separately
   approved maintenance invocation imported both; its immediate post-import
   status reported `pending_sessions=2`, `pending_generations=2`, and an empty
