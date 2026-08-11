@@ -2,7 +2,7 @@
 
 ## Overview
 
-Skill Evolver는 Phase 1 Feasibility `FAIL`을 Phase 2의 session-level 계약으로 수정해 amended gate `PASS`를 확보했고, Phase 3 bounded Runtime Queue와 Phase 4 explicit Review/Inbox를 구현했다. source/canonical main/cache/installed plugin은 `0.1.5`이며 seven-file source/cache parity는 `PASS`다. `Q-004`는 `quality_provenance_drift`로 terminal `INVALID` 처리됐고 immutable report digest는 `a9d30a50776d7e1ad2b0f56d5be741fda8b9460f46090a88e1e18777e5f0e917`다. Installed `0.1.5`는 `2026-08-11T13:03:28Z`에 그 exact digest에서 `Q-005`를 열었다. `Q-005`는 `COLLECTING`이며 distinct sessions, candidates, labels는 모두 0이고 old batches/rows는 historical evidence일 뿐 observation이 아니다. Phase 6은 Q-005의 최소 10개 distinct real sessions, explicit Review, user-only labels, terminal `PASS`까지 차단되고 mutation, Evaluate, Apply capability는 disabled 상태다. 이후 runner, immutable evaluation, manual apply/versioning, undo/recovery와 hardening gate를 순서대로 통과한다.
+Skill Evolver는 Phase 1 Feasibility `FAIL`을 Phase 2의 session-level 계약으로 수정해 amended gate `PASS`를 확보했고, Phase 3 bounded Runtime Queue와 Phase 4 explicit Review/Inbox를 구현했다. source/canonical main/cache/installed plugin은 `0.1.6`이며 seven-file source/cache parity는 `PASS`다. release suite는 538 passed, 3 skipped이고 canonical source HEAD는 `980118fcddce4f8b5271f82638c3f9d131bf0e7f`다. `Q-005`는 source provenance 변경으로 `quality_provenance_drift` terminal `INVALID` 처리됐고 immutable report digest는 `781dbac0ba4e8e601ce6475e408204865127e5fd16a961e66cf47afc38a94c2f`다. Installed `0.1.6`은 `2026-08-11T14:53:34Z`에 그 exact digest에서 `Q-006`을 열었다. `Q-006`은 `COLLECTING`이며 distinct sessions, candidates, labels는 모두 0이다. post-open maintenance 뒤 old backlog 128건은 `pre_quality_epoch` 71건과 `transcript_changed` 57건으로 격리됐고 claimable은 0이다. Phase 6은 Q-006의 최소 10개 distinct real sessions, explicit Review, user-only labels, terminal `PASS`까지 차단되고 mutation, Evaluate, Apply capability는 disabled 상태다. 이후 runner, immutable evaluation, manual apply/versioning, undo/recovery와 hardening gate를 순서대로 통과한다.
 
 ## Phases
 
@@ -112,17 +112,28 @@ Plans:
 **Depends on**: Phase 4
 **Requirements**: QUALITY-01
 **Entry Gate**: Review/Inbox suite passes with zero target-skill writes
-**Gate Result**: **Q-005 COLLECTING — 0.1.5 INSTALLED** — `Q-004` terminalized
-`INVALID` for `quality_provenance_drift` with immutable report digest
-`a9d30a50776d7e1ad2b0f56d5be741fda8b9460f46090a88e1e18777e5f0e917`.
-The matching content-addressed aggregate body is preserved at
-`docs/release-reports/quality/Q-004-a9d30a50776d7e1ad2b0f56d5be741fda8b9460f46090a88e1e18777e5f0e917.json`.
-Installed `0.1.5` opened `Q-005` at `2026-08-11T13:03:28Z` from exact
-predecessor `Q-004@a9d30a50776d7e1ad2b0f56d5be741fda8b9460f46090a88e1e18777e5f0e917`;
-`first_batch_id` is 24. Current `Q-005/COLLECTING` has zero distinct sessions,
-candidates, and labels. Old batches and rows remain historical evidence and
-do not count as Q-005 observations. Phase 6 stays blocked until Q-005 has at
-least ten distinct real sessions, explicit Review, user-only labels, and
+**Gate Result**: **Q-006 COLLECTING — 0.1.6 INSTALLED** — `Q-005` terminalized
+`INVALID` for `quality_provenance_drift` with zero sessions, candidates, and
+labels. Its immutable report digest is
+`781dbac0ba4e8e601ce6475e408204865127e5fd16a961e66cf47afc38a94c2f`, and
+the matching content-addressed aggregate body is preserved at
+`docs/release-reports/quality/Q-005-781dbac0ba4e8e601ce6475e408204865127e5fd16a961e66cf47afc38a94c2f.json`.
+Installed `0.1.6` opened `Q-006` at `2026-08-11T14:53:34Z`, expiring at
+`2026-09-10T14:53:34Z`, from exact predecessor
+`Q-005@781dbac0ba4e8e601ce6475e408204865127e5fd16a961e66cf47afc38a94c2f`;
+`first_batch_id` is 24. Its quality-contract digest is
+`d2479583d755d8196e05df5e63b5af12d52c5d3738c70a24555d8a9a5c81cc3b`,
+runtime digest is
+`69090bd71cb89b6d4889dd9119c344fc3f0c96efd953c80211f677a0b744c334`, and
+transcript-adapter digest remains
+`0fc96fa4a58f06221736200f2d4b7ec393269c42fc488c5aebd7822eac74509b`.
+Current `Q-006/COLLECTING` has zero distinct sessions, candidates, and labels.
+Maintenance performed only after Q-006 opened imported 68 spool records and
+recognized 3 duplicates. Post-maintenance status is spool 0, pending 128,
+claimable 0, and quarantined 128: `pre_quality_epoch` 71 plus
+`transcript_changed` 57. No Review claim ran, so the old backlog cannot count
+as Q-006 observations. Phase 6 stays blocked until Q-006 has at least ten
+distinct real post-open sessions, explicit Review, user-only labels, and
 terminal `PASS`; mutation, Runner, Prepare, Evaluate, and Apply remain
 disabled.
 **Failure Route**: Phase 4 transcript adapter 또는 improvement policy로 돌아간다.
@@ -243,7 +254,7 @@ Plans:
 | 2. Session-Level Capture Design Amendment | 1/1 | Complete (gate PASS) | 2026-07-29 |
 | 3. Runtime Queue | 1/1 | Complete (gate PASS) | 2026-07-29 |
 | 4. Review and Inbox | 1/1 | Complete (gate PASS) | 2026-07-30 |
-| 5. Read-only Quality Gate | 0/1 | Q-005 COLLECTING; 0.1.5 installed | - |
+| 5. Read-only Quality Gate | 0/1 | Q-006 COLLECTING; 0.1.6 installed | - |
 | 6. Evaluate Runner Spike | 0/1 | Not started | - |
 | 7. Evaluate Prepare | 0/1 | Not started | - |
 | 8. Evaluate Execution | 0/1 | Not started | - |

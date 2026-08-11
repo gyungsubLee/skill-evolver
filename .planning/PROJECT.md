@@ -62,28 +62,40 @@ CLI와 Desktop 모두에서 경계가 명확한 session metadata를 수집하고
 | Phase 1의 작업 완료와 product gate 결과를 분리해 기록한다. | probe는 완료됐지만 결과가 FAIL이므로 다음 구현을 승인하지 않는다. | Recorded 2026-07-27 |
 | turn-level capture와 접근 불가능한 fixed-root 가정은 session-level queue/data-root 계약으로 수정한다. | CLI/Desktop에서 네 가지 필수 Feasibility check가 실패했다. | Implemented |
 | quality label은 사용자만 외부 TTY에서 입력하고 agent는 답을 추론하거나 대신 입력하지 않는다. | 품질 판정의 독립성과 명시적 승인 경계를 유지한다. | Active gate |
+| collecting quality epoch의 시작 시각보다 늦은 `first_stop_at`만 review claim 대상으로 삼는다. | epoch 이전 backlog가 prospective quality cohort에 섞이는 것을 막고 같은 판정을 status에도 적용한다. | Implemented in 0.1.6 |
 
 ## Current State
 
 - Phase 1의 최초 Feasibility `FAIL`은 Phase 2 session-level amendment로 보완됐고 amended report는 `PASS`다.
 - Phase 3 Runtime Queue와 Phase 4 Review/Inbox는 canonical report `PASS`로 완료됐다.
-- source/canonical main/cache/installed plugin은 `0.1.5`이며 source/cache
+- source/canonical main/cache/installed plugin은 `0.1.6`이며 source/cache
   parity는 7개 production file에서 `PASS`다. canonical source HEAD는
-  `a2acd3e`이고 release test suite는 524 passed, 3 skipped였다.
+  `980118fcddce4f8b5271f82638c3f9d131bf0e7f`이고 release test suite는
+  538 passed, 3 skipped였다.
 - `Q-004`는 `quality_provenance_drift`로 terminal `INVALID` 처리됐고
   immutable aggregate report digest는
   `a9d30a50776d7e1ad2b0f56d5be741fda8b9460f46090a88e1e18777e5f0e917`다.
-- 현재 단계는 Phase 5 Read-only Quality Gate다. Installed `0.1.5`가
-  `2026-08-11T13:03:28Z`에 exact predecessor
-  `Q-004@a9d30a50776d7e1ad2b0f56d5be741fda8b9460f46090a88e1e18777e5f0e917`
-  에서 `Q-005`를 열었다. `first_batch_id`는 24이며 현재
-  `Q-005/COLLECTING`은 distinct sessions, candidates, labels가 모두 0이다.
-  이전 batch와 row는 historical evidence일 뿐 Q-005 observation이 아니다.
-  Q-005 transcript-adapter digest는
-  `0fc96fa4a58f06221736200f2d4b7ec393269c42fc488c5aebd7822eac74509b`이고
+- `Q-005`는 source `0.1.6` provenance 변경으로
+  `quality_provenance_drift` terminal `INVALID` 처리됐다. sessions,
+  candidates, labels는 모두 0이었고 immutable aggregate report digest는
+  `781dbac0ba4e8e601ce6475e408204865127e5fd16a961e66cf47afc38a94c2f`다.
+- 현재 단계는 Phase 5 Read-only Quality Gate다. Installed `0.1.6`이
+  `2026-08-11T14:53:34Z`에 exact predecessor
+  `Q-005@781dbac0ba4e8e601ce6475e408204865127e5fd16a961e66cf47afc38a94c2f`
+  에서 `Q-006`을 열었다. expiry는 `2026-09-10T14:53:34Z`,
+  `first_batch_id`는 24이며 현재 `Q-006/COLLECTING`은 distinct sessions,
+  candidates, labels가 모두 0이다. quality-contract digest는
+  `d2479583d755d8196e05df5e63b5af12d52c5d3738c70a24555d8a9a5c81cc3b`,
   runtime digest는
-  `91613f7d7c681ec9ab6da64ccedf2364bd61d2dbe4aad607157040c62b90b996`다.
-- Phase 6 Evaluate Runner Spike는 Q-005의 최소 10개 distinct real
+  `69090bd71cb89b6d4889dd9119c344fc3f0c96efd953c80211f677a0b744c334`,
+  transcript-adapter digest는
+  `0fc96fa4a58f06221736200f2d4b7ec393269c42fc488c5aebd7822eac74509b`다.
+- Q-006을 연 뒤 maintenance가 spool 68건을 import하고 duplicate 3건을
+  확인했다. 현재 spool은 0, pending은 128, claimable은 0이며 quarantined
+  128건은 `pre_quality_epoch` 71건과 `transcript_changed` 57건이다. 따라서
+  이전 backlog는 Q-006 review 대상에서 격리됐고 review claim은 실행하지
+  않았다.
+- Phase 6 Evaluate Runner Spike는 Q-006의 최소 10개 distinct real
   sessions, explicit Review, user-only labels, terminal `PASS` 전까지
   차단되며 mutation, evaluate, apply capability는 계속 disabled다.
 
@@ -98,4 +110,6 @@ CLI와 Desktop 모두에서 경계가 명확한 session metadata를 수집하고
 - `docs/superpowers/specs/2026-07-30-skill-evolver-session-quality-gate-design.md`
 - `docs/release-reports/quality/Q-003-512aa6cb395e7a4d6c94a51ad2b9950fb8cada381381784370d3edecda01ac1a.json`
 - `docs/release-reports/quality/Q-004-a9d30a50776d7e1ad2b0f56d5be741fda8b9460f46090a88e1e18777e5f0e917.json`
+- `docs/release-reports/quality/Q-005-781dbac0ba4e8e601ce6475e408204865127e5fd16a961e66cf47afc38a94c2f.json`
 - `docs/superpowers/specs/2026-08-04-skill-evolver-target-attribution-remediation-design.md`
+- `docs/superpowers/specs/2026-08-11-skill-evolver-prospective-capture-cutoff-design.md`

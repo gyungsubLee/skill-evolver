@@ -22,20 +22,25 @@ See: `.planning/PROJECT.md` (updated 2026-08-11)
 
 Phase: 5 of 11 (Read-only Quality Gate)
 Plan: 0 of 1 in current phase
-Status: source/canonical main/cache/installed plugin are `0.1.5`; canonical
-source HEAD is `a2acd3e`, source/cache parity is `PASS` for 7 production files,
-and the release suite recorded 524 passed, 3 skipped. `Q-004` is immutable
-terminal `INVALID` for `quality_provenance_drift` with report digest
-`a9d30a50776d7e1ad2b0f56d5be741fda8b9460f46090a88e1e18777e5f0e917`.
-Installed `0.1.5` opened `Q-005` at `2026-08-11T13:03:28Z` from exact
-predecessor `Q-004@a9d30a50776d7e1ad2b0f56d5be741fda8b9460f46090a88e1e18777e5f0e917`;
-`first_batch_id=24`. Read-only status is `Q-005/COLLECTING` with zero distinct
-sessions, candidates, and labels. Historical old batches/rows do not count as
-Q-005 observations; current queue counts are intentionally not asserted here.
-Phase 6 remains blocked until Q-005 has at least ten distinct real sessions,
-explicit Review, user-only labels, and terminal `PASS`. Mutation, Evaluate,
-and Apply capability remain disabled.
-Last activity: 2026-08-11 — Q-004 terminal report recorded and Q-005 opened
+Status: source/canonical main/cache/installed plugin are `0.1.6`; canonical
+source HEAD is `980118fcddce4f8b5271f82638c3f9d131bf0e7f`, source/cache parity is
+`PASS` for 7 production files, and the release suite recorded 538 passed,
+3 skipped. `Q-005` is immutable terminal `INVALID` for
+`quality_provenance_drift`, with zero sessions, candidates, and labels and
+report digest
+`781dbac0ba4e8e601ce6475e408204865127e5fd16a961e66cf47afc38a94c2f`.
+Installed `0.1.6` opened `Q-006` at `2026-08-11T14:53:34Z` from exact
+predecessor `Q-005@781dbac0ba4e8e601ce6475e408204865127e5fd16a961e66cf47afc38a94c2f`;
+it expires at `2026-09-10T14:53:34Z` and has `first_batch_id=24`. Read-only
+status is `Q-006/COLLECTING` with zero distinct sessions, candidates, and
+labels. Post-open maintenance imported 68 spool records, recognized 3
+duplicates, and left spool 0, pending 128, claimable 0, quarantined 128
+(`pre_quality_epoch` 71 plus `transcript_changed` 57). No Review claim ran.
+Phase 6 remains blocked until Q-006 has at least ten distinct real post-open
+sessions, explicit Review, user-only labels, and terminal `PASS`. Mutation,
+Evaluate, and Apply capability remain disabled.
+Last activity: 2026-08-11 — Q-005 terminal report recorded, 0.1.6 installed,
+Q-006 opened, and historical backlog isolation verified
 
 Progress: [████░░░░░░] 36%
 
@@ -56,11 +61,13 @@ Progress: [████░░░░░░] 36%
 | 4. Review and Inbox | 1/1 | Not recorded | Not recorded |
 
 **Recent Trend:** Four sequential phase gates recorded; Phase 2, Phase 3 and
-Phase 4 are PASS. Installed `0.1.5` has seven-file source/cache parity.
-`Q-004` terminalized `INVALID` for provenance drift and `Q-005` is collecting
-a new post-open sample under transcript-adapter digest
-`0fc96fa4a58f06221736200f2d4b7ec393269c42fc488c5aebd7822eac74509b` and
-runtime digest `91613f7d7c681ec9ab6da64ccedf2364bd61d2dbe4aad607157040c62b90b996`.
+Phase 4 are PASS. Installed `0.1.6` has seven-file source/cache parity.
+`Q-005` terminalized `INVALID` for provenance drift and `Q-006` is collecting
+a clean post-open sample under quality-contract digest
+`d2479583d755d8196e05df5e63b5af12d52c5d3738c70a24555d8a9a5c81cc3b`,
+transcript-adapter digest
+`0fc96fa4a58f06221736200f2d4b7ec393269c42fc488c5aebd7822eac74509b`, and
+runtime digest `69090bd71cb89b6d4889dd9119c344fc3f0c96efd953c80211f677a0b744c334`.
 
 ## Accumulated Context
 
@@ -87,8 +94,10 @@ runtime digest `91613f7d7c681ec9ab6da64ccedf2364bd61d2dbe4aad607157040c62b90b996
 - The `0.1.0` production capture assumption regressed. Release `0.1.2`
   introduced the pinned plugin-data route and release `0.1.3` added the
   Codex `0.146.0` transcript adapter.
-- Installed plugin, runtime and source release identity are `0.1.5`; seven
-  production source/cache pairs match and canonical source HEAD is `a2acd3e`.
+- Installed plugin, runtime and source release identity are `0.1.6`; seven
+  production source/cache pairs match and canonical source HEAD is
+  `980118fcddce4f8b5271f82638c3f9d131bf0e7f`. The full release suite records
+  538 passed and 3 skipped.
 - `Q-001` terminalized `INVALID` for `quality_provenance_drift` with report
   digest `2759c55fcc9262ef7ae83b55eb30b95466e932ce6621761dd305fa0d80a51bc1`.
 - `Q-002` opened from that exact predecessor digest at
@@ -112,10 +121,31 @@ runtime digest `91613f7d7c681ec9ab6da64ccedf2364bd61d2dbe4aad607157040c62b90b996
 - Installed `0.1.5` opened `Q-005` at `2026-08-11T13:03:28Z`, with
   `first_batch_id=24` and exact predecessor
   `Q-004@a9d30a50776d7e1ad2b0f56d5be741fda8b9460f46090a88e1e18777e5f0e917`.
-  Current `Q-005/COLLECTING` has zero distinct sessions, candidates, and
-  labels. Its transcript-adapter digest is
+  At open, `Q-005/COLLECTING` had zero distinct sessions, candidates, and
+  labels. Its transcript-adapter digest was
   `0fc96fa4a58f06221736200f2d4b7ec393269c42fc488c5aebd7822eac74509b`; runtime
   digest is `91613f7d7c681ec9ab6da64ccedf2364bd61d2dbe4aad607157040c62b90b996`.
+- `Q-005` later terminalized `INVALID` for `quality_provenance_drift` under
+  source `0.1.6`. It had zero sessions, candidates, and labels. Its immutable
+  aggregate report digest is
+  `781dbac0ba4e8e601ce6475e408204865127e5fd16a961e66cf47afc38a94c2f`,
+  preserved at
+  `docs/release-reports/quality/Q-005-781dbac0ba4e8e601ce6475e408204865127e5fd16a961e66cf47afc38a94c2f.json`.
+- Installed `0.1.6` opened `Q-006` at `2026-08-11T14:53:34Z`, expiring at
+  `2026-09-10T14:53:34Z`, with `first_batch_id=24` and exact predecessor
+  `Q-005@781dbac0ba4e8e601ce6475e408204865127e5fd16a961e66cf47afc38a94c2f`.
+  `Q-006/COLLECTING` has zero distinct sessions, candidates, and labels. Its
+  quality-contract digest is
+  `d2479583d755d8196e05df5e63b5af12d52c5d3738c70a24555d8a9a5c81cc3b`,
+  runtime digest is
+  `69090bd71cb89b6d4889dd9119c344fc3f0c96efd953c80211f677a0b744c334`,
+  and transcript-adapter digest remains
+  `0fc96fa4a58f06221736200f2d4b7ec393269c42fc488c5aebd7822eac74509b`.
+- Maintenance ran only after Q-006 opened: 68 spool records imported and 3
+  duplicates were recognized. Post-maintenance status is spool 0, pending
+  128, claimable 0, and quarantined 128, split into `pre_quality_epoch` 71
+  and `transcript_changed` 57. No Review claim ran. This is the operational
+  proof that historical backlog cannot enter Q-006.
 - Historical pre-Q-005 review batches 12 through 17 each returned
   `no_exportable_sessions`. Their 30 generations were retained but quarantined with
   `transcript_changed`, so subsequent claims skip them. The seal contract
@@ -139,15 +169,15 @@ runtime digest `91613f7d7c681ec9ab6da64ccedf2364bd61d2dbe4aad607157040c62b90b996
   with `pending_sessions=0` and `spool.verified_files=2`. One separately
   approved maintenance invocation imported both; its immediate post-import
   status reported `pending_sessions=2`, `pending_generations=2`, and an empty
-  spool. These are not current Q-005 queue counts.
+  spool. These were historical ingress counts, not Q-005 observations or
+  current queue counts.
 
 ### Pending Todos
 
-- Collect at least ten distinct real post-open sessions in `Q-005`.
-- Obtain separate approval for the next actual mutation after Q-005 has
-  collectable sessions; do not treat historical old batches or rows as Q-005
-  observations.
-- Explicitly Review the Q-005 sample, seal it, obtain every user-only label,
+- Collect at least ten distinct genuine post-open user sessions in `Q-006`.
+- Do not treat `pre_quality_epoch`, `transcript_changed`, historical batches,
+  or subagent work as Q-006 observations.
+- Explicitly Review the Q-006 sample, seal it, obtain every user-only label,
   and run the immutable quality gate.
 - Refresh the Phase 6 runner plan only after a successor quality epoch passes.
 - Keep Runner, Prepare, Evaluate and Apply disabled until `QUALITY-01` passes.
@@ -158,9 +188,10 @@ runtime digest `91613f7d7c681ec9ab6da64ccedf2364bd61d2dbe4aad607157040c62b90b996
 - Phase 4 PASS proves deterministic mechanics and safety only; candidate quality remains unmeasured until Phase 5.
 - Phase 5 cannot use fixtures, subagents, repeated generations in this task, or
   empty generated tasks as substitutes for 10 distinct real sessions.
-- Read-only status now exposes claimable and quarantined aggregate splits;
-  do not infer Q-005 observations or current queue counts from historical
-  batches/rows. The next actual Review remains a separately approved mutation.
+- Read-only status now exposes claimable and quarantined aggregate splits.
+  The post-Q-006 maintenance result is claimable 0 and quarantine split
+  `pre_quality_epoch=71`, `transcript_changed=57`; no Review claim occurred.
+  Do not infer Q-006 observations from those historical rows.
 - `Q-003` is an immutable terminal `FAIL`; do not relabel, rewrite, or
   reinterpret it. An unchanged-provenance successor is rejected.
 - The first remediation intentionally stays inside the Phase 4 policy boundary.
@@ -182,7 +213,8 @@ runtime digest `91613f7d7c681ec9ab6da64ccedf2364bd61d2dbe4aad607157040c62b90b996
 ## Session Continuity
 
 Last session: 2026-08-11
-Stopped at: Q-005 is `COLLECTING` with zero distinct sessions, candidates, and
-labels. Its first batch ID is 24; the next actual Review requires separate
-approval after collectable Q-005 sessions exist.
+Stopped at: Q-006 is `COLLECTING` with zero distinct sessions, candidates, and
+labels. Its first batch ID is 24; old backlog is isolated and claimable remains
+zero. Continue by collecting ten genuine post-open user sessions before the
+next explicit Review.
 Resume file: None
