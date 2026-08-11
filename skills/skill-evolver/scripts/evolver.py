@@ -2111,6 +2111,16 @@ def transcript_locator_digest(locator: TranscriptLocator) -> str:
     return sha256_json(transcript_locator_payload(locator))
 
 
+def _replacement_rebinding_allowed(
+    frozen: FrozenTranscript,
+) -> bool:
+    return (
+        frozen.generation == 1
+        and frozen.transcript_epoch == 0
+        and frozen.frozen_from == 0
+    )
+
+
 def frozen_transcript_from_row(row: sqlite3.Row) -> FrozenTranscript:
     try:
         locator_payload = json.loads(str(row["frozen_locator_json"]))
@@ -2233,6 +2243,20 @@ def transcript_adapter_contract(
                 TRANSCRIPT_RELOCATION_SCAN_MAX_ENTRIES
             ),
             "scan_max_depth": TRANSCRIPT_RELOCATION_SCAN_MAX_DEPTH,
+        },
+        "replacement_rebinding": {
+            "path": "exact-frozen-locator",
+            "eligibility": "generation-1-epoch-0-from-0",
+            "session_binding": "initial-session-meta-hmac",
+            "frozen_to": "preserve-signed-numeric-boundary",
+            "historical_prefix_identity": False,
+            "later_state": "strict-device-inode",
+            "stop_convergence": {
+                "event_order": "strictly-newer-observed-at-ns",
+                "eligibility": "pending-generation-1-epoch-0-reviewed-0",
+                "session_binding": "signed-stop-session-key",
+                "transcript_read": False,
+            },
         },
         "limits": {
             "session_bytes": runtime.max_transcript_bytes,
@@ -3219,7 +3243,7 @@ def _open_matching_transcript(
     path: Path,
     installation: Installation,
     frozen: FrozenTranscript,
-) -> Optional[int]:
+) -> tuple[Optional[int], bool]:
     try:
         if (
             path.is_symlink()
@@ -3228,7 +3252,7 @@ def _open_matching_transcript(
         ):
             raise _transcript_error("transcript_changed")
     except FileNotFoundError:
-        return None
+        return None, False
     except TranscriptAdapterError:
         raise
     except (OSError, RuntimeError):
@@ -3241,18 +3265,19 @@ def _open_matching_transcript(
             | getattr(os, "O_NOFOLLOW", 0),
         )
     except FileNotFoundError:
-        return None
+        return None, False
     except (OSError, RuntimeError):
         raise _transcript_error("transcript_changed") from None
     try:
         info = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_uid != os.getuid()
-            or (info.st_dev, info.st_ino)
-            != (frozen.locator.device, frozen.locator.inode)
-        ):
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
             raise _transcript_error("transcript_changed")
+        if (info.st_dev, info.st_ino) != (
+            frozen.locator.device,
+            frozen.locator.inode,
+        ):
+            _close_transcript_descriptor(descriptor)
+            return None, True
     except TranscriptAdapterError:
         _close_transcript_descriptor(descriptor)
         raise
@@ -3262,7 +3287,7 @@ def _open_matching_transcript(
     except BaseException:
         _close_transcript_descriptor(descriptor)
         raise
-    return descriptor
+    return descriptor, False
 
 
 def _find_relocated_transcript(
@@ -3443,30 +3468,186 @@ def _find_relocated_transcript(
     raise _transcript_error("transcript_missing")
 
 
+def _open_exact_path_replacement(
+    installation: Installation,
+    frozen: FrozenTranscript,
+) -> tuple[int, Path, tuple[int, int]]:
+    path = frozen.locator.path
+    selected: Optional[tuple[Path, tuple[str, ...]]] = None
+    for root in installation.transcript_roots:
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            continue
+        components = relative.parts
+        if (
+            not components
+            or any(part in {"", ".", ".."} for part in components)
+        ):
+            raise _transcript_error("transcript_changed")
+        selected = root, components
+        break
+    if selected is None:
+        raise _transcript_error("transcript_changed")
+    root, components = selected
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+    def open_directory(
+        name: str,
+        *,
+        parent_descriptor: Optional[int] = None,
+        missing_is_missing: bool = False,
+    ) -> int:
+        try:
+            if parent_descriptor is None:
+                descriptor = os.open(name, directory_flags)
+            else:
+                descriptor = os.open(
+                    name,
+                    directory_flags,
+                    dir_fd=parent_descriptor,
+                )
+        except FileNotFoundError:
+            raise _transcript_error(
+                "transcript_missing"
+                if missing_is_missing
+                else "transcript_changed"
+            ) from None
+        except (OSError, RuntimeError):
+            raise _transcript_error("transcript_changed") from None
+        try:
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != os.getuid()
+            ):
+                raise _transcript_error("transcript_changed")
+        except TranscriptAdapterError:
+            _close_transcript_descriptor(descriptor)
+            raise
+        except (OSError, RuntimeError):
+            _close_transcript_descriptor(descriptor)
+            raise _transcript_error("transcript_changed") from None
+        except BaseException:
+            _close_transcript_descriptor(descriptor)
+            raise
+        return descriptor
+
+    directory_descriptor = open_directory(str(root))
+    try:
+        for component in components[:-1]:
+            child_descriptor = open_directory(
+                component,
+                parent_descriptor=directory_descriptor,
+                missing_is_missing=True,
+            )
+            _close_transcript_descriptor(directory_descriptor)
+            directory_descriptor = child_descriptor
+        try:
+            descriptor = os.open(
+                components[-1],
+                os.O_RDONLY
+                | os.O_NONBLOCK
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_descriptor,
+            )
+        except FileNotFoundError:
+            raise _transcript_error("transcript_missing") from None
+        except (OSError, RuntimeError):
+            raise _transcript_error("transcript_changed") from None
+        try:
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_size < frozen.frozen_to
+            ):
+                raise _transcript_error("transcript_changed")
+        except TranscriptAdapterError:
+            _close_transcript_descriptor(descriptor)
+            raise
+        except (OSError, RuntimeError):
+            _close_transcript_descriptor(descriptor)
+            raise _transcript_error("transcript_changed") from None
+        except BaseException:
+            _close_transcript_descriptor(descriptor)
+            raise
+        return descriptor, path, (info.st_dev, info.st_ino)
+    finally:
+        _close_transcript_descriptor(directory_descriptor)
+
+
 def _open_frozen_transcript(
     installation: Installation,
     frozen: FrozenTranscript,
-) -> tuple[int, Path]:
-    descriptor = _open_matching_transcript(
+) -> tuple[int, Path, tuple[int, int], bool]:
+    descriptor, identity_mismatch = _open_matching_transcript(
         frozen.read_path, installation, frozen
     )
     if descriptor is not None:
-        return descriptor, frozen.read_path
-    return _find_relocated_transcript(installation, frozen)
+        return (
+            descriptor,
+            frozen.read_path,
+            (frozen.locator.device, frozen.locator.inode),
+            False,
+        )
+    if identity_mismatch and not _replacement_rebinding_allowed(frozen):
+        raise _transcript_error("transcript_changed")
+    try:
+        relocated, resolved_path = _find_relocated_transcript(
+            installation, frozen
+        )
+    except TranscriptAdapterError as error:
+        if error.code != "transcript_missing":
+            raise
+    else:
+        return (
+            relocated,
+            resolved_path,
+            (frozen.locator.device, frozen.locator.inode),
+            False,
+        )
+    if not _replacement_rebinding_allowed(frozen):
+        raise _transcript_error(
+            "transcript_changed"
+            if identity_mismatch
+            else "transcript_missing"
+        )
+    try:
+        replacement, resolved_path, selected_identity = (
+            _open_exact_path_replacement(installation, frozen)
+        )
+    except TranscriptAdapterError as error:
+        if identity_mismatch and error.code == "transcript_missing":
+            raise _transcript_error("transcript_changed") from None
+        raise
+    return (
+        replacement,
+        resolved_path,
+        selected_identity,
+        selected_identity
+        != (frozen.locator.device, frozen.locator.inode),
+    )
 
 
 def _stable_frozen_stat(
     info: os.stat_result,
     frozen: FrozenTranscript,
+    selected_identity: tuple[int, int],
+    rebound: bool,
 ) -> tuple[int, int, int, int]:
     if (
         not stat.S_ISREG(info.st_mode)
         or info.st_uid != os.getuid()
-        or (info.st_dev, info.st_ino)
-        != (frozen.locator.device, frozen.locator.inode)
+        or (info.st_dev, info.st_ino) != selected_identity
         or info.st_size < frozen.frozen_to
         or (
-            info.st_size == frozen.locator.size
+            not rebound
+            and info.st_size == frozen.locator.size
             and info.st_mtime_ns != frozen.locator.mtime_ns
         )
     ):
@@ -3482,12 +3663,16 @@ def _stable_frozen_stat(
 def _stable_frozen_descriptor_stat(
     descriptor: int,
     frozen: FrozenTranscript,
+    selected_identity: tuple[int, int],
+    rebound: bool,
 ) -> tuple[int, int, int, int]:
     try:
         info = os.fstat(descriptor)
     except (OSError, RuntimeError):
         raise _transcript_error("transcript_changed") from None
-    return _stable_frozen_stat(info, frozen)
+    return _stable_frozen_stat(
+        info, frozen, selected_identity, rebound
+    )
 
 
 def read_frozen_transcript(
@@ -3503,22 +3688,26 @@ def read_frozen_transcript(
         config.max_transcript_records, runtime.max_transcript_records
     )
     delta_length = frozen.frozen_to - frozen.frozen_from
-    descriptor, resolved_path = _open_frozen_transcript(
-        installation, frozen
+    descriptor, resolved_path, selected_identity, rebound = (
+        _open_frozen_transcript(installation, frozen)
     )
     try:
-        before = _stable_frozen_descriptor_stat(descriptor, frozen)
+        before = _stable_frozen_descriptor_stat(
+            descriptor, frozen, selected_identity, rebound
+        )
         header_error: Optional[TranscriptAdapterError] = None
         try:
             _initial_session_meta(descriptor, installation, frozen)
         except TranscriptAdapterError as error:
             header_error = error
         after_header = _stable_frozen_descriptor_stat(
-            descriptor, frozen
+            descriptor, frozen, selected_identity, rebound
         )
         if after_header != before:
             raise _transcript_error("transcript_changed")
         if header_error is not None:
+            if rebound:
+                raise _transcript_error("transcript_changed") from None
             raise header_error
         data_error: Optional[TranscriptAdapterError] = None
         delta = b""
@@ -3561,7 +3750,9 @@ def read_frozen_transcript(
                     context_records = []
         except TranscriptAdapterError as error:
             data_error = error
-        after = _stable_frozen_descriptor_stat(descriptor, frozen)
+        after = _stable_frozen_descriptor_stat(
+            descriptor, frozen, selected_identity, rebound
+        )
         if after != before:
             raise _transcript_error("transcript_changed")
         if data_error is not None:

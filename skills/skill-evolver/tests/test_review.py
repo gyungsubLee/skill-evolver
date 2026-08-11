@@ -2328,6 +2328,25 @@ class FrozenTranscriptBoundedReadTests(FrozenTranscriptTestCase):
             },
         )
         self.assertEqual(
+            adapter_contract["replacement_rebinding"],
+            {
+                "path": "exact-frozen-locator",
+                "eligibility": "generation-1-epoch-0-from-0",
+                "session_binding": "initial-session-meta-hmac",
+                "frozen_to": "preserve-signed-numeric-boundary",
+                "historical_prefix_identity": False,
+                "later_state": "strict-device-inode",
+                "stop_convergence": {
+                    "event_order": "strictly-newer-observed-at-ns",
+                    "eligibility": (
+                        "pending-generation-1-epoch-0-reviewed-0"
+                    ),
+                    "session_binding": "signed-stop-session-key",
+                    "transcript_read": False,
+                },
+            },
+        )
+        self.assertEqual(
             (
                 adapter_contract["limits"]["evidence_shape_nodes"],
                 adapter_contract["limits"]["evidence_shape_depth"],
@@ -2627,6 +2646,19 @@ class FrozenTranscriptBoundedReadTests(FrozenTranscriptTestCase):
                 self.runtime.transcript_adapter_digest(self.review),
                 before,
             )
+            changed_contract = copy.deepcopy(adapter_contract)
+            changed_contract["replacement_rebinding"][
+                "historical_prefix_identity"
+            ] = True
+            with mock.patch.object(
+                self.runtime,
+                "transcript_adapter_contract",
+                return_value=changed_contract,
+            ):
+                self.assertNotEqual(
+                    self.runtime.transcript_adapter_digest(self.review),
+                    before,
+                )
         finally:
             connection.close()
 
@@ -4262,6 +4294,302 @@ class FrozenTranscriptLayoutTests(FrozenTranscriptTestCase):
 
 
 class FrozenTranscriptIdentityTests(FrozenTranscriptTestCase):
+    def test_first_generation_exact_path_replacement_is_session_bound(
+        self,
+    ) -> None:
+        session_id = "replacement-bound"
+        header = self.fixture_lines[0].replace(
+            b"fixture-session", session_id.encode()
+        )
+        delta = self.fixture_lines[5]
+        connection, transcript, frozen = self.capture_and_claim(
+            [header, delta],
+            reviewed_boundary=0,
+            session_id=session_id,
+        )
+        original_digest = self.runtime.transcript_locator_digest(
+            frozen.locator
+        )
+        preserved = self.base / "preserved-captured-inode.jsonl"
+        transcript.rename(preserved)
+        replacement_delta = delta.replace(b"correction", b"reflection")
+        self.assertEqual(len(replacement_delta), len(delta))
+        transcript.write_bytes(header + replacement_delta)
+        try:
+            exported = self.runtime.read_frozen_transcript(
+                self.installation,
+                frozen,
+                self.config,
+                self.review,
+            )
+            self.assertEqual(
+                [record.text for record in exported.records],
+                ["sanitized direct reflection"],
+            )
+            self.assertEqual(
+                self.runtime.transcript_locator_digest(frozen.locator),
+                original_digest,
+            )
+            self.assertEqual(frozen.frozen_to, len(header) + len(delta))
+            self.assertNotEqual(
+                (transcript.stat().st_dev, transcript.stat().st_ino),
+                (frozen.locator.device, frozen.locator.inode),
+            )
+        finally:
+            connection.close()
+
+    def test_exact_path_replacement_header_failures_are_changed(
+        self,
+    ) -> None:
+        delta = self.fixture_lines[5]
+        for name in ("malformed", "missing", "partial", "hmac-mismatch"):
+            with self.subTest(header=name):
+                session_id = f"replacement-header-{name}"
+                header = self.fixture_lines[0].replace(
+                    b"fixture-session", session_id.encode()
+                )
+                connection, transcript, frozen = self.capture_and_claim(
+                    [header, delta],
+                    reviewed_boundary=0,
+                    session_id=session_id,
+                )
+                transcript.rename(
+                    self.base / f"preserved-{name}.jsonl"
+                )
+                replacement = {
+                    "malformed": b"{\n",
+                    "missing": b'{"type":"event_msg","payload":{}}\n',
+                    "partial": b"x" * frozen.frozen_to,
+                    "hmac-mismatch": header.replace(
+                        session_id.encode(),
+                        b"x" * len(session_id.encode()),
+                    ),
+                }[name]
+                if name != "partial":
+                    replacement += b" " * max(
+                        0, frozen.frozen_to - len(replacement)
+                    )
+                transcript.write_bytes(replacement)
+                try:
+                    with self.assertRaises(
+                        self.runtime.TranscriptAdapterError
+                    ) as raised:
+                        self.runtime.read_frozen_transcript(
+                            self.installation,
+                            frozen,
+                            self.config,
+                            self.review,
+                        )
+                    self.assertEqual(
+                        raised.exception.code, "transcript_changed"
+                    )
+                    self.assertTrue(raised.exception.retryable)
+                finally:
+                    connection.close()
+
+    def test_second_generation_exact_path_replacement_is_changed(
+        self,
+    ) -> None:
+        self._assert_replacement_state_is_changed(generation=2)
+
+    def test_adopted_epoch_exact_path_replacement_is_changed_after_reset(
+        self,
+    ) -> None:
+        self._assert_replacement_state_is_changed(transcript_epoch=1)
+
+    def test_nonzero_frozen_from_exact_path_replacement_is_changed(
+        self,
+    ) -> None:
+        self._assert_replacement_state_is_changed(frozen_from=1)
+
+    def _assert_replacement_state_is_changed(self, **changes) -> None:
+        session_id = "replacement-state"
+        header = self.fixture_lines[0].replace(
+            b"fixture-session", session_id.encode()
+        )
+        delta = self.fixture_lines[5]
+        connection, transcript, frozen = self.capture_and_claim(
+            [header, delta],
+            reviewed_boundary=0,
+            session_id=session_id,
+        )
+        frozen = replace(frozen, **changes)
+        self.assertEqual(frozen.frozen_from, changes.get("frozen_from", 0))
+        transcript.rename(
+            self.base
+            / "preserved-state-"
+            f"{next(iter(changes))}.jsonl"
+        )
+        transcript.write_bytes(header + delta)
+        try:
+            with self.assertRaises(
+                self.runtime.TranscriptAdapterError
+            ) as raised:
+                self.runtime.read_frozen_transcript(
+                    self.installation,
+                    frozen,
+                    self.config,
+                    self.review,
+                )
+            self.assertEqual(raised.exception.code, "transcript_changed")
+            self.assertTrue(raised.exception.retryable)
+        finally:
+            connection.close()
+
+    def test_exact_path_replacement_security_failures_are_changed(
+        self,
+    ) -> None:
+        delta = self.fixture_lines[5]
+
+        def capture(name: str):
+            session_id = f"replacement-security-{name}"
+            header = self.fixture_lines[0].replace(
+                b"fixture-session", session_id.encode()
+            )
+            return (
+                header,
+                *self.capture_and_claim(
+                    [header, delta],
+                    reviewed_boundary=0,
+                    session_id=session_id,
+                ),
+            )
+
+        def assert_changed(
+            frozen,
+            *,
+            installation=None,
+            getuid=None,
+        ) -> None:
+            uid_patch = (
+                mock.patch.object(
+                    self.runtime.os, "getuid", return_value=getuid
+                )
+                if getuid is not None
+                else nullcontext()
+            )
+            with uid_patch, self.assertRaises(
+                self.runtime.TranscriptAdapterError
+            ) as raised:
+                self.runtime.read_frozen_transcript(
+                    installation or self.installation,
+                    frozen,
+                    self.config,
+                    self.review,
+                )
+            self.assertEqual(raised.exception.code, "transcript_changed")
+            self.assertTrue(raised.exception.retryable)
+
+        with self.subTest(security="leaf-symlink"):
+            header, connection, transcript, frozen = capture("leaf-symlink")
+            preserved = self.base / "preserved-leaf-symlink.jsonl"
+            transcript.rename(preserved)
+            replacement = self.base / "leaf-symlink-target.jsonl"
+            replacement.write_bytes(header + delta)
+            transcript.symlink_to(replacement)
+            try:
+                assert_changed(frozen)
+            finally:
+                connection.close()
+
+        with self.subTest(security="parent-symlink"):
+            header, connection, transcript, frozen = capture(
+                "parent-symlink"
+            )
+            preserved = self.base / "preserved-parent-symlink.jsonl"
+            transcript.rename(preserved)
+            real_parent = self.base / "replacement-real-parent"
+            real_parent.mkdir(mode=0o700)
+            replacement_path = real_parent / transcript.name
+            replacement_path.write_bytes(header + delta)
+            linked_parent = self.sessions / "linked-parent"
+            linked_parent.symlink_to(real_parent, target_is_directory=True)
+            linked_locator = replace(
+                frozen.locator, path=linked_parent / transcript.name
+            )
+            linked_frozen = replace(
+                frozen,
+                locator=linked_locator,
+                read_path=linked_locator.path,
+            )
+            try:
+                assert_changed(linked_frozen)
+            finally:
+                connection.close()
+
+        with self.subTest(security="fifo"):
+            header, connection, transcript, frozen = capture("fifo")
+            transcript.rename(self.base / "preserved-fifo.jsonl")
+            os.mkfifo(transcript, mode=0o600)
+            try:
+                assert_changed(frozen)
+            finally:
+                connection.close()
+
+        with self.subTest(security="wrong-uid"):
+            header, connection, transcript, frozen = capture("wrong-uid")
+            transcript.rename(self.base / "preserved-wrong-uid.jsonl")
+            transcript.write_bytes(header + delta)
+            try:
+                assert_changed(frozen, getuid=os.getuid() + 1)
+            finally:
+                connection.close()
+
+        with self.subTest(security="outside-root"):
+            header, connection, transcript, frozen = capture("outside-root")
+            transcript.rename(self.base / "preserved-outside-root.jsonl")
+            outside = self.base / "outside-root.jsonl"
+            outside.write_bytes(header + delta)
+            outside_locator = replace(frozen.locator, path=outside)
+            outside_frozen = replace(
+                frozen,
+                locator=outside_locator,
+                read_path=outside,
+            )
+            try:
+                assert_changed(outside_frozen)
+            finally:
+                connection.close()
+
+        with self.subTest(security="shorter-than-frozen-to"):
+            header, connection, transcript, frozen = capture("short")
+            transcript.rename(self.base / "preserved-short.jsonl")
+            transcript.write_bytes(header)
+            try:
+                assert_changed(frozen)
+            finally:
+                connection.close()
+
+    def test_same_session_replacement_at_different_path_is_not_searched(
+        self,
+    ) -> None:
+        session_id = "replacement-other-path"
+        header = self.fixture_lines[0].replace(
+            b"fixture-session", session_id.encode()
+        )
+        delta = self.fixture_lines[5]
+        connection, transcript, frozen = self.capture_and_claim(
+            [header, delta], reviewed_boundary=0, session_id=session_id
+        )
+        transcript.rename(self.base / "preserved-other-path.jsonl")
+        (self.sessions / "same-session-elsewhere.jsonl").write_bytes(
+            header + delta
+        )
+        try:
+            with self.assertRaises(
+                self.runtime.TranscriptAdapterError
+            ) as raised:
+                self.runtime.read_frozen_transcript(
+                    self.installation,
+                    frozen,
+                    self.config,
+                    self.review,
+                )
+            self.assertEqual(raised.exception.code, "transcript_missing")
+            self.assertTrue(raised.exception.retryable)
+        finally:
+            connection.close()
+
     def test_same_inode_relocation_is_accepted_but_replacement_is_changed(
         self,
     ) -> None:
