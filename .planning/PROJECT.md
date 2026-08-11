@@ -67,22 +67,25 @@ CLI와 Desktop 모두에서 경계가 명확한 session metadata를 수집하고
 
 - Phase 1의 최초 Feasibility `FAIL`은 Phase 2 session-level amendment로 보완됐고 amended report는 `PASS`다.
 - Phase 3 Runtime Queue와 Phase 4 Review/Inbox는 canonical report `PASS`로 완료됐다.
-- 설치된 plugin/runtime/source는 `0.1.4`이며 source/cache parity,
-  Codex `0.146.0` transcript adapter, causal-attribution 정책과 review
-  batch당 최대 3개 distinct candidate target 제한을 포함한다.
-- `Q-002`는 adapter provenance drift로 terminal `INVALID` 처리됐다.
-- 현재 단계는 Phase 5 Read-only Quality Gate다. `Q-003`은 12 distinct
-  real sessions와 candidate `C-001` 1건을 측정한 뒤 evaluation-worth와
-  target-attribution 기준에서 terminal `FAIL`했다. `Q-004`는 exact
-  predecessor `Q-003@512aa6cb395e7a4d6c94a51ad2b9950fb8cada381381784370d3edecda01ac1a`
-  에서 열렸고 현재 `COLLECTING`이다. Review batches 12-17은 오래된
-  transcript generation 30개를 `transcript_changed`로 격리하며 terminal
-  `failed`가 됐지만, 이 배치들은 seal witness로 유효하고 표본에는
-  포함되지 않는다. Regression commit `a1aac8e`가 이후 2개 완료 배치의
-  10개 session으로 정상 seal되는 경로를 검증한다.
-- Phase 6 Evaluate Runner Spike는 Q-004의 최소 10개 distinct real
+- source/canonical main/cache/installed plugin은 `0.1.5`이며 source/cache
+  parity는 7개 production file에서 `PASS`다. canonical source HEAD는
+  `a2acd3e`이고 release test suite는 524 passed, 3 skipped였다.
+- `Q-004`는 `quality_provenance_drift`로 terminal `INVALID` 처리됐고
+  immutable aggregate report digest는
+  `a9d30a50776d7e1ad2b0f56d5be741fda8b9460f46090a88e1e18777e5f0e917`다.
+- 현재 단계는 Phase 5 Read-only Quality Gate다. Installed `0.1.5`가
+  `2026-08-11T13:03:28Z`에 exact predecessor
+  `Q-004@a9d30a50776d7e1ad2b0f56d5be741fda8b9460f46090a88e1e18777e5f0e917`
+  에서 `Q-005`를 열었다. `first_batch_id`는 24이며 현재
+  `Q-005/COLLECTING`은 distinct sessions, candidates, labels가 모두 0이다.
+  이전 batch와 row는 historical evidence일 뿐 Q-005 observation이 아니다.
+  Q-005 transcript-adapter digest는
+  `0fc96fa4a58f06221736200f2d4b7ec393269c42fc488c5aebd7822eac74509b`이고
+  runtime digest는
+  `91613f7d7c681ec9ab6da64ccedf2364bd61d2dbe4aad607157040c62b90b996`다.
+- Phase 6 Evaluate Runner Spike는 Q-005의 최소 10개 distinct real
   sessions, explicit Review, user-only labels, terminal `PASS` 전까지
-  차단된다.
+  차단되며 mutation, evaluate, apply capability는 계속 disabled다.
 
 ## Sources of Truth
 
@@ -94,4 +97,5 @@ CLI와 Desktop 모두에서 경계가 명확한 session metadata를 수집하고
 - `docs/release-reports/review-inbox.json`
 - `docs/superpowers/specs/2026-07-30-skill-evolver-session-quality-gate-design.md`
 - `docs/release-reports/quality/Q-003-512aa6cb395e7a4d6c94a51ad2b9950fb8cada381381784370d3edecda01ac1a.json`
+- `docs/release-reports/quality/Q-004-a9d30a50776d7e1ad2b0f56d5be741fda8b9460f46090a88e1e18777e5f0e917.json`
 - `docs/superpowers/specs/2026-08-04-skill-evolver-target-attribution-remediation-design.md`

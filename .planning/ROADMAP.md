@@ -2,7 +2,7 @@
 
 ## Overview
 
-Skill Evolver는 Phase 1 Feasibility `FAIL`을 Phase 2의 session-level 계약으로 수정해 amended gate `PASS`를 확보했고, Phase 3 bounded Runtime Queue와 Phase 4 explicit Review/Inbox를 구현했다. 설치된 `0.1.4`는 source/cache parity, Codex `0.146.0` transcript adapter, 교정된 causal-attribution 정책과 review batch당 최대 3개 distinct candidate target 제한을 포함한다. `Q-001`과 `Q-002`는 provenance drift로 terminal `INVALID` 처리됐고, `Q-003`은 12 distinct real sessions와 candidate `C-001` 1건을 측정한 뒤 evaluation-worth와 target-attribution 기준에서 terminal `FAIL`했다. `Q-004`는 그 exact failed predecessor에서 열렸고 현재 `COLLECTING`이다. Phase 6은 Q-004의 최소 10개 distinct real sessions, explicit Review, user-only labels, terminal `PASS`까지 차단된다. 이후 runner, immutable evaluation, manual apply/versioning, undo/recovery와 hardening gate를 순서대로 통과한다.
+Skill Evolver는 Phase 1 Feasibility `FAIL`을 Phase 2의 session-level 계약으로 수정해 amended gate `PASS`를 확보했고, Phase 3 bounded Runtime Queue와 Phase 4 explicit Review/Inbox를 구현했다. source/canonical main/cache/installed plugin은 `0.1.5`이며 seven-file source/cache parity는 `PASS`다. `Q-004`는 `quality_provenance_drift`로 terminal `INVALID` 처리됐고 immutable report digest는 `a9d30a50776d7e1ad2b0f56d5be741fda8b9460f46090a88e1e18777e5f0e917`다. Installed `0.1.5`는 `2026-08-11T13:03:28Z`에 그 exact digest에서 `Q-005`를 열었다. `Q-005`는 `COLLECTING`이며 distinct sessions, candidates, labels는 모두 0이고 old batches/rows는 historical evidence일 뿐 observation이 아니다. Phase 6은 Q-005의 최소 10개 distinct real sessions, explicit Review, user-only labels, terminal `PASS`까지 차단되고 mutation, Evaluate, Apply capability는 disabled 상태다. 이후 runner, immutable evaluation, manual apply/versioning, undo/recovery와 hardening gate를 순서대로 통과한다.
 
 ## Phases
 
@@ -112,23 +112,19 @@ Plans:
 **Depends on**: Phase 4
 **Requirements**: QUALITY-01
 **Entry Gate**: Review/Inbox suite passes with zero target-skill writes
-**Gate Result**: **Q-004 COLLECTING — CORRECTIVE 0.1.4 INSTALLED** — `Q-002` terminalized
-`INVALID` for `quality_provenance_drift` with report digest
-`57c64c9a7b32591f3af0e78c77d2f766f75f57e1da41a1a5a6aefca7b3993bfe`.
-`Q-003` opened from that exact predecessor and sealed on 2026-07-31 with 12
-distinct real sessions and one candidate, `C-001`. The user attested all three
-labels `false`; the quality gate returned terminal `FAIL` with digest
-`512aa6cb395e7a4d6c94a51ad2b9950fb8cada381381784370d3edecda01ac1a`.
-Its exact aggregate body is preserved in the matching content-addressed
-repository report.
-The sample and safety checks passed, while evaluation-worth and target
-attribution failed. Corrective `0.1.4` is installed with source/cache parity,
-and `Q-004` opened from the exact Q-003 terminal digest. Batches 12-17 then
-quarantined 30 stale transcript generations as `transcript_changed` and
-terminalized `failed`; regression `a1aac8e` proves these failed witnesses do
-not block a later ten-session seal. Phase 6 stays blocked until Q-004 has at
+**Gate Result**: **Q-005 COLLECTING — 0.1.5 INSTALLED** — `Q-004` terminalized
+`INVALID` for `quality_provenance_drift` with immutable report digest
+`a9d30a50776d7e1ad2b0f56d5be741fda8b9460f46090a88e1e18777e5f0e917`.
+The matching content-addressed aggregate body is preserved at
+`docs/release-reports/quality/Q-004-a9d30a50776d7e1ad2b0f56d5be741fda8b9460f46090a88e1e18777e5f0e917.json`.
+Installed `0.1.5` opened `Q-005` at `2026-08-11T13:03:28Z` from exact
+predecessor `Q-004@a9d30a50776d7e1ad2b0f56d5be741fda8b9460f46090a88e1e18777e5f0e917`;
+`first_batch_id` is 24. Current `Q-005/COLLECTING` has zero distinct sessions,
+candidates, and labels. Old batches and rows remain historical evidence and
+do not count as Q-005 observations. Phase 6 stays blocked until Q-005 has at
 least ten distinct real sessions, explicit Review, user-only labels, and
-terminal `PASS`.
+terminal `PASS`; mutation, Runner, Prepare, Evaluate, and Apply remain
+disabled.
 **Failure Route**: Phase 4 transcript adapter 또는 improvement policy로 돌아간다.
 **Success Criteria** (what must be TRUE):
   1. 개발자가 최소 10 sessions 또는 30 review items에 대한 complete label set을 확인할 수 있다.
@@ -247,7 +243,7 @@ Plans:
 | 2. Session-Level Capture Design Amendment | 1/1 | Complete (gate PASS) | 2026-07-29 |
 | 3. Runtime Queue | 1/1 | Complete (gate PASS) | 2026-07-29 |
 | 4. Review and Inbox | 1/1 | Complete (gate PASS) | 2026-07-30 |
-| 5. Read-only Quality Gate | 0/1 | Q-004 COLLECTING; corrective 0.1.4 installed | - |
+| 5. Read-only Quality Gate | 0/1 | Q-005 COLLECTING; 0.1.5 installed | - |
 | 6. Evaluate Runner Spike | 0/1 | Not started | - |
 | 7. Evaluate Prepare | 0/1 | Not started | - |
 | 8. Evaluate Execution | 0/1 | Not started | - |
