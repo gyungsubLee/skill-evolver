@@ -2347,6 +2347,21 @@ class FrozenTranscriptBoundedReadTests(FrozenTranscriptTestCase):
             },
         )
         self.assertEqual(
+            adapter_contract["read_stability"],
+            {
+                "attempts_max": 2,
+                "first_retry": (
+                    "same-device-inode-size-growth-only"
+                ),
+                "discard_first_attempt": True,
+                "retry_identity": (
+                    "pin-first-selected-device-inode"
+                ),
+                "retry_rebinding": False,
+                "sleep_or_poll": False,
+            },
+        )
+        self.assertEqual(
             (
                 adapter_contract["limits"]["evidence_shape_nodes"],
                 adapter_contract["limits"]["evidence_shape_depth"],
@@ -2650,6 +2665,17 @@ class FrozenTranscriptBoundedReadTests(FrozenTranscriptTestCase):
             changed_contract["replacement_rebinding"][
                 "historical_prefix_identity"
             ] = True
+            with mock.patch.object(
+                self.runtime,
+                "transcript_adapter_contract",
+                return_value=changed_contract,
+            ):
+                self.assertNotEqual(
+                    self.runtime.transcript_adapter_digest(self.review),
+                    before,
+                )
+            changed_contract = copy.deepcopy(adapter_contract)
+            changed_contract["read_stability"]["attempts_max"] = 3
             with mock.patch.object(
                 self.runtime,
                 "transcript_adapter_contract",
@@ -4907,6 +4933,290 @@ class FrozenTranscriptIdentityTests(FrozenTranscriptTestCase):
         finally:
             connection.close()
 
+    def test_same_inode_growth_rereads_once_and_succeeds(self) -> None:
+        session_id = "changing-during-read"
+        header = self.fixture_lines[0].replace(
+            b"fixture-session", session_id.encode()
+        )
+        delta = self.fixture_lines[5]
+        connection, transcript, frozen = self.capture_and_claim(
+            [header, delta],
+            reviewed_boundary=len(header),
+            session_id=session_id,
+        )
+        real_pread = os.pread
+        real_open = os.open
+        real_fstat = os.fstat
+        real_read_exact = self.runtime._read_exact_at
+        real_reopen = self.runtime._reopen_selected_transcript
+        real_open_frozen = self.runtime._open_frozen_transcript
+        real_relocate = self.runtime._find_relocated_transcript
+        real_rebind = self.runtime._open_exact_path_replacement
+        appended = False
+        attempt = 1
+        reopen_calls = []
+        file_opens = []
+        file_stats = []
+        reads = []
+        exact_reads = []
+
+        def append_once(descriptor: int, length: int, offset: int) -> bytes:
+            nonlocal appended
+            self.assertLessEqual(offset + length, frozen.frozen_to)
+            reads.append((attempt, offset, length))
+            result = real_pread(descriptor, length, offset)
+            if not appended:
+                appended = True
+                with transcript.open("ab") as stream:
+                    stream.write(b'{"type":"event_msg","payload":{}}\n')
+            return result
+
+        def track_open(name, flags, *args, **kwargs):
+            descriptor = real_open(name, flags, *args, **kwargs)
+            if name in {str(transcript), transcript.name}:
+                file_opens.append((name, kwargs.get("dir_fd")))
+            return descriptor
+
+        def track_fstat(descriptor: int):
+            info = real_fstat(descriptor)
+            if stat.S_ISREG(info.st_mode):
+                file_stats.append(
+                    (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+                )
+            return info
+
+        def track_read_exact(
+            descriptor: int, start: int, length: int
+        ) -> bytes:
+            self.assertLessEqual(start + length, frozen.frozen_to)
+            exact_reads.append((attempt, start, length))
+            return real_read_exact(descriptor, start, length)
+
+        def count_reopen(*args, **kwargs):
+            nonlocal attempt
+            reopen_calls.append((args, kwargs))
+            attempt = 2
+            return real_reopen(*args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                self.runtime.os, "pread", side_effect=append_once
+            ), mock.patch.object(
+                self.runtime.os, "open", side_effect=track_open
+            ), mock.patch.object(
+                self.runtime.os, "fstat", side_effect=track_fstat
+            ), mock.patch.object(
+                self.runtime,
+                "_read_exact_at",
+                side_effect=track_read_exact,
+            ), mock.patch.object(
+                self.runtime,
+                "_open_frozen_transcript",
+                wraps=real_open_frozen,
+            ) as open_frozen, mock.patch.object(
+                self.runtime,
+                "_find_relocated_transcript",
+                wraps=real_relocate,
+            ) as relocate, mock.patch.object(
+                self.runtime,
+                "_open_exact_path_replacement",
+                wraps=real_rebind,
+            ) as rebind, mock.patch.object(
+                self.runtime,
+                "_reopen_selected_transcript",
+                side_effect=count_reopen,
+            ):
+                exported = self.runtime.read_frozen_transcript(
+                    self.installation,
+                    frozen,
+                    self.config,
+                    self.review,
+                )
+            self.assertTrue(appended)
+            open_frozen.assert_called_once_with(
+                self.installation, frozen
+            )
+            relocate.assert_not_called()
+            rebind.assert_not_called()
+            self.assertEqual(len(reopen_calls), 1)
+            reopen_args, reopen_kwargs = reopen_calls[0]
+            self.assertFalse(reopen_kwargs)
+            self.assertEqual(reopen_args[0], transcript)
+            self.assertEqual(reopen_args[1], self.installation)
+            self.assertEqual(reopen_args[2], frozen)
+            self.assertEqual(
+                reopen_args[3],
+                (frozen.locator.device, frozen.locator.inode),
+            )
+            self.assertEqual(
+                reopen_args[4][:2],
+                (frozen.locator.device, frozen.locator.inode),
+            )
+            self.assertGreater(reopen_args[4][2], frozen.locator.size)
+            self.assertEqual(len(file_opens), 2)
+            self.assertEqual({read[0] for read in reads}, {1, 2})
+            self.assertEqual(
+                {identity[:2] for identity in file_stats},
+                {(frozen.locator.device, frozen.locator.inode)},
+            )
+            self.assertEqual(
+                exact_reads,
+                [
+                    (1, 0, frozen.frozen_to),
+                    (2, 0, frozen.frozen_to),
+                    (2, frozen.frozen_from, len(delta)),
+                    (2, 0, len(header)),
+                ],
+            )
+            self.assertEqual(
+                [record.text for record in exported.records],
+                ["sanitized direct correction"],
+            )
+            self.assertEqual(exported.delta_source_bytes, len(delta))
+            self.assertEqual(exported.context_source_bytes, len(header))
+        finally:
+            connection.close()
+
+    def test_growth_on_both_attempts_is_retryable_changed(self) -> None:
+        session_id = "changing-on-both-attempts"
+        header = self.fixture_lines[0].replace(
+            b"fixture-session", session_id.encode()
+        )
+        delta = self.fixture_lines[5]
+        connection, transcript, frozen = self.capture_and_claim(
+            [header, delta],
+            reviewed_boundary=len(header),
+            session_id=session_id,
+        )
+        real_pread = os.pread
+        real_reopen = self.runtime._reopen_selected_transcript
+        appended = False
+        reopen_count = 0
+
+        def append_each_attempt(
+            descriptor: int, length: int, offset: int
+        ) -> bytes:
+            nonlocal appended
+            self.assertLessEqual(offset + length, frozen.frozen_to)
+            result = real_pread(descriptor, length, offset)
+            if not appended:
+                appended = True
+                with transcript.open("ab") as stream:
+                    stream.write(b'{"type":"event_msg","payload":{}}\n')
+            return result
+
+        def reset_after_reopen(*args, **kwargs):
+            nonlocal appended, reopen_count
+            reopen_count += 1
+            descriptor = real_reopen(*args, **kwargs)
+            appended = False
+            return descriptor
+
+        try:
+            with mock.patch.object(
+                self.runtime.os,
+                "pread",
+                side_effect=append_each_attempt,
+            ), mock.patch.object(
+                self.runtime,
+                "_reopen_selected_transcript",
+                side_effect=reset_after_reopen,
+            ):
+                with self.assertRaises(
+                    self.runtime.TranscriptAdapterError
+                ) as raised:
+                    self.runtime.read_frozen_transcript(
+                        self.installation,
+                        frozen,
+                        self.config,
+                        self.review,
+                    )
+            self.assertEqual(reopen_count, 1)
+            self.assertEqual(raised.exception.code, "transcript_changed")
+            self.assertTrue(raised.exception.retryable)
+        finally:
+            connection.close()
+
+    def test_retry_identity_swap_is_retryable_changed(self) -> None:
+        session_id = "retry-identity-swap"
+        header = self.fixture_lines[0].replace(
+            b"fixture-session", session_id.encode()
+        )
+        delta = self.fixture_lines[5]
+        connection, transcript, frozen = self.capture_and_claim(
+            [header, delta],
+            reviewed_boundary=len(header),
+            session_id=session_id,
+        )
+        real_pread = os.pread
+        real_reopen = self.runtime._reopen_selected_transcript
+        real_open_frozen = self.runtime._open_frozen_transcript
+        real_relocate = self.runtime._find_relocated_transcript
+        appended = False
+        relocated = self.sessions / "retry-relocated"
+        relocated.mkdir(mode=0o700)
+        selected_path = relocated / "selected.jsonl"
+        transcript.rename(selected_path)
+        preserved = self.base / "preserved-before-retry.jsonl"
+
+        def append_once(descriptor: int, length: int, offset: int) -> bytes:
+            nonlocal appended
+            self.assertLessEqual(offset + length, frozen.frozen_to)
+            result = real_pread(descriptor, length, offset)
+            if not appended:
+                appended = True
+                with selected_path.open("ab") as stream:
+                    stream.write(b'{"type":"event_msg","payload":{}}\n')
+            return result
+
+        def swap_before_reopen(*args, **kwargs):
+            selected_path.rename(preserved)
+            selected_path.write_bytes(header + delta)
+            return real_reopen(*args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                self.runtime.os, "pread", side_effect=append_once
+            ), mock.patch.object(
+                self.runtime,
+                "_open_frozen_transcript",
+                wraps=real_open_frozen,
+            ) as open_frozen, mock.patch.object(
+                self.runtime,
+                "_find_relocated_transcript",
+                wraps=real_relocate,
+            ) as relocate, mock.patch.object(
+                self.runtime,
+                "_reopen_selected_transcript",
+                side_effect=swap_before_reopen,
+            ) as reopen:
+                with self.assertRaises(
+                    self.runtime.TranscriptAdapterError
+                ) as raised:
+                    self.runtime.read_frozen_transcript(
+                        self.installation,
+                        frozen,
+                        self.config,
+                        self.review,
+                    )
+            self.assertTrue(appended)
+            open_frozen.assert_called_once_with(
+                self.installation, frozen
+            )
+            reopen.assert_called_once()
+            relocate.assert_called_once_with(
+                self.installation, frozen
+            )
+            self.assertEqual(reopen.call_args.args[0], selected_path)
+            self.assertEqual(
+                reopen.call_args.args[3],
+                (frozen.locator.device, frozen.locator.inode),
+            )
+            self.assertEqual(raised.exception.code, "transcript_changed")
+            self.assertTrue(raised.exception.retryable)
+        finally:
+            connection.close()
+
     def test_missing_and_during_read_change_are_retryable(self) -> None:
         lines = [self.fixture_lines[0], self.fixture_lines[5]]
         connection, transcript, frozen = self.capture_and_claim(
@@ -5028,56 +5338,6 @@ class FrozenTranscriptIdentityTests(FrozenTranscriptTestCase):
                     too_deep.exception.code, "transcript_missing"
                 )
                 self.assertTrue(too_deep.exception.retryable)
-        finally:
-            connection.close()
-
-        connection, transcript, frozen = self.capture_and_claim(
-            [
-                lines[0].replace(
-                    b"fixture-session", b"changing-during-read"
-                ),
-                lines[1],
-            ],
-            reviewed_boundary=len(
-                lines[0].replace(
-                    b"fixture-session", b"changing-during-read"
-                )
-            ),
-            session_id="changing-during-read",
-        )
-        real_pread = os.pread
-        changed = False
-
-        def append_during_read(
-            descriptor: int, length: int, offset: int
-        ) -> bytes:
-            nonlocal changed
-            result = real_pread(descriptor, length, offset)
-            if not changed:
-                changed = True
-                with transcript.open("ab") as stream:
-                    stream.write(b'{"type":"event_msg","payload":{}}\n')
-            return result
-
-        try:
-            with mock.patch.object(
-                self.runtime.os,
-                "pread",
-                side_effect=append_during_read,
-            ):
-                with self.assertRaises(
-                    self.runtime.TranscriptAdapterError
-                ) as changing:
-                    self.runtime.read_frozen_transcript(
-                        self.installation,
-                        frozen,
-                        self.config,
-                        self.review,
-                    )
-            self.assertEqual(
-                changing.exception.code, "transcript_changed"
-            )
-            self.assertTrue(changing.exception.retryable)
         finally:
             connection.close()
 

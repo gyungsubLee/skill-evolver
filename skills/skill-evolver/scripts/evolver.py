@@ -2087,6 +2087,17 @@ class TranscriptAdapterError(ValueError):
         super().__init__(code)
 
 
+@dataclass(frozen=True)
+class _TranscriptReadAttempt:
+    records: tuple[TranscriptRecord, ...]
+    delta_source_bytes: int
+    context_source_bytes: int
+    canonical_records_bytes: int
+    before: tuple[int, int, int, int]
+    after: tuple[int, int, int, int]
+    error: Optional[TranscriptAdapterError]
+
+
 def _transcript_error(code: str) -> TranscriptAdapterError:
     if code in TRANSCRIPT_RETRYABLE_CODES:
         return TranscriptAdapterError(code, retryable=True)
@@ -2257,6 +2268,14 @@ def transcript_adapter_contract(
                 "session_binding": "signed-stop-session-key",
                 "transcript_read": False,
             },
+        },
+        "read_stability": {
+            "attempts_max": 2,
+            "first_retry": "same-device-inode-size-growth-only",
+            "discard_first_attempt": True,
+            "retry_identity": "pin-first-selected-device-inode",
+            "retry_rebinding": False,
+            "sleep_or_poll": False,
         },
         "limits": {
             "session_bytes": runtime.max_transcript_bytes,
@@ -3468,11 +3487,11 @@ def _find_relocated_transcript(
     raise _transcript_error("transcript_missing")
 
 
-def _open_exact_path_replacement(
+def _open_exact_transcript_path(
+    path: Path,
     installation: Installation,
     frozen: FrozenTranscript,
-) -> tuple[int, Path, tuple[int, int]]:
-    path = frozen.locator.path
+) -> tuple[int, os.stat_result]:
     selected: Optional[tuple[Path, tuple[str, ...]]] = None
     for root in installation.transcript_roots:
         try:
@@ -3576,9 +3595,23 @@ def _open_exact_path_replacement(
         except BaseException:
             _close_transcript_descriptor(descriptor)
             raise
-        return descriptor, path, (info.st_dev, info.st_ino)
+        return descriptor, info
     finally:
         _close_transcript_descriptor(directory_descriptor)
+
+
+def _open_exact_path_replacement(
+    installation: Installation,
+    frozen: FrozenTranscript,
+) -> tuple[int, Path, tuple[int, int]]:
+    descriptor, info = _open_exact_transcript_path(
+        frozen.locator.path, installation, frozen
+    )
+    return (
+        descriptor,
+        frozen.locator.path,
+        (info.st_dev, info.st_ino),
+    )
 
 
 def _open_frozen_transcript(
@@ -3675,6 +3708,156 @@ def _stable_frozen_descriptor_stat(
     )
 
 
+def _reopen_selected_transcript(
+    path: Path,
+    installation: Installation,
+    frozen: FrozenTranscript,
+    selected_identity: tuple[int, int],
+    minimum_stat: tuple[int, int, int, int],
+) -> int:
+    """Exact-path reopen; no relocation and no replacement rebinding."""
+    try:
+        descriptor, info = _open_exact_transcript_path(
+            path, installation, frozen
+        )
+    except TranscriptAdapterError:
+        raise _transcript_error("transcript_changed") from None
+    current = (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+    )
+    if (
+        minimum_stat[:2] != selected_identity
+        or current[:2] != selected_identity
+        or current[2] < minimum_stat[2]
+        or current[3] < minimum_stat[3]
+    ):
+        _close_transcript_descriptor(descriptor)
+        raise _transcript_error("transcript_changed")
+    return descriptor
+
+
+def _same_identity_growth(
+    before: tuple[int, int, int, int],
+    after: tuple[int, int, int, int],
+) -> bool:
+    return (
+        after[:2] == before[:2]
+        and after[2] > before[2]
+        and after[3] >= before[3]
+    )
+
+
+def _read_frozen_transcript_attempt(
+    descriptor: int,
+    installation: Installation,
+    frozen: FrozenTranscript,
+    *,
+    byte_limit: int,
+    record_limit: int,
+    selected_identity: tuple[int, int],
+    rebound: bool,
+) -> _TranscriptReadAttempt:
+    before = _stable_frozen_descriptor_stat(
+        descriptor, frozen, selected_identity, rebound
+    )
+    header_error: Optional[TranscriptAdapterError] = None
+    try:
+        _initial_session_meta(descriptor, installation, frozen)
+    except TranscriptAdapterError as error:
+        header_error = error
+    after_header = _stable_frozen_descriptor_stat(
+        descriptor, frozen, selected_identity, rebound
+    )
+    if after_header != before:
+        return _TranscriptReadAttempt(
+            records=(),
+            delta_source_bytes=0,
+            context_source_bytes=0,
+            canonical_records_bytes=0,
+            before=before,
+            after=after_header,
+            error=header_error,
+        )
+    if header_error is not None:
+        return _TranscriptReadAttempt(
+            records=(),
+            delta_source_bytes=0,
+            context_source_bytes=0,
+            canonical_records_bytes=0,
+            before=before,
+            after=after_header,
+            error=(
+                _transcript_error("transcript_changed")
+                if rebound
+                else header_error
+            ),
+        )
+
+    delta_length = frozen.frozen_to - frozen.frozen_from
+    data_error: Optional[TranscriptAdapterError] = None
+    delta = b""
+    context = b""
+    delta_records: list[TranscriptRecord] = []
+    context_records: list[TranscriptRecord] = []
+    try:
+        if delta_length > byte_limit:
+            raise _transcript_error("oversized_session")
+        delta = _read_exact_at(
+            descriptor, frozen.frozen_from, delta_length
+        )
+        if not delta.endswith(b"\n"):
+            raise _transcript_error("transcript_partial")
+        delta_records = _parse_jsonl_records(
+            delta,
+            frozen.frozen_from,
+            installation,
+            frozen,
+            evidence_eligible=True,
+        )
+        if len(delta_records) > record_limit:
+            raise _transcript_error("oversized_session")
+        context_start, context = _bounded_reverse_context(
+            descriptor,
+            frozen.frozen_from,
+            byte_limit - len(delta),
+        )
+        context_records = _parse_jsonl_records(
+            context,
+            context_start,
+            installation,
+            frozen,
+            evidence_eligible=False,
+        )
+        remaining_records = record_limit - len(delta_records)
+        if len(context_records) > remaining_records:
+            context_records = context_records[-remaining_records:]
+            if not remaining_records:
+                context_records = []
+    except TranscriptAdapterError as error:
+        data_error = error
+    after = _stable_frozen_descriptor_stat(
+        descriptor, frozen, selected_identity, rebound
+    )
+    records = tuple([*context_records, *delta_records])
+    canonical = (
+        b""
+        if data_error is not None
+        else _canonical_transcript_records(records)
+    )
+    return _TranscriptReadAttempt(
+        records=records,
+        delta_source_bytes=len(delta),
+        context_source_bytes=len(context),
+        canonical_records_bytes=len(canonical),
+        before=before,
+        after=after,
+        error=data_error,
+    )
+
+
 def read_frozen_transcript(
     installation: Installation,
     frozen: FrozenTranscript,
@@ -3687,85 +3870,52 @@ def read_frozen_transcript(
     record_limit = min(
         config.max_transcript_records, runtime.max_transcript_records
     )
-    delta_length = frozen.frozen_to - frozen.frozen_from
     descriptor, resolved_path, selected_identity, rebound = (
         _open_frozen_transcript(installation, frozen)
     )
     try:
-        before = _stable_frozen_descriptor_stat(
-            descriptor, frozen, selected_identity, rebound
+        attempt = _read_frozen_transcript_attempt(
+            descriptor,
+            installation,
+            frozen,
+            byte_limit=byte_limit,
+            record_limit=record_limit,
+            selected_identity=selected_identity,
+            rebound=rebound,
         )
-        header_error: Optional[TranscriptAdapterError] = None
-        try:
-            _initial_session_meta(descriptor, installation, frozen)
-        except TranscriptAdapterError as error:
-            header_error = error
-        after_header = _stable_frozen_descriptor_stat(
-            descriptor, frozen, selected_identity, rebound
-        )
-        if after_header != before:
-            raise _transcript_error("transcript_changed")
-        if header_error is not None:
-            if rebound:
-                raise _transcript_error("transcript_changed") from None
-            raise header_error
-        data_error: Optional[TranscriptAdapterError] = None
-        delta = b""
-        context = b""
-        delta_records: list[TranscriptRecord] = []
-        context_records: list[TranscriptRecord] = []
-        try:
-            if delta_length > byte_limit:
-                raise _transcript_error("oversized_session")
-            delta = _read_exact_at(
-                descriptor, frozen.frozen_from, delta_length
-            )
-            if not delta.endswith(b"\n"):
-                raise _transcript_error("transcript_partial")
-            delta_records = _parse_jsonl_records(
-                delta,
-                frozen.frozen_from,
-                installation,
-                frozen,
-                evidence_eligible=True,
-            )
-            if len(delta_records) > record_limit:
-                raise _transcript_error("oversized_session")
-            context_start, context = _bounded_reverse_context(
-                descriptor,
-                frozen.frozen_from,
-                byte_limit - len(delta),
-            )
-            context_records = _parse_jsonl_records(
-                context,
-                context_start,
-                installation,
-                frozen,
-                evidence_eligible=False,
-            )
-            remaining_records = record_limit - len(delta_records)
-            if len(context_records) > remaining_records:
-                context_records = context_records[-remaining_records:]
-                if not remaining_records:
-                    context_records = []
-        except TranscriptAdapterError as error:
-            data_error = error
-        after = _stable_frozen_descriptor_stat(
-            descriptor, frozen, selected_identity, rebound
-        )
-        if after != before:
-            raise _transcript_error("transcript_changed")
-        if data_error is not None:
-            raise data_error
     finally:
         _close_transcript_descriptor(descriptor)
-    records = tuple([*context_records, *delta_records])
-    canonical = _canonical_transcript_records(records)
+    if attempt.before != attempt.after:
+        if not _same_identity_growth(attempt.before, attempt.after):
+            raise _transcript_error("transcript_changed")
+        descriptor = _reopen_selected_transcript(
+            resolved_path,
+            installation,
+            frozen,
+            selected_identity,
+            attempt.after,
+        )
+        try:
+            attempt = _read_frozen_transcript_attempt(
+                descriptor,
+                installation,
+                frozen,
+                byte_limit=byte_limit,
+                record_limit=record_limit,
+                selected_identity=selected_identity,
+                rebound=rebound,
+            )
+        finally:
+            _close_transcript_descriptor(descriptor)
+        if attempt.before != attempt.after:
+            raise _transcript_error("transcript_changed")
+    if attempt.error is not None:
+        raise attempt.error
     return TranscriptExport(
-        records=records,
-        delta_source_bytes=len(delta),
-        context_source_bytes=len(context),
-        canonical_records_bytes=len(canonical),
+        records=attempt.records,
+        delta_source_bytes=attempt.delta_source_bytes,
+        context_source_bytes=attempt.context_source_bytes,
+        canonical_records_bytes=attempt.canonical_records_bytes,
         read_path_changed=resolved_path != frozen.locator.path,
     )
 
