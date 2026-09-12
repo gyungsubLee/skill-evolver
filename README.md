@@ -15,6 +15,32 @@ language, and requires causal target attribution plus bounded target
 inspection before a candidate. During a collecting quality epoch, it admits
 only sessions whose earliest Stop is strictly after the epoch start.
 
+## Versions and GitHub releases
+
+To prepare a release, open [Actions → Release](https://github.com/gyungsubLee/skill-evolver/actions/workflows/release.yml),
+choose **Run workflow** on `main`, and select `patch`, `minor` or `major`.
+The workflow synchronizes version fields and opens a release PR. Review its
+changes and merge it after CI passes. GitHub may ask you to approve CI for
+the bot-created PR before those checks run.
+
+After the version change reaches `main`, Actions retests that commit and
+publishes `vX.Y.Z` with generated release notes, a source ZIP and `SHA256SUMS`.
+Ordinary commits run CI without increasing the release version. CI artifacts
+also include the build number and commit identity. The initial workflow
+setup preserves 0.1.7 and does not publish a release.
+
+The archive includes the plugin, marketplace and frozen reports required by
+the runtime. It retains the current macOS installation configuration. Install
+a release explicitly using the commands below; Actions does not update local
+plugin caches or run private quality lifecycle commands.
+
+Local release-tool checks use Python's standard library:
+
+```bash
+/usr/bin/python3 -I scripts/release.py check
+/usr/bin/python3 -I -m unittest discover -s scripts -p 'test_*.py'
+```
+
 ## Gate
 
 `docs/feasibility-report-v2.json` must contain:

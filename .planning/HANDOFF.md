@@ -1,6 +1,6 @@
 # Skill Evolver Session Handoff
 
-Updated: 2026-09-12
+Updated: 2026-09-13
 
 ## Resume Point
 
@@ -28,6 +28,22 @@ Installed plugin: `skill-evolver 0.1.7`
 Frozen implementation commit: `4d535cb`
 
 Historical Q-006 implementation commit: `980118fcddce4f8b5271f82638c3f9d131bf0e7f`
+
+## Release Automation
+
+The user approved [GitHub Actions release automation](../docs/superpowers/specs/2026-09-13-skill-evolver-release-workflow-design.md)
+on 2026-09-13 and requested direct implementation. Its [execution plan and
+verification evidence](../docs/superpowers/plans/2026-09-13-skill-evolver-release-workflow.md)
+track the rollout. CI validates source archives and fixtures; manual Release
+dispatch prepares a version PR, and a subsequent version change on main
+publishes its tested commit. Workflow setup keeps version 0.1.7, publishes no
+initial release and does not install a plugin or operate the quality queue.
+
+The 2026-09-12 installation parity evidence below is historical: this workflow
+change adds README release instructions without updating the installed README.
+The runtime, manifest, runtime reference, Hook, policy and SKILL remain the
+same 0.1.7 bytes. Phase 5 and its next real-Stop/Q-007 approval steps remain
+pending. Release automation is repository tooling, not a Phase 5 quality PASS.
 
 ## Product Shape Inherited From Hermes
 
