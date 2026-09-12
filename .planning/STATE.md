@@ -13,7 +13,7 @@ progress:
 
 ## Project Reference
 
-See: `.planning/PROJECT.md` (updated 2026-08-11)
+See: `.planning/PROJECT.md` (updated 2026-09-12)
 
 **Core value:** 관찰은 최소화하고 판단과 스킬 변경 권한은 사용자에게 남긴다.
 **Current focus:** Phase 5 — Read-only Quality Gate
@@ -22,25 +22,27 @@ See: `.planning/PROJECT.md` (updated 2026-08-11)
 
 Phase: 5 of 11 (Read-only Quality Gate)
 Plan: 0 of 1 in current phase
-Status: source/canonical main/cache/installed plugin are `0.1.6`; canonical
-source HEAD is `980118fcddce4f8b5271f82638c3f9d131bf0e7f`, source/cache parity is
-`PASS` for 7 production files, and the release suite recorded 538 passed,
-3 skipped. `Q-005` is immutable terminal `INVALID` for
-`quality_provenance_drift`, with zero sessions, candidates, and labels and
-report digest
-`781dbac0ba4e8e601ce6475e408204865127e5fd16a961e66cf47afc38a94c2f`.
-Installed `0.1.6` opened `Q-006` at `2026-08-11T14:53:34Z` from exact
-predecessor `Q-005@781dbac0ba4e8e601ce6475e408204865127e5fd16a961e66cf47afc38a94c2f`;
-it expires at `2026-09-10T14:53:34Z` and has `first_batch_id=24`. Read-only
-status is `Q-006/COLLECTING` with zero distinct sessions, candidates, and
-labels. Post-open maintenance imported 68 spool records, recognized 3
-duplicates, and left spool 0, pending 128, claimable 0, quarantined 128
-(`pre_quality_epoch` 71 plus `transcript_changed` 57). No Review claim ran.
-Phase 6 remains blocked until Q-006 has at least ten distinct real post-open
-sessions, explicit Review, user-only labels, and terminal `PASS`. Mutation,
-Evaluate, and Apply capability remain disabled.
-Last activity: 2026-08-11 — Q-005 terminal report recorded, 0.1.6 installed,
-Q-006 opened, and historical backlog isolation verified
+Status: Design A is implemented in source 0.1.7 in the standalone project
+`/Users/igyeongseob/Develop/10_herness/skill-evolver`. Quality contract v3
+adds collection deadline, remaining seconds, invalid reason and advisory next
+action to read-only quality status. The unchanged-provenance retry guard,
+gate, schema, TTLs, Hook, policy and transcript adapter are unchanged.
+Focused quality tests: 109 passed. Independent specification/code-quality and
+security/privacy reviews: CLEAN. Full suite: 554 tests run, 551 passed, 3 historical skips, zero failures.
+Source/cache/installed plugin are 0.1.7 with seven production-file pairs
+identical; packaged Phase 4 report also matches. Frozen implementation commit
+is 4d535cb. Marketplace and plugin source both point at the current project.
+The installed read-only check at 2026-09-12T11:44:39Z reports spool 0,
+pending 0, claimable 0 and no cleanup backlog; fresh real Stop proof is pending.
+Q-006 remains immutable INVALID for quality_collection_expired, report digest
+`c06087eff41522ee6c76dd584a0009aaefccffad572a0e49867a36492014c3d3`.
+Source read-only status confirms its stored deadline and terminal recovery
+action; no live maintenance, Review, open, seal, label or gate was run.
+Q-007 requires installed parity, fresh genuine Stop ingress and exact-command
+approval. Phase 6 remains blocked until a genuine successor cohort of at least
+ten distinct sessions, explicit Review, user-only labels and immutable PASS.
+Last activity: 2026-09-12 — 0.1.7 installed from current project with verified
+source/cache parity; fresh real Stop and Q-007 approval pending
 
 Progress: [████░░░░░░] 36%
 
@@ -61,9 +63,10 @@ Progress: [████░░░░░░] 36%
 | 4. Review and Inbox | 1/1 | Not recorded | Not recorded |
 
 **Recent Trend:** Four sequential phase gates recorded; Phase 2, Phase 3 and
-Phase 4 are PASS. Installed `0.1.6` has seven-file source/cache parity.
-`Q-005` terminalized `INVALID` for provenance drift and `Q-006` is collecting
-a clean post-open sample under quality-contract digest
+Phase 4 are PASS. Installed `0.1.7` has seven-file source/cache parity. The
+following Q-006 provenance is the immutable historical `0.1.6` record.
+`Q-006` terminalized `INVALID` for collection expiry without a sample under
+quality-contract digest
 `d2479583d755d8196e05df5e63b5af12d52c5d3738c70a24555d8a9a5c81cc3b`,
 transcript-adapter digest
 `0fc96fa4a58f06221736200f2d4b7ec393269c42fc488c5aebd7822eac74509b`, and
@@ -94,8 +97,8 @@ runtime digest `69090bd71cb89b6d4889dd9119c344fc3f0c96efd953c80211f677a0b744c334
 - The `0.1.0` production capture assumption regressed. Release `0.1.2`
   introduced the pinned plugin-data route and release `0.1.3` added the
   Codex `0.146.0` transcript adapter.
-- Installed plugin, runtime and source release identity are `0.1.6`; seven
-  production source/cache pairs match and canonical source HEAD is
+- The historical `0.1.6` plugin/runtime/source release had seven matching
+  production source/cache pairs; its frozen implementation commit was
   `980118fcddce4f8b5271f82638c3f9d131bf0e7f`. The full release suite records
   538 passed and 3 skipped.
 - `Q-001` terminalized `INVALID` for `quality_provenance_drift` with report
@@ -134,18 +137,25 @@ runtime digest `69090bd71cb89b6d4889dd9119c344fc3f0c96efd953c80211f677a0b744c334
 - Installed `0.1.6` opened `Q-006` at `2026-08-11T14:53:34Z`, expiring at
   `2026-09-10T14:53:34Z`, with `first_batch_id=24` and exact predecessor
   `Q-005@781dbac0ba4e8e601ce6475e408204865127e5fd16a961e66cf47afc38a94c2f`.
-  `Q-006/COLLECTING` has zero distinct sessions, candidates, and labels. Its
+  Q-006 opened with zero distinct sessions, candidates, and labels. Its
   quality-contract digest is
   `d2479583d755d8196e05df5e63b5af12d52c5d3738c70a24555d8a9a5c81cc3b`,
   runtime digest is
   `69090bd71cb89b6d4889dd9119c344fc3f0c96efd953c80211f677a0b744c334`,
   and transcript-adapter digest remains
   `0fc96fa4a58f06221736200f2d4b7ec393269c42fc488c5aebd7822eac74509b`.
-- Maintenance ran only after Q-006 opened: 68 spool records imported and 3
-  duplicates were recognized. Post-maintenance status is spool 0, pending
+- Initial maintenance ran only after Q-006 opened: 68 spool records imported
+  and 3 duplicates were recognized. That post-open status was spool 0, pending
   128, claimable 0, and quarantined 128, split into `pre_quality_epoch` 71
   and `transcript_changed` 57. No Review claim ran. This is the operational
-  proof that historical backlog cannot enter Q-006.
+  proof that historical backlog could not enter Q-006.
+- Q-006 later terminalized `INVALID` for `quality_collection_expired` with zero
+  sessions, candidates, and labels. Its immutable report digest is
+  `c06087eff41522ee6c76dd584a0009aaefccffad572a0e49867a36492014c3d3`.
+- Maintenance on 2026-09-12 expired pending 128 and spool 171, redacted 22
+  overdue raw metadata records, and left spool, pending, claimable,
+  quarantined, and cleanup overdue at zero without deleting candidates,
+  labels, or quality observations.
 - Historical pre-Q-005 review batches 12 through 17 each returned
   `no_exportable_sessions`. Their 30 generations were retained but quarantined with
   `transcript_changed`, so subsequent claims skip them. The seal contract
@@ -174,24 +184,27 @@ runtime digest `69090bd71cb89b6d4889dd9119c344fc3f0c96efd953c80211f677a0b744c334
 
 ### Pending Todos
 
-- Collect at least ten distinct genuine post-open user sessions in `Q-006`.
-- Do not treat `pre_quality_epoch`, `transcript_changed`, historical batches,
-  or subagent work as Q-006 observations.
-- Explicitly Review the Q-006 sample, seal it, obtain every user-only label,
-  and run the immutable quality gate.
+- Verify a fresh genuine post-install Stop reaches the authenticated spool;
+  do not substitute fixture, subagent or synthetic capture.
+- Request a separately approved quality-open invocation from exact
+  predecessor
+  `Q-006@c06087eff41522ee6c76dd584a0009aaefccffad572a0e49867a36492014c3d3`.
+- Collect at least ten distinct genuine post-open user sessions in the
+  successor epoch. Do not count fixtures, historical batches, subagent work,
+  or repeated generations as distinct real sessions.
+- Explicitly Review and seal the successor, obtain every user-only external
+  TTY label, and run the immutable quality gate.
 - Refresh the Phase 6 runner plan only after a successor quality epoch passes.
 - Keep Runner, Prepare, Evaluate and Apply disabled until `QUALITY-01` passes.
 
 ### Blockers/Concerns
 
 - No Phase 4 implementation blocker remains: `docs/release-reports/review-inbox.json` records `PASS`.
-- Phase 4 PASS proves deterministic mechanics and safety only; candidate quality remains unmeasured until Phase 5.
+- Phase 4 PASS proves deterministic mechanics and safety only; candidate quality has not passed Phase 5. Q-003 measured it and returned FAIL.
 - Phase 5 cannot use fixtures, subagents, repeated generations in this task, or
   empty generated tasks as substitutes for 10 distinct real sessions.
-- Read-only status now exposes claimable and quarantined aggregate splits.
-  The post-Q-006 maintenance result is claimable 0 and quarantine split
-  `pre_quality_epoch=71`, `transcript_changed=57`; no Review claim occurred.
-  Do not infer Q-006 observations from those historical rows.
+- Read-only status after 2026-09-12 maintenance is spool 0, pending 0,
+  claimable 0, quarantined 0, and cleanup overdue 0. No Review claim occurred.
 - `Q-003` is an immutable terminal `FAIL`; do not relabel, rewrite, or
   reinterpret it. An unchanged-provenance successor is rejected.
 - The first remediation intentionally stays inside the Phase 4 policy boundary.
@@ -212,9 +225,8 @@ runtime digest `69090bd71cb89b6d4889dd9119c344fc3f0c96efd953c80211f677a0b744c334
 
 ## Session Continuity
 
-Last session: 2026-08-11
-Stopped at: Q-006 is `COLLECTING` with zero distinct sessions, candidates, and
-labels. Its first batch ID is 24; old backlog is isolated and claimable remains
-zero. Continue by collecting ten genuine post-open user sessions before the
-next explicit Review.
-Resume file: None
+Last session: 2026-09-12
+Stopped at: Design A implemented and 0.1.7 installed with verified parity.
+Prove fresh real Stop ingress before requesting Q-007. Q-006 remains immutable terminal INVALID;
+do not open a successor with unchanged provenance.
+Resume file: `.planning/HANDOFF.md`

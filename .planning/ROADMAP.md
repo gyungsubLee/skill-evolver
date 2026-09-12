@@ -2,7 +2,11 @@
 
 ## Overview
 
-Skill Evolver는 Phase 1 Feasibility `FAIL`을 Phase 2의 session-level 계약으로 수정해 amended gate `PASS`를 확보했고, Phase 3 bounded Runtime Queue와 Phase 4 explicit Review/Inbox를 구현했다. source/canonical main/cache/installed plugin은 `0.1.6`이며 seven-file source/cache parity는 `PASS`다. release suite는 538 passed, 3 skipped이고 canonical source HEAD는 `980118fcddce4f8b5271f82638c3f9d131bf0e7f`다. `Q-005`는 source provenance 변경으로 `quality_provenance_drift` terminal `INVALID` 처리됐고 immutable report digest는 `781dbac0ba4e8e601ce6475e408204865127e5fd16a961e66cf47afc38a94c2f`다. Installed `0.1.6`은 `2026-08-11T14:53:34Z`에 그 exact digest에서 `Q-006`을 열었다. `Q-006`은 `COLLECTING`이며 distinct sessions, candidates, labels는 모두 0이다. post-open maintenance 뒤 old backlog 128건은 `pre_quality_epoch` 71건과 `transcript_changed` 57건으로 격리됐고 claimable은 0이다. Phase 6은 Q-006의 최소 10개 distinct real sessions, explicit Review, user-only labels, terminal `PASS`까지 차단되고 mutation, Evaluate, Apply capability는 disabled 상태다. 이후 runner, immutable evaluation, manual apply/versioning, undo/recovery와 hardening gate를 순서대로 통과한다.
+Skill Evolver는 Phase 1 Feasibility `FAIL`을 Phase 2의 session-level 계약으로 수정해 amended gate `PASS`를 확보했고, Phase 3 bounded Runtime Queue와 Phase 4 explicit Review/Inbox를 구현했다. 설계 A를 `0.1.7`로 구현·설치했으며 현재 경로에서 source/cache seven-file parity를 확인했다. 전체 테스트는 554개 실행, 551개 통과, 기존 3개 skip, 실패 0개다. 새 frozen implementation commit은 `4d535cb`다. 다음은 실제 Stop ingress 증명과 Q-007 개설의 exact-command 승인이다. 다음 `0.1.6` 내용은 Q-006의 역사적 기록이다. Frozen implementation commit은 `980118fcddce4f8b5271f82638c3f9d131bf0e7f`이고 release suite는 538 passed, 3 skipped다. `Q-006`은 실제 표본 없이 만료되어 2026-09-12 `quality_collection_expired` terminal `INVALID`로 확정됐으며 immutable report digest는 `c06087eff41522ee6c76dd584a0009aaefccffad572a0e49867a36492014c3d3`다. Maintenance 뒤 spool, pending, claimable, quarantined와 cleanup overdue는 모두 0이다. Phase 5의 deadline/status 수정은 구현됐고 실제 Stop 검증과 successor quality cohort가 남았다. Phase 6은 successor epoch의 최소 10개 distinct real sessions, explicit Review, user-only labels, terminal `PASS`까지 차단되고 mutation, Evaluate, Apply capability는 disabled 상태다. 이후 runner, immutable evaluation, manual apply/versioning, undo/recovery와 hardening gate를 순서대로 통과한다.
+
+## Milestone Boundary
+
+현재 M1은 Phase 1부터 Phase 11까지와 마지막 milestone audit를 포함한다. Phase 5 `PASS`는 M1 완료가 아니라 Phase 6 진입 조건이다.
 
 ## Phases
 
@@ -112,33 +116,35 @@ Plans:
 **Depends on**: Phase 4
 **Requirements**: QUALITY-01
 **Entry Gate**: Review/Inbox suite passes with zero target-skill writes
-**Gate Result**: **Q-006 COLLECTING — 0.1.6 INSTALLED** — `Q-005` terminalized
-`INVALID` for `quality_provenance_drift` with zero sessions, candidates, and
-labels. Its immutable report digest is
-`781dbac0ba4e8e601ce6475e408204865127e5fd16a961e66cf47afc38a94c2f`, and
-the matching content-addressed aggregate body is preserved at
-`docs/release-reports/quality/Q-005-781dbac0ba4e8e601ce6475e408204865127e5fd16a961e66cf47afc38a94c2f.json`.
-Installed `0.1.6` opened `Q-006` at `2026-08-11T14:53:34Z`, expiring at
-`2026-09-10T14:53:34Z`, from exact predecessor
-`Q-005@781dbac0ba4e8e601ce6475e408204865127e5fd16a961e66cf47afc38a94c2f`;
-`first_batch_id` is 24. Its quality-contract digest is
+**Gate Result**: **Q-006 TERMINAL INVALID — RECOVERY REQUIRED** — Installed
+`0.1.6` opened Q-006 at `2026-08-11T14:53:34Z` from exact predecessor
+`Q-005@781dbac0ba4e8e601ce6475e408204865127e5fd16a961e66cf47afc38a94c2f`.
+Q-006 expired at `2026-09-10T14:53:34Z` with zero sessions, candidates, and
+labels, then terminalized `INVALID` for `quality_collection_expired` on
+2026-09-12. Its immutable report digest is
+`c06087eff41522ee6c76dd584a0009aaefccffad572a0e49867a36492014c3d3`, and
+the content-addressed aggregate body is preserved at
+`docs/release-reports/quality/Q-006-c06087eff41522ee6c76dd584a0009aaefccffad572a0e49867a36492014c3d3.json`.
+Its quality-contract digest is
 `d2479583d755d8196e05df5e63b5af12d52c5d3738c70a24555d8a9a5c81cc3b`,
 runtime digest is
 `69090bd71cb89b6d4889dd9119c344fc3f0c96efd953c80211f677a0b744c334`, and
 transcript-adapter digest remains
 `0fc96fa4a58f06221736200f2d4b7ec393269c42fc488c5aebd7822eac74509b`.
-Current `Q-006/COLLECTING` has zero distinct sessions, candidates, and labels.
-Maintenance performed only after Q-006 opened imported 68 spool records and
-recognized 3 duplicates. Post-maintenance status is spool 0, pending 128,
-claimable 0, and quarantined 128: `pre_quality_epoch` 71 plus
-`transcript_changed` 57. No Review claim ran, so the old backlog cannot count
-as Q-006 observations. Phase 6 stays blocked until Q-006 has at least ten
-distinct real post-open sessions, explicit Review, user-only labels, and
-terminal `PASS`; mutation, Runner, Prepare, Evaluate, and Apply remain
-disabled.
+On 2026-09-12 maintenance expired 128 pending generations and 171 spool files,
+and redacted 22 overdue raw metadata records. It deleted no candidate links,
+labels, or quality observations. Read-only status after maintenance reports
+spool 0, pending 0, claimable 0, quarantined 0, and cleanup overdue 0. No
+Review claim ran. Approved Design A now exposes collection deadline, remaining
+time, invalid reason and advisory next action in source 0.1.7 without weakening
+the unchanged-provenance guard. Source/cache/install parity is verified. Fresh
+genuine Stop ingress and separately approved successor opening remain. Phase 6 stays
+blocked until that successor reaches at least ten distinct real sessions,
+explicit Review, user-only labels, and terminal `PASS`; mutation, Runner,
+Prepare, Evaluate, and Apply remain disabled.
 **Failure Route**: Phase 4 transcript adapter 또는 improvement policy로 돌아간다.
 **Success Criteria** (what must be TRUE):
-  1. 개발자가 최소 10 sessions 또는 30 review items에 대한 complete label set을 확인할 수 있다.
+  1. epoch 개설 후 서로 다른 실제 세션 10개 이상과 후보 1개 이상을 수집하고 모든 후보의 사용자 전용 label set을 완료한다.
   2. report가 evaluation-worth rate 0.50 이상과 target misattribution 0.20 이하를 입증한다.
   3. external-content adoption은 0건이고 policy/adapter digest가 report에 고정된다.
   4. FAIL이면 Runner, Prepare와 Evaluate는 비활성 상태로 남는다.
@@ -254,7 +260,7 @@ Plans:
 | 2. Session-Level Capture Design Amendment | 1/1 | Complete (gate PASS) | 2026-07-29 |
 | 3. Runtime Queue | 1/1 | Complete (gate PASS) | 2026-07-29 |
 | 4. Review and Inbox | 1/1 | Complete (gate PASS) | 2026-07-30 |
-| 5. Read-only Quality Gate | 0/1 | Q-006 COLLECTING; 0.1.6 installed | - |
+| 5. Read-only Quality Gate | 0/1 | 0.1.7 installed; fresh Stop and Q-007 approval pending | - |
 | 6. Evaluate Runner Spike | 0/1 | Not started | - |
 | 7. Evaluate Prepare | 0/1 | Not started | - |
 | 8. Evaluate Execution | 0/1 | Not started | - |

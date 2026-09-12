@@ -44,7 +44,7 @@ Production installation and plugin-data roots retain their exact current values.
 - [x] Run baseline discovery. Result: 538 run, 3 skipped, one error because
   `ProductionSurfaceTests` reads the former parent marketplace path. Focused
   reproduction confirms FileNotFoundError. Other baseline tests pass.
-- [ ] Update the existing production-surface test to read
+- [x] Update the existing production-surface test to read
   `PLUGIN_ROOT / ".agents/plugins/marketplace.json"` and expect source `./`.
   Change README command-path expectation to the current project. Run:
 
@@ -53,7 +53,7 @@ Production installation and plugin-data roots retain their exact current values.
 ```
 
   Expected RED until the missing root marketplace and current README exist.
-- [ ] Add the repository-owned marketplace (filesystem approval if needed):
+- [x] Add the repository-owned marketplace (filesystem approval if needed):
 
 ```json
 {
@@ -68,11 +68,11 @@ Production installation and plugin-data roots retain their exact current values.
 }
 ```
 
-- [ ] Replace old absolute execution/navigation paths in current README,
+- [x] Replace old absolute execution/navigation paths in current README,
   PROJECT, HANDOFF and synthesis links. Record standalone Git root and old
   commit provenance without rewriting historical plans or immutable reports.
   README marketplace-add uses the current project itself.
-- [ ] Repeat the focused command; expect two production-surface tests passing.
+- [x] Repeat the focused command; expect two production-surface tests passing.
 
 ## Task 2: Add status diagnostics through TDD
 
@@ -84,7 +84,7 @@ Production installation and plugin-data roots retain their exact current values.
 quality_status calls it) with `_quality_status_invalid_reason(connection,
 installation, epoch, now) -> Optional[str]`.
 
-- [ ] Extend the existing fixtures/tests with the spec's output assertions.
+- [x] Extend the existing fixtures/tests with the spec's output assertions.
   Use this exact collecting boundary matrix:
 
 ```python
@@ -116,18 +116,18 @@ for checked_at, remaining, status, reason in (
   `collect_ten`, `answers` and existing retention helpers. Preserve malformed
   inventory fail-closed behavior. Extend the CLI/read-only test with exact
   new keys, database-byte invariance and forbidden transcript reads.
-- [ ] Add a partial-sample regression: open, commit one synthetic batch,
+- [x] Add a partial-sample regression: open, commit one synthetic batch,
   expire and gate INVALID, then call open with exact predecessor under the
   same provenance and require `quality_predecessor_provenance_unchanged`.
   The database fixture stays in its temporary directory; this is not a real
   quality run.
-- [ ] Run focused tests; confirm failures are missing new fields, then code:
+- [x] Run focused tests; confirm failures are missing new fields, then code:
 
 ```bash
 /usr/bin/python3 -I -m unittest discover -s skills/skill-evolver/tests -p test_quality_gate.py
 ```
 
-- [ ] Replace the status-only helper with the precise reason derivation:
+- [x] Replace the status-only helper with the precise reason derivation:
 
 ```python
 def _quality_status_invalid_reason(connection, installation, epoch, now):
@@ -193,11 +193,11 @@ else:
     }[status]
 ```
 
-- [ ] Bind behavior in `quality_contract_payload`: version 3 and
+- [x] Bind behavior in `quality_contract_payload`: version 3 and
   `status_output` containing the four field semantics and advisory action
   mapping. Add an exact payload assertion and update the previous version-2
   assertion. Existing prospective capture payload remains unchanged.
-- [ ] Re-run the quality module and inspect the complete diff. Gate,
+- [x] Re-run the quality module and inspect the complete diff. Gate,
   predecessor, schema and transcript adapter must be unchanged.
 
 ## Task 3: Release metadata, verification and live handoff
@@ -211,14 +211,14 @@ else:
 **Interfaces:** all source version pins agree on 0.1.7; no change to runtime
 installation/data paths or live quality state.
 
-- [ ] Change the three existing `ProductionSurfaceTests` version assertions
+- [x] Change the three existing `ProductionSurfaceTests` version assertions
   to 0.1.7. Run that test to prove RED.
-- [ ] Set manifest/runtime JSON version to `0.1.7`, `VERSION` to
+- [x] Set manifest/runtime JSON version to `0.1.7`, `VERSION` to
   `skill-evolver 0.1.7`, and `load_review_runtime`'s strict version to `0.1.7`.
-- [ ] Document the four fields, nullable countdown, advisory actions and
+- [x] Document the four fields, nullable countdown, advisory actions and
   distinction between projected INVALID and a stored immutable terminal in
   README and SKILL. Use current paths for execution examples.
-- [ ] Run verification:
+- [x] Run verification:
 
 ```bash
 /usr/bin/python3 -I -m unittest discover -s skills/skill-evolver/tests -p 'test_*.py'
@@ -230,23 +230,88 @@ installation/data paths or live quality state.
 git diff --check
 ```
 
-- [ ] Obtain independent code/specification and security/privacy review.
+- [x] Obtain independent code/specification and security/privacy review.
   Fix substantive findings with focused RED/GREEN evidence. Record actual
   full-suite counts and baseline error resolution.
-- [ ] Verify immutable report digests and unchanged guard/gate/schema/Hook.
+- [x] Verify immutable report digests and unchanged guard/gate/schema/Hook.
   Commit migration/docs and verified implementation with exact paths.
-- [ ] Prepare exact marketplace registration and plugin-install commands for
+- [x] Prepare exact marketplace registration and plugin-install commands for
   separate filesystem approval. Do not silently alter installed caches.
-- [ ] After approved installation, compare seven source/cache pairs: manifest,
+- [x] After approved installation, compare seven source/cache pairs: manifest,
   hooks, README, SKILL, runtime JSON, improvement policy and evolver.py;
   separately check packaged Phase 4 report and installed version/source path.
-- [ ] Read-only status/quality-status verification. Require fresh genuine Stop
-  ingress before requesting the literal Q-007 open command. No maintain,
-  Review, quality-open, label or gate runs implicitly.
-- [ ] Update HANDOFF/STATE/PROJECT/ROADMAP with exact completed work and pending
+- [x] Read-only installed status/quality-status verification.
+- [ ] Require fresh genuine Stop ingress before requesting the literal Q-007
+  open command. No maintain, Review, quality-open, label or gate runs implicitly.
+- [x] Update HANDOFF/STATE/PROJECT/ROADMAP with exact completed work and pending
   approval/real-data steps. Keep M1 at 4/11 phases and Phase 5 incomplete.
 
 ## Execution evidence
 
-Append verified results here after execution. Local runtime implementation,
-deployment and genuine quality PASS are separate checkpoints.
+Verified on 2026-09-12 in the current standalone project:
+
+- Design/plan commit: `4606f9d`; frozen source release:
+  `4d535cb80bd3318b269165303314360968139c37`.
+- Baseline: 538 run, 3 historical skips, one missing-parent-marketplace error.
+  Path RED reproduced that error plus the new README path assertion; path
+  GREEN passed both production-surface tests after root marketplace setup.
+- Quality RED: 109 run, 30 expected assertion failures, zero errors. GREEN:
+  109 passed. Existing temporary fixtures gained 16 test methods, without a
+  new harness or production sample.
+- Release RED: manifest 0.1.6 failed the 0.1.7 expectation. After all four
+  source version pins changed, both production-surface tests passed.
+- Full release suite: 554 tests run in 123.749 seconds, 551 passed, exactly 3
+  historical skips, zero failures/errors. Parser error text in the log is
+  expected negative argument-validation coverage.
+- Runtime compile, manifest/runtime/hooks/marketplace JSON, diff checks and
+  current-document links passed. Source-text comparison proved schema,
+  retry fields, gate/predecessor/open/seal, TTLs, transcript adapter, Hook and
+  improvement policy unchanged against `origin/main`.
+- Independent specification/code-quality and security/privacy reviews: CLEAN.
+- Final planning-document review corrected historical release wording and the
+  obsolete "30 review items" alternative in REQUIREMENTS/ROADMAP to match the
+  existing gate: at least ten genuine distinct post-open sessions, at least
+  one candidate and complete user-only labels. Runtime thresholds did not change.
+- All four historical Q-003 through Q-006 canonical report digests match
+  filenames. Q-006 was copied from the verified legacy worktree; no live gate
+  replay or new private terminal report was requested.
+- Runtime SHA-256:
+  `ad354b892dba9ac8bbea68aa95697e183617d28e99e2f232105d5350cb7bac8b`.
+- Quality contract v3 SHA-256:
+  `bb603f49e949b7c7d3fb0c0b768fa711ab52c378e33fc593c82b162888f1a540`.
+
+Codex CLI 0.154.0 refused adding the same marketplace name from a different
+source. After filesystem approval for each invocation, the CLI removed the
+old registration (`installedRoot: null`), added the current project and
+installed 0.1.7. No source directory or old cache was manually deleted:
+
+```bash
+codex plugin marketplace remove skill-evolver-dev --json
+codex plugin marketplace add /Users/igyeongseob/Develop/10_herness/skill-evolver --json
+codex plugin add skill-evolver@skill-evolver-dev --json
+```
+
+Installed/enabled version is 0.1.7. Both plugin source and marketplace source
+are `/Users/igyeongseob/Develop/10_herness/skill-evolver`. All seven production
+source/cache pairs match, and the packaged Phase 4 report also matches.
+The remote-catalog portion of `codex plugin list` was unavailable in the
+sandbox; its local Skill Evolver installation record was returned and verified.
+
+Installed read-only check at `2026-09-12T11:44:39Z`:
+
+```json
+{
+  "epoch_id": "Q-006",
+  "status": "INVALID",
+  "collection_expires_at": "2026-09-10T14:53:34Z",
+  "remaining_seconds": null,
+  "invalid_reason": "quality_collection_expired",
+  "next_action": "open_changed_quality_epoch"
+}
+```
+
+Spool, pending, claimable, quarantined and cleanup-overdue aggregates were all
+zero. No live maintenance, Review, open, seal, label or gate ran. Fresh genuine
+Stop ingress and the separately approved Q-007 command remain pending. GSD
+continues at Phase 5, 4/11 phases complete (36%); no Phase 5 completion report
+or Phase 6 implementation was created. This source release was not pushed.
