@@ -32,7 +32,10 @@ Historical Q-006 implementation commit: `980118fcddce4f8b5271f82638c3f9d131bf0e7
 ## Release Automation
 
 The user approved [GitHub Actions release automation](../docs/superpowers/specs/2026-09-13-skill-evolver-release-workflow-design.md)
-on 2026-09-13 and requested direct implementation. Its [execution plan and
+on 2026-09-13 and requested direct implementation. Source implementation and
+local verification are complete in `e59d449`; remote setup is pending GitHub
+OAuth `workflow` scope authorization after the initial push was rejected.
+No remote workflow, PR, tag or release has been created. Its [execution plan and
 verification evidence](../docs/superpowers/plans/2026-09-13-skill-evolver-release-workflow.md)
 track the rollout. CI validates source archives and fixtures; manual Release
 dispatch prepares a version PR, and a subsequent version change on main

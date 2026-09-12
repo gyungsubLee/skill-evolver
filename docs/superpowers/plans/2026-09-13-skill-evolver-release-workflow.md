@@ -97,5 +97,19 @@ Local verification on 2026-09-13:
   default GITHUB_TOKEN permissions remain read-only. Existing rulesets unchanged.
 - Runtime/manifest/runtime-reference/Hook/policy/SKILL bytes match `eef580e`.
   Version remains 0.1.7; no tag, release or local plugin update was created.
+- Implementation commit: `e59d4496f1ffec4e7b268ee2b8b533a14c9e96b3`.
+  Its committed source ZIP was built and its extracted contracts verified.
+- In an isolated source copy, `bump patch` produced 0.1.8. All 19 tooling
+  tests and 554 runtime tests (551 passed, 3 historical skips) then passed.
+  This verifies the preparation sequence without changing the working version.
+
+Remote rollout is pending authentication. GitHub rejected the feature-branch
+push because the existing OAuth login lacks the `workflow` scope. No PR or
+workflow was created remotely. A standard `gh auth refresh --hostname
+github.com --scopes workflow` device authorization was started; the user must
+finish that GitHub authentication before retrying the push and integration.
+Do not replace the token or bypass this permission requirement. After login,
+resume with the exact feature branch, verify actual PR CI, merge normally and
+verify main CI and the initial-publication skip before marking rollout complete.
 
 Build CI does not constitute a real Phase 5 quality sample.
