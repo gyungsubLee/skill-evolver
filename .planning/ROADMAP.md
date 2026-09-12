@@ -2,7 +2,7 @@
 
 ## Overview
 
-Skill Evolver는 Phase 1 Feasibility `FAIL`을 Phase 2의 session-level 계약으로 수정해 amended gate `PASS`를 확보했고, Phase 3 bounded Runtime Queue와 Phase 4 explicit Review/Inbox를 구현했다. 설계 A를 `0.1.7`로 구현·설치했으며 현재 경로에서 source/cache seven-file parity를 확인했다. 전체 테스트는 554개 실행, 551개 통과, 기존 3개 skip, 실패 0개다. 새 frozen implementation commit은 `4d535cb`다. 다음은 실제 Stop ingress 증명과 Q-007 개설의 exact-command 승인이다. 다음 `0.1.6` 내용은 Q-006의 역사적 기록이다. Frozen implementation commit은 `980118fcddce4f8b5271f82638c3f9d131bf0e7f`이고 release suite는 538 passed, 3 skipped다. `Q-006`은 실제 표본 없이 만료되어 2026-09-12 `quality_collection_expired` terminal `INVALID`로 확정됐으며 immutable report digest는 `c06087eff41522ee6c76dd584a0009aaefccffad572a0e49867a36492014c3d3`다. Maintenance 뒤 spool, pending, claimable, quarantined와 cleanup overdue는 모두 0이다. Phase 5의 deadline/status 수정은 구현됐고 실제 Stop 검증과 successor quality cohort가 남았다. Phase 6은 successor epoch의 최소 10개 distinct real sessions, explicit Review, user-only labels, terminal `PASS`까지 차단되고 mutation, Evaluate, Apply capability는 disabled 상태다. 이후 runner, immutable evaluation, manual apply/versioning, undo/recovery와 hardening gate를 순서대로 통과한다.
+Skill Evolver는 Phase 1 Feasibility `FAIL`을 Phase 2의 session-level 계약으로 수정해 amended gate `PASS`를 확보했고, Phase 3 bounded Runtime Queue와 Phase 4 explicit Review/Inbox를 구현했다. 설계 A를 `0.1.7`로 구현·설치했으며 2026-09-12에 `4d535cb`의 source/cache seven-file parity를 확인했다. 이후 소스 README에 릴리스 자동화 안내를 추가했으며 설치본은 그대로 유지했다. 전체 테스트는 554개 실행, 551개 통과, 기존 3개 skip, 실패 0개다. 새 frozen implementation commit은 `4d535cb`다. 다음은 실제 Stop ingress 증명과 Q-007 개설의 exact-command 승인이다. 다음 `0.1.6` 내용은 Q-006의 역사적 기록이다. Frozen implementation commit은 `980118fcddce4f8b5271f82638c3f9d131bf0e7f`이고 release suite는 538 passed, 3 skipped다. `Q-006`은 실제 표본 없이 만료되어 2026-09-12 `quality_collection_expired` terminal `INVALID`로 확정됐으며 immutable report digest는 `c06087eff41522ee6c76dd584a0009aaefccffad572a0e49867a36492014c3d3`다. Maintenance 뒤 spool, pending, claimable, quarantined와 cleanup overdue는 모두 0이다. Phase 5의 deadline/status 수정은 구현됐고 실제 Stop 검증과 successor quality cohort가 남았다. Phase 6은 successor epoch의 최소 10개 distinct real sessions, explicit Review, user-only labels, terminal `PASS`까지 차단되고 mutation, Evaluate, Apply capability는 disabled 상태다. 이후 runner, immutable evaluation, manual apply/versioning, undo/recovery와 hardening gate를 순서대로 통과한다.
 
 ## Milestone Boundary
 
@@ -137,8 +137,9 @@ labels, or quality observations. Read-only status after maintenance reports
 spool 0, pending 0, claimable 0, quarantined 0, and cleanup overdue 0. No
 Review claim ran. Approved Design A now exposes collection deadline, remaining
 time, invalid reason and advisory next action in source 0.1.7 without weakening
-the unchanged-provenance guard. Source/cache/install parity is verified. Fresh
-genuine Stop ingress and separately approved successor opening remain. Phase 6 stays
+the unchanged-provenance guard. Seven-file source/cache parity was verified
+on 2026-09-12 at `4d535cb`; source README has since gained release instructions.
+Fresh genuine Stop ingress and separately approved successor opening remain. Phase 6 stays
 blocked until that successor reaches at least ten distinct real sessions,
 explicit Review, user-only labels, and terminal `PASS`; mutation, Runner,
 Prepare, Evaluate, and Apply remain disabled.

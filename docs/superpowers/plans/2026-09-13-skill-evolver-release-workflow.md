@@ -68,11 +68,11 @@ Owned files: `.github/workflows/ci.yml`, `.github/workflows/release.yml`,
   local installation. Keep the latest README release declaration unchanged.
 - [x] Run helper/publisher tests, full runtime suite, version check, Bash and
   actionlint validation; independently review implementation and permissions.
-- [ ] Commit exact paths, push the feature branch and create an integration PR
+- [x] Commit exact paths, push the feature branch and create an integration PR
   containing the current 0.1.7 baseline. Verify the PR's actual GitHub CI.
 - [x] Enable only the repository permission needed for Actions-created PRs,
   preserving the default read-only token and branch protections.
-- [ ] Integrate verified changes into main and verify main CI plus bootstrap
+- [x] Integrate verified changes into main and verify main CI plus bootstrap
   release skip. Verify Actions manual entry exists; do not launch a real bump
   merely as a test. Record evidence and leave Phase 5 quality work pending.
 
@@ -91,8 +91,8 @@ Local verification on 2026-09-13:
   Draft lookup scans every release-list page and rejects duplicate tag matches.
 - Bash syntax, Python compilation and diff whitespace checks passed. Actionlint
   1.7.12 passed except its unsupported `concurrency.queue` key, which is
-  documented by GitHub; only that exact diagnostic was ignored. Actual GitHub
-  workflow acceptance remains part of the remote verification below.
+  documented by GitHub; only that exact diagnostic was ignored. The actual
+  GitHub Release runs below accepted this setting and completed successfully.
 - Repository Actions is enabled. The PR-creation setting is enabled while
   default GITHUB_TOKEN permissions remain read-only. Existing rulesets unchanged.
 - Runtime/manifest/runtime-reference/Hook/policy/SKILL bytes match `eef580e`.
@@ -103,13 +103,33 @@ Local verification on 2026-09-13:
   tests and 554 runtime tests (551 passed, 3 historical skips) then passed.
   This verifies the preparation sequence without changing the working version.
 
-Remote rollout is pending authentication. GitHub rejected the feature-branch
-push because the existing OAuth login lacks the `workflow` scope. No PR or
-workflow was created remotely. A standard `gh auth refresh --hostname
-github.com --scopes workflow` device authorization was started; the user must
-finish that GitHub authentication before retrying the push and integration.
-Do not replace the token or bypass this permission requirement. After login,
-resume with the exact feature branch, verify actual PR CI, merge normally and
-verify main CI and the initial-publication skip before marking rollout complete.
+Remote verification on 2026-09-13:
+
+- The initial push lacked OAuth `workflow` scope. The user completed standard
+  GitHub authorization; the authenticated push then succeeded.
+- [PR #1](https://github.com/gyungsubLee/skill-evolver/pull/1) passed
+  [macOS CI](https://github.com/gyungsubLee/skill-evolver/actions/runs/34703981078)
+  and merged as `b3aa85f055c9d27ee2d0044f6e819858d3395106`.
+- Its main CI exposed a pre-existing timing assumption in the spool lock
+  coordination test: scheduling can exceed the production 50ms budget. A
+  controlled 200ms delay reproduced the failure. Commit `9124935` uses an
+  actual-contention event, a test-only two-second acquisition budget and
+  guaranteed cleanup. Runtime code and its separate 50ms budget test are
+  unchanged; four focused tests and the delayed probe passed.
+- [PR #2](https://github.com/gyungsubLee/skill-evolver/pull/2) passed
+  [full CI](https://github.com/gyungsubLee/skill-evolver/actions/runs/34704596813)
+  and merged as `f5f8275d6775708b2ea4ab75c99f0551a574c6e9`.
+- [Main CI](https://github.com/gyungsubLee/skill-evolver/actions/runs/34704711045)
+  then passed: 19 release-tool tests and 554 runtime tests with three historical
+  skips, archive contract validation and upload. Artifact ID `10301048818`
+  identifies version 0.1.7, build 4 and that exact commit.
+- Both workflows are active. The remote Release YAML matches the checked-in
+  file and exposes manual patch/minor/major input on main. The
+  [bootstrap run](https://github.com/gyungsubLee/skill-evolver/actions/runs/34704128641)
+  and [unchanged-version run](https://github.com/gyungsubLee/skill-evolver/actions/runs/34704711046)
+  completed successfully without publishing. Tags and releases remain empty.
+- No real release bump was dispatched as a test. Automatic PR creation and
+  actual release publication execute when the user starts that release flow;
+  their local regression checks cover preparation and draft/asset recovery.
 
 Build CI does not constitute a real Phase 5 quality sample.

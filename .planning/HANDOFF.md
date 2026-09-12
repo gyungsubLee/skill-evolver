@@ -7,8 +7,9 @@ Updated: 2026-09-13
 The project is in M1 Phase 5 of 11. Phases 1 through 4 are complete. Q-006 is
 immutable terminal `INVALID` for `quality_collection_expired`, and Phase 6 is
 blocked. Design A was approved, implemented, tested and installed as 0.1.7 on
-2026-09-12. Source/cache parity is verified. Resume by proving fresh genuine
-post-install Stop ingress, then requesting exact-command approval to open
+2026-09-12. Seven-file source/cache parity was verified at `4d535cb`; the
+source README subsequently gained release automation instructions. Resume by
+proving fresh genuine post-install Stop ingress, then requesting exact-command approval to open
 Q-007. Never open a successor against unchanged predecessor provenance.
 
 Repository root: `/Users/igyeongseob/Develop/10_herness/skill-evolver`
@@ -32,10 +33,15 @@ Historical Q-006 implementation commit: `980118fcddce4f8b5271f82638c3f9d131bf0e7
 ## Release Automation
 
 The user approved [GitHub Actions release automation](../docs/superpowers/specs/2026-09-13-skill-evolver-release-workflow-design.md)
-on 2026-09-13 and requested direct implementation. Source implementation and
-local verification are complete in `e59d449`; remote setup is pending GitHub
-OAuth `workflow` scope authorization after the initial push was rejected.
-No remote workflow, PR, tag or release has been created. Its [execution plan and
+on 2026-09-13 and requested direct implementation. Source implementation is
+`e59d449`; [PR #1](https://github.com/gyungsubLee/skill-evolver/pull/1) integrated
+it into main. [PR #2](https://github.com/gyungsubLee/skill-evolver/pull/2) fixed
+an existing test's scheduling assumption without changing runtime behavior.
+The resulting main commit `f5f8275` passed [CI](https://github.com/gyungsubLee/skill-evolver/actions/runs/34704711045):
+19 release-tool tests and 554 runtime tests (551 passed, 3 historical skips),
+plus source ZIP validation and upload. Both CI and Release workflows are
+active; initial setup and unchanged versions correctly skipped publication.
+No tag, release or local plugin update was created. Its [execution plan and
 verification evidence](../docs/superpowers/plans/2026-09-13-skill-evolver-release-workflow.md)
 track the rollout. CI validates source archives and fixtures; manual Release
 dispatch prepares a version PR, and a subsequent version change on main
@@ -231,8 +237,9 @@ five plans registered so far.
 
 ## Latest Runtime Evidence
 
-- 0.1.7 source/cache/installed identity verified at the current project path.
-- Seven production file pairs and packaged Phase 4 report match.
+- 0.1.7 source/cache/installed identity verified on 2026-09-12 at `4d535cb`.
+- Seven production file pairs and packaged Phase 4 report matched then;
+  source README subsequently gained release automation instructions.
 - Full suite: 554 run, 551 passed, 3 historical skips, zero failures.
 - Focused quality RED: 109 run, 30 expected assertion failures; GREEN: 109 passed.
 - Independent specification/code quality and security/privacy reviews: CLEAN.

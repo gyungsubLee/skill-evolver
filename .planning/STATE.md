@@ -29,9 +29,10 @@ action to read-only quality status. The unchanged-provenance retry guard,
 gate, schema, TTLs, Hook, policy and transcript adapter are unchanged.
 Focused quality tests: 109 passed. Independent specification/code-quality and
 security/privacy reviews: CLEAN. Full suite: 554 tests run, 551 passed, 3 historical skips, zero failures.
-Source/cache/installed plugin are 0.1.7 with seven production-file pairs
-identical; packaged Phase 4 report also matches. Frozen implementation commit
-is 4d535cb. Marketplace and plugin source both point at the current project.
+Source/cache/installed plugin are 0.1.7. Seven production-file pairs and the
+packaged Phase 4 report matched at 4d535cb on 2026-09-12; source README has
+since gained release automation instructions without a cache update. Frozen
+runtime implementation commit is 4d535cb. Marketplace and plugin source both point at the current project.
 The installed read-only check at 2026-09-12T11:44:39Z reports spool 0,
 pending 0, claimable 0 and no cleanup backlog; fresh real Stop proof is pending.
 Q-006 remains immutable INVALID for quality_collection_expired, report digest
@@ -63,7 +64,8 @@ Progress: [████░░░░░░] 36%
 | 4. Review and Inbox | 1/1 | Not recorded | Not recorded |
 
 **Recent Trend:** Four sequential phase gates recorded; Phase 2, Phase 3 and
-Phase 4 are PASS. Installed `0.1.7` has seven-file source/cache parity. The
+Phase 4 are PASS. Installed `0.1.7` had seven-file source/cache parity on
+2026-09-12 at `4d535cb`; source README was subsequently updated. The
 following Q-006 provenance is the immutable historical `0.1.6` record.
 `Q-006` terminalized `INVALID` for collection expiry without a sample under
 quality-contract digest

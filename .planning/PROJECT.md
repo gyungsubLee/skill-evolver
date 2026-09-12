@@ -68,8 +68,9 @@ CLI와 Desktop 모두에서 경계가 명확한 session metadata를 수집하고
 
 - 현재 source/cache/installed plugin은 `0.1.7`이며 frozen implementation
   commit은 `4d535cb`다. 전체 554 tests 실행, 551 통과, 기존 3 skip, 실패
-  0건이며 독립 코드·보안 검토는 CLEAN이다. 7개 production file과 packaged
-  Phase 4 report의 source/cache parity를 확인했다. Marketplace와 plugin
+  0건이며 독립 코드·보안 검토는 CLEAN이다. 2026-09-12에 `4d535cb`의 7개
+  production file과 packaged Phase 4 report의 source/cache parity를 확인했다.
+  이후 소스 README에 릴리스 자동화 안내를 추가했으며 설치본은 갱신하지 않았다. Marketplace와 plugin
   source 모두 현재 프로젝트 경로를 사용한다. 설치 후 실제 Stop ingress
   증명과 Q-007 exact-command 승인이 다음 단계다.
 - Phase 1의 최초 Feasibility `FAIL`은 Phase 2 session-level amendment로 보완됐고 amended report는 `PASS`다.
