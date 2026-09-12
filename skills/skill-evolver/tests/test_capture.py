@@ -4436,14 +4436,25 @@ class MaintenanceStatusTests(unittest.TestCase):
             self.installation, second.session_id
         )
         entered = threading.Event()
+        contended = threading.Event()
         release = threading.Event()
         real_read = os.read
+        real_flock = fcntl.flock
+        real_acquire_spool_lock = self.runtime.acquire_spool_lock
 
         def blocking_read(descriptor: int, size: int) -> bytes:
             if os.fstat(descriptor).st_ino == first_inode:
                 entered.set()
-                self.assertTrue(release.wait(1))
+                self.assertTrue(release.wait(2))
             return real_read(descriptor, size)
+
+        def observing_flock(descriptor: int, operation: int) -> None:
+            try:
+                return real_flock(descriptor, operation)
+            except BlockingIOError:
+                if threading.current_thread() is enqueuer:
+                    contended.set()
+                raise
 
         import_results: list[dict[str, int]] = []
         hook_results: list[bool] = []
@@ -4479,19 +4490,31 @@ class MaintenanceStatusTests(unittest.TestCase):
             except BaseException as error:
                 errors.append(error)
 
+        importer = threading.Thread(target=importing)
+        enqueuer = threading.Thread(target=enqueueing)
         with mock.patch.object(
             self.runtime.os, "read", side_effect=blocking_read
+        ), mock.patch.object(
+            self.runtime.fcntl, "flock", side_effect=observing_flock
+        ), mock.patch.object(
+            self.runtime,
+            "acquire_spool_lock",
+            # ponytail: this tests coordination; hook-budget coverage keeps 50ms.
+            side_effect=lambda descriptor: real_acquire_spool_lock(
+                descriptor, timeout_seconds=2
+            ),
         ):
-            importer = threading.Thread(target=importing)
             importer.start()
-            self.assertTrue(entered.wait(1))
-            enqueuer = threading.Thread(target=enqueueing)
-            enqueuer.start()
-            time.sleep(0.01)
-            self.assertTrue(enqueuer.is_alive())
-            release.set()
-            importer.join(timeout=2)
-            enqueuer.join(timeout=2)
+            try:
+                self.assertTrue(entered.wait(2))
+                enqueuer.start()
+                self.assertTrue(contended.wait(2))
+                self.assertTrue(enqueuer.is_alive())
+            finally:
+                release.set()
+                importer.join(timeout=2)
+                if enqueuer.ident is not None:
+                    enqueuer.join(timeout=2)
 
         self.assertFalse(importer.is_alive())
         self.assertFalse(enqueuer.is_alive())
