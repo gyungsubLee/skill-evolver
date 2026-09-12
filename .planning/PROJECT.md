@@ -13,9 +13,9 @@ Skill Evolver는 Codex CLI와 Desktop 작업에서 재사용 가능한 스킬 �
 - macOS Codex CLI와 Desktop
 - `/usr/bin/python3` 3.9 이상
 - Python 표준 라이브러리와 `sqlite3`만 사용
-- 프로젝트 루트: `/Users/igyeongseob/Documents/오픈소스/skill-evolver`
-- Git worktree 루트: `/Users/igyeongseob/Documents/오픈소스`
-- `skill-evolver/` 안에 중첩 `.git`을 만들지 않음
+- 프로젝트 루트: `/Users/igyeongseob/Develop/10_herness/skill-evolver`
+- Git 저장소 루트: `/Users/igyeongseob/Develop/10_herness/skill-evolver`
+- 현재 프로젝트 자체가 독립 Git 저장소이며 이전 상위 저장소를 사용하지 않음
 
 ## Developer-facing Success Metric
 
@@ -49,7 +49,7 @@ CLI와 Desktop 모두에서 경계가 명확한 session metadata를 수집하고
 - `evaluate`는 전체 immutable evaluation-spec digest에 결합되고 installed target을 변경하지 않는다.
 - apply, privacy purge와 undo mutation은 external TTY와 전체 digest 또는 current hash를 요구한다.
 - 모든 경로, identity, artifact, lease, state transition과 schema version은 fail-closed로 검증한다.
-- Phase 6은 changed-provenance successor quality epoch의 사용자 전용 외부 TTY label과 Phase 5 `PASS`가 확인될 때까지 시작하지 않는다.
+- Phase 6은 successor quality epoch의 사용자 전용 외부 TTY label과 Phase 5 `PASS`가 확인될 때까지 시작하지 않는다.
 
 ## Key Decisions
 
@@ -66,12 +66,19 @@ CLI와 Desktop 모두에서 경계가 명확한 session metadata를 수집하고
 
 ## Current State
 
+- 현재 source/cache/installed plugin은 `0.1.7`이며 frozen implementation
+  commit은 `4d535cb`다. 전체 554 tests 실행, 551 통과, 기존 3 skip, 실패
+  0건이며 독립 코드·보안 검토는 CLEAN이다. 7개 production file과 packaged
+  Phase 4 report의 source/cache parity를 확인했다. Marketplace와 plugin
+  source 모두 현재 프로젝트 경로를 사용한다. 설치 후 실제 Stop ingress
+  증명과 Q-007 exact-command 승인이 다음 단계다.
 - Phase 1의 최초 Feasibility `FAIL`은 Phase 2 session-level amendment로 보완됐고 amended report는 `PASS`다.
 - Phase 3 Runtime Queue와 Phase 4 Review/Inbox는 canonical report `PASS`로 완료됐다.
-- source/canonical main/cache/installed plugin은 `0.1.6`이며 source/cache
-  parity는 7개 production file에서 `PASS`다. canonical source HEAD는
+- 이전 `0.1.6` release의 source/cache/installed parity는 7개
+  production file에서 `PASS`다. Frozen implementation commit은
   `980118fcddce4f8b5271f82638c3f9d131bf0e7f`이고 release test suite는
-  538 passed, 3 skipped였다.
+  538 passed, 3 skipped로 기록돼 있다. 0.1.7 구현 전까지 뒤따른 commit은
+  품질 cohort와 운영 상태를 기록하는 docs-only 변경이었다.
 - `Q-004`는 `quality_provenance_drift`로 terminal `INVALID` 처리됐고
   immutable aggregate report digest는
   `a9d30a50776d7e1ad2b0f56d5be741fda8b9460f46090a88e1e18777e5f0e917`다.
@@ -82,21 +89,28 @@ CLI와 Desktop 모두에서 경계가 명확한 session metadata를 수집하고
 - 현재 단계는 Phase 5 Read-only Quality Gate다. Installed `0.1.6`이
   `2026-08-11T14:53:34Z`에 exact predecessor
   `Q-005@781dbac0ba4e8e601ce6475e408204865127e5fd16a961e66cf47afc38a94c2f`
-  에서 `Q-006`을 열었다. expiry는 `2026-09-10T14:53:34Z`,
-  `first_batch_id`는 24이며 현재 `Q-006/COLLECTING`은 distinct sessions,
-  candidates, labels가 모두 0이다. quality-contract digest는
+  에서 `Q-006`을 열었다. Q-006은 표본 없이
+  `2026-09-10T14:53:34Z`에 만료됐고, 2026-09-12에
+  `quality_collection_expired` terminal `INVALID`로 확정됐다. sessions,
+  candidates, labels는 모두 0이고 immutable report digest는
+  `c06087eff41522ee6c76dd584a0009aaefccffad572a0e49867a36492014c3d3`다.
+  당시 quality-contract digest는
   `d2479583d755d8196e05df5e63b5af12d52c5d3738c70a24555d8a9a5c81cc3b`,
   runtime digest는
   `69090bd71cb89b6d4889dd9119c344fc3f0c96efd953c80211f677a0b744c334`,
   transcript-adapter digest는
   `0fc96fa4a58f06221736200f2d4b7ec393269c42fc488c5aebd7822eac74509b`다.
-- Q-006을 연 뒤 maintenance가 spool 68건을 import하고 duplicate 3건을
-  확인했다. 현재 spool은 0, pending은 128, claimable은 0이며 quarantined
-  128건은 `pre_quality_epoch` 71건과 `transcript_changed` 57건이다. 따라서
-  이전 backlog는 Q-006 review 대상에서 격리됐고 review claim은 실행하지
-  않았다.
-- Phase 6 Evaluate Runner Spike는 Q-006의 최소 10개 distinct real
-  sessions, explicit Review, user-only labels, terminal `PASS` 전까지
+- 2026-09-12 maintenance는 만료 pending 128건, 만료 spool 171건과 보존
+  기간이 지난 raw metadata 22건을 정리했다. 후보, label, quality
+  observation은 삭제하지 않았다. 정리 뒤 spool, pending, claimable,
+  quarantined, cleanup overdue는 모두 0이다.
+- 동일 provenance successor는 열 수 없다. 의도적 만료를 통한 표본
+  cherry-pick을 막는 기존 guard는 유지한다. Phase 5 안에서 수집 deadline,
+  남은 시간, 무효 사유와 advisory next_action을 노출하는 설계 A를 승인받아
+  source `0.1.7`/quality contract v3으로 구현·설치했다. 실제 Stop 증명과
+  exact-command 승인 뒤 successor epoch를 열어야 한다.
+- Phase 6 Evaluate Runner Spike는 successor epoch의 최소 10개 distinct
+  real sessions, explicit Review, user-only labels, terminal `PASS` 전까지
   차단되며 mutation, evaluate, apply capability는 계속 disabled다.
 
 ## Sources of Truth
@@ -111,5 +125,8 @@ CLI와 Desktop 모두에서 경계가 명확한 session metadata를 수집하고
 - `docs/release-reports/quality/Q-003-512aa6cb395e7a4d6c94a51ad2b9950fb8cada381381784370d3edecda01ac1a.json`
 - `docs/release-reports/quality/Q-004-a9d30a50776d7e1ad2b0f56d5be741fda8b9460f46090a88e1e18777e5f0e917.json`
 - `docs/release-reports/quality/Q-005-781dbac0ba4e8e601ce6475e408204865127e5fd16a961e66cf47afc38a94c2f.json`
+- `docs/release-reports/quality/Q-006-c06087eff41522ee6c76dd584a0009aaefccffad572a0e49867a36492014c3d3.json`
 - `docs/superpowers/specs/2026-08-04-skill-evolver-target-attribution-remediation-design.md`
 - `docs/superpowers/specs/2026-08-11-skill-evolver-prospective-capture-cutoff-design.md`
+- `docs/superpowers/specs/2026-09-12-skill-evolver-collection-deadline-design.md`
+- `docs/superpowers/plans/2026-09-12-skill-evolver-collection-deadline.md`

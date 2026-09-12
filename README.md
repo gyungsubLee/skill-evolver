@@ -5,12 +5,41 @@ explicit Review/Inbox surface. The Hook does not run a model, analyze
 transcript bytes, create a candidate automatically, or change an installed
 skill.
 
-Version `0.1.6` recognizes the text and control response items emitted by
+Version `0.1.7` exposes collection deadlines, remaining time, invalid reasons
+and advisory next actions through read-only `quality-status`, while retaining
+the unchanged-provenance retry guard. It recognizes the text and control
+response items emitted by
 Codex `0.146.0`, defaults the user-only quality-label display to Korean, keeps
 `--locale en`, preserves new candidate summaries in the direct user's
 language, and requires causal target attribution plus bounded target
 inspection before a candidate. During a collecting quality epoch, it admits
 only sessions whose earliest Stop is strictly after the epoch start.
+
+## Versions and GitHub releases
+
+To prepare a release, open [Actions → Release](https://github.com/gyungsubLee/skill-evolver/actions/workflows/release.yml),
+choose **Run workflow** on `main`, and select `patch`, `minor` or `major`.
+The workflow synchronizes version fields and opens a release PR. Review its
+changes and merge it after CI passes. GitHub may ask you to approve CI for
+the bot-created PR before those checks run.
+
+After the version change reaches `main`, Actions retests that commit and
+publishes `vX.Y.Z` with generated release notes, a source ZIP and `SHA256SUMS`.
+Ordinary commits run CI without increasing the release version. CI artifacts
+also include the build number and commit identity. The initial workflow
+setup preserves 0.1.7 and does not publish a release.
+
+The archive includes the plugin, marketplace and frozen reports required by
+the runtime. It retains the current macOS installation configuration. Install
+a release explicitly using the commands below; Actions does not update local
+plugin caches or run private quality lifecycle commands.
+
+Local release-tool checks use Python's standard library:
+
+```bash
+/usr/bin/python3 -I scripts/release.py check
+/usr/bin/python3 -I -m unittest discover -s scripts -p 'test_*.py'
+```
 
 ## Gate
 
@@ -46,7 +75,7 @@ Then run:
 
 ```bash
 /usr/bin/python3 -I \
-  /Users/igyeongseob/Documents/오픈소스/skill-evolver/skills/skill-evolver/scripts/evolver.py init \
+  /Users/igyeongseob/Develop/10_herness/skill-evolver/skills/skill-evolver/scripts/evolver.py init \
   --data-root /Users/igyeongseob/.codex/skill-evolver \
   --transcript-root /Users/igyeongseob/.codex/sessions \
   --transcript-root /Users/igyeongseob/.codex/archived_sessions \
@@ -61,7 +90,7 @@ variables cannot redirect the installation.
 
 ```bash
 codex plugin marketplace add \
-  /Users/igyeongseob/Documents/오픈소스 --json
+  /Users/igyeongseob/Develop/10_herness/skill-evolver --json
 codex plugin add skill-evolver@skill-evolver-dev --json
 ```
 
@@ -94,7 +123,7 @@ Status needs no write approval:
 
 ```bash
 /usr/bin/python3 -I \
-  /Users/igyeongseob/Documents/오픈소스/skill-evolver/skills/skill-evolver/scripts/evolver.py status \
+  /Users/igyeongseob/Develop/10_herness/skill-evolver/skills/skill-evolver/scripts/evolver.py status \
   --installation \
   /Users/igyeongseob/.codex/skill-evolver/installation.json \
   --plugin-data \
@@ -121,7 +150,7 @@ canonical and plugin-data roots for that invocation.
 
 ```bash
 /usr/bin/python3 -I \
-  /Users/igyeongseob/Documents/오픈소스/skill-evolver/skills/skill-evolver/scripts/evolver.py maintain \
+  /Users/igyeongseob/Develop/10_herness/skill-evolver/skills/skill-evolver/scripts/evolver.py maintain \
   --installation \
   /Users/igyeongseob/.codex/skill-evolver/installation.json \
   --plugin-data \
@@ -262,6 +291,28 @@ edit an installed skill, stage changes, or create a snapshot.
 Each requires its own approval for one fully expanded literal command and the
 exact installation data root; approval for one never authorizes another.
 `quality-status` is read-only.
+
+Its JSON always includes `collection_expires_at`, `remaining_seconds`,
+`invalid_reason`, and `next_action`. The collection deadline is retained after
+collection ends; it is null for IDLE or a retained tombstone. Remaining seconds
+are rounded up and clamped at zero only while the stored epoch is collecting,
+and are null afterward. A positive countdown never overrides INVALID; a sealed
+epoch's label deadline is a separate validity check.
+
+`next_action` is advisory. `collect_real_sessions` requests genuine prospective
+evidence; `request_quality_seal` means the sample counts are sufficient to
+request a seal, whose full checks still apply. `request_user_labels` leaves
+every answer to the user. `run_quality_gate` applies to ready sealed epochs or
+INVALID epochs that still need an immutable terminal report.
+`open_quality_epoch` and `open_changed_quality_epoch` retain every approval,
+provenance, predecessor, private-lineage and capacity check. A retained PASS
+reports `begin_phase_6_evaluate_runner_spike`; refresh that historical plan
+before execution. `inspect_quality_history` means retained history is
+insufficient for ordinary guidance. None of these values authorizes a command.
+
+Read-only INVALID may describe expiry or drift without persisting a terminal
+result. A separately approved `quality-gate` records that result; an unchanged
+FAIL/INVALID predecessor still cannot be retried, including after expiry.
 
 The model may explain sanitized `inspect` output, but it never infers or enters a label.
 Only the user runs a fully expanded `quality-label` command in a user-controlled external terminal.

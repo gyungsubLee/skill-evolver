@@ -1,0 +1,155 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version increment
+        required: true
+        default: patch
+        type: choice
+        options: [patch, minor, major]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  queue: max
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    if: github.event_name == 'workflow_dispatch'
+    name: Prepare version PR
+    runs-on: macos-15
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Require main
+        run: test "$GITHUB_REF" = refs/heads/main
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare version change
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          version=$(/usr/bin/python3 -I scripts/release.py bump "$BUMP")
+          git switch -c "release/v$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Test release tooling
+        run: /usr/bin/python3 -I -m unittest discover -s scripts -p 'test_*.py'
+      - name: Test runtime
+        run: /usr/bin/python3 -I -m unittest discover -s skills/skill-evolver/tests -p 'test_*.py'
+      - name: Commit and validate archive
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- .codex-plugin/plugin.json README.md \
+            skills/skill-evolver/references/runtime.json \
+            skills/skill-evolver/scripts/evolver.py \
+            skills/skill-evolver/tests/test_capture.py
+          git diff --cached --check
+          git commit -m "chore(release): prepare $VERSION"
+          /usr/bin/python3 -I scripts/release.py archive --output "$RUNNER_TEMP/release"
+      - name: Open release PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          branch="release/v$VERSION"
+          # ponytail: one PR per version; resume an existing branch manually instead of force-pushing it.
+          existing=$(git ls-remote --heads origin "refs/heads/$branch")
+          test -z "$existing"
+          gh auth setup-git
+          git push origin "HEAD:refs/heads/$branch"
+          cat > "$RUNNER_TEMP/release-pr.md" <<EOF
+          Prepare Skill Evolver $VERSION by synchronizing the existing version pins.
+
+          The release tooling tests, full runtime suite and committed source archive checks passed.
+          Approve GitHub's CI run if requested, then merge after checks pass to publish the tag, source ZIP and checksum.
+          Local plugin installation and Phase 5 quality commands remain separate explicit operations.
+          EOF
+          gh pr create --base main --head "$branch" \
+            --title "chore(release): prepare $VERSION" \
+            --body-file "$RUNNER_TEMP/release-pr.md" >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    if: github.event_name == 'push'
+    name: Publish changed version
+    runs-on: macos-15
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Detect release change
+        id: change
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          echo 'release=false' >> "$GITHUB_OUTPUT"
+          if [[ "$BEFORE" == 0000000000000000000000000000000000000000 ]]; then
+            echo 'Initial branch setup; release skipped.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git cat-file -e "$BEFORE^{commit}"
+          if ! git cat-file -e "$BEFORE:.github/workflows/release.yml" 2>/dev/null; then
+            echo 'Initial workflow setup; release skipped.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          old=$(git show "$BEFORE:.codex-plugin/plugin.json" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
+          version=$(/usr/bin/python3 -I scripts/release.py check)
+          if [[ "$old" == "$version" ]]; then
+            echo "Version $version is unchanged; release skipped." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          /usr/bin/python3 -I - "$old" "$version" <<'PY'
+          import re
+          import sys
+          old, new = sys.argv[1:]
+          pattern = r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+          if not all(re.fullmatch(pattern, value) for value in (old, new)):
+              raise SystemExit('Release versions must be X.Y.Z without leading zeroes')
+          if tuple(map(int, new.split('.'))) <= tuple(map(int, old.split('.'))):
+              raise SystemExit('Release version must increase')
+          PY
+          echo 'release=true' >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Test release tooling
+        if: steps.change.outputs.release == 'true'
+        run: /usr/bin/python3 -I -m unittest discover -s scripts -p 'test_*.py'
+      - name: Test runtime
+        if: steps.change.outputs.release == 'true'
+        run: /usr/bin/python3 -I -m unittest discover -s skills/skill-evolver/tests -p 'test_*.py'
+      - name: Validate committed source archive
+        if: steps.change.outputs.release == 'true'
+        run: /usr/bin/python3 -I scripts/release.py archive --output "$RUNNER_TEMP/release"
+      - name: Publish verified release
+        if: steps.change.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.change.outputs.version }}
+        run: |
+          gh auth setup-git
+          bash scripts/publish-release.sh "$VERSION" "$GITHUB_SHA" "$RUNNER_TEMP/release"
+          echo "Published v$VERSION from $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"

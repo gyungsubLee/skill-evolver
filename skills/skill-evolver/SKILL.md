@@ -170,6 +170,21 @@ Each requires its own approval for one fully expanded literal command and the
 exact installation data root; approval for one never authorizes another.
 `quality-status` is read-only.
 
+Its output always includes `collection_expires_at`, `remaining_seconds`,
+`invalid_reason`, and advisory `next_action`. The countdown is rounded up and
+clamped at zero only for a stored collecting epoch, otherwise null. A positive
+countdown does not override INVALID. IDLE and tombstones have null deadline,
+countdown and reason. A retained deadline after collection is historical.
+`request_quality_seal` is a sample-count hint; the explicit command still
+checks the full witness. `request_user_labels` never delegates answers to the
+agent. `run_quality_gate` can mean a read-only INVALID projection needs its
+immutable terminal report before recovery. `open_changed_quality_epoch` keeps
+the exact predecessor, changed-provenance, retained-history and capacity
+requirements, including after collection expiry. `inspect_quality_history`
+requires history review. Every action remains advisory and all existing
+command approvals apply. A PASS only permits the Phase 6 runner spike after
+its historical plan is refreshed.
+
 The model may explain sanitized `inspect` output, but it never infers or enters a label.
 Only the user runs a fully expanded `quality-label` command in a user-controlled external terminal.
 The agent never invokes `quality-label`, including through a PTY.

@@ -1,0 +1,20 @@
+{
+  "name": "skill-evolver-dev",
+  "interface": {
+    "displayName": "Skill Evolver Development"
+  },
+  "plugins": [
+    {
+      "name": "skill-evolver",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
