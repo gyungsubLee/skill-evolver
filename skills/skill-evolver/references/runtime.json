@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "version": "0.1.6",
+  "version": "0.1.7",
   "installation": "/Users/igyeongseob/.codex/skill-evolver/installation.json",
   "plugin_data": "/Users/igyeongseob/.codex/plugins/data/skill-evolver-skill-evolver-dev",
   "mutable_skill_roots": [

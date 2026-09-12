@@ -1680,7 +1680,7 @@ class ProductionSurfaceTests(unittest.TestCase):
         command = hooks["hooks"]["Stop"][0]["hooks"][0]["command"]
         marketplace = json.loads(
             (
-                PLUGIN_ROOT.parent / ".agents/plugins/marketplace.json"
+                PLUGIN_ROOT / ".agents/plugins/marketplace.json"
             ).read_text(encoding="utf-8")
         )
 
@@ -1692,7 +1692,7 @@ class ProductionSurfaceTests(unittest.TestCase):
                     "name": "skill-evolver",
                     "source": {
                         "source": "local",
-                        "path": "./skill-evolver",
+                        "path": "./",
                     },
                     "policy": {
                         "installation": "AVAILABLE",
@@ -1702,12 +1702,12 @@ class ProductionSurfaceTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(manifest["version"], "0.1.6")
-        self.assertEqual(runtime["version"], "0.1.6")
+        self.assertEqual(manifest["version"], "0.1.7")
+        self.assertEqual(runtime["version"], "0.1.7")
         loaded_runtime = load_runtime()
         self.assertEqual(
             loaded_runtime.VERSION,
-            "skill-evolver 0.1.6",
+            "skill-evolver 0.1.7",
         )
         self.assertIsInstance(
             loaded_runtime.load_review_runtime(),
@@ -1743,7 +1743,7 @@ class ProductionSurfaceTests(unittest.TestCase):
     def test_readme_uses_v2_gate_and_scoped_mutation_approval(self) -> None:
         readme = (PLUGIN_ROOT / "README.md").read_text(encoding="utf-8")
         evolver = (
-            "/Users/igyeongseob/Documents/오픈소스/skill-evolver/"
+            "/Users/igyeongseob/Develop/10_herness/skill-evolver/"
             "skills/skill-evolver/scripts/evolver.py"
         )
         self.assertIn("docs/feasibility-report-v2.json", readme)

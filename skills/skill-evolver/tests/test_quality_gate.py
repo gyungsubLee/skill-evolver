@@ -378,7 +378,7 @@ class ProspectiveQualityEpochTests(CandidateBatchFixture):
     def test_quality_contract_binds_prospective_capture_cutoff(self) -> None:
         payload = self.runtime.quality_contract_payload()
 
-        self.assertEqual(payload["version"], 2)
+        self.assertEqual(payload["version"], 3)
         self.assertEqual(
             payload["prospective_capture"],
             {
@@ -395,6 +395,45 @@ class ProspectiveQualityEpochTests(CandidateBatchFixture):
         self.assertEqual(
             self.runtime.quality_contract_digest(),
             self.runtime.sha256_json(payload),
+        )
+
+    def test_quality_contract_binds_read_only_status_diagnostics(self) -> None:
+        self.assertEqual(
+            self.runtime.quality_contract_payload().get("status_output"),
+            {
+                "collection_expires_at": (
+                    "retained-epoch-deadline-or-null-for-idle-or-tombstone"
+                ),
+                "remaining_seconds": {
+                    "collecting": "max(0,ceil(collection-expires-at-minus-now))",
+                    "otherwise": None,
+                },
+                "invalid_reason": {
+                    "retained": "stored-reason-without-provenance-reinterpretation",
+                    "active_precedence": [
+                        "collection-expired",
+                        "label-expired",
+                        "provenance-unreadable-or-invalid",
+                        "provenance-drift",
+                        "sealed-witness-mismatch-or-invalid",
+                        "candidate-subject-mismatch-or-invalid",
+                    ],
+                    "otherwise": None,
+                },
+                "next_action": {
+                    "advisory_only": True,
+                    "IDLE": "open_quality_epoch",
+                    "COLLECTING": {
+                        "ten-distinct-sessions-and-candidate": "request_quality_seal",
+                        "otherwise": "collect_real_sessions",
+                    },
+                    "AWAITING_LABELS": "request_user_labels",
+                    "READY_TO_GATE": "run_quality_gate",
+                    "INVALID-without-terminal": "run_quality_gate",
+                    "retained-terminal": "immutable-report-next-action",
+                    "SUPERSEDED-or-tombstone": "inspect_quality_history",
+                },
+            },
         )
 
     def terminalize_invalid_epoch(
@@ -1624,42 +1663,240 @@ class QualitySealTests(CandidateBatchFixture):
             result,
         )
 
-    def test_collecting_status_reports_expiry_or_drift_read_only(
+    def test_idle_status_has_nullable_deadline_and_open_action(self) -> None:
+        before = self.installation.database.read_bytes()
+        actual = self.runtime.quality_status(
+            self.connection, self.installation, 2_000_000_000.0
+        )
+
+        self.assertEqual(
+            actual,
+            {
+                "schema_version": 1,
+                "epoch_id": None,
+                "status": "IDLE",
+                "distinct_session_count": None,
+                "candidate_count": None,
+                "attested_label_count": 0,
+                "missing_labels": [],
+                "collection_expires_at": None,
+                "remaining_seconds": None,
+                "invalid_reason": None,
+                "next_action": "open_quality_epoch",
+            },
+        )
+        self.assertEqual(before, self.installation.database.read_bytes())
+
+    def test_collecting_status_countdown_rounds_up_until_exact_expiry(
         self,
     ) -> None:
         now = 2_000_000_000.0
         epoch = self.open_epoch(now)
-        before = self.installation.database.read_bytes()
-        expires_at = self.runtime.parse_iso_utc(
-            epoch["collection_expires_at"]
-        )
+        deadline = self.runtime.parse_iso_utc(epoch["collection_expires_at"])
+        for checked_at, remaining, status, reason in (
+            (deadline - 1, 1, "COLLECTING", None),
+            (deadline - 0.25, 1, "COLLECTING", None),
+            (deadline, 0, "INVALID", "quality_collection_expired"),
+            (deadline + 1, 0, "INVALID", "quality_collection_expired"),
+        ):
+            with self.subTest(checked_at=checked_at):
+                before = self.installation.database.read_bytes()
+                actual = self.runtime.quality_status(
+                    self.connection, self.installation, checked_at
+                )
+                self.assertEqual(
+                    actual.get("collection_expires_at"),
+                    epoch["collection_expires_at"],
+                )
+                self.assertEqual(actual["remaining_seconds"], remaining)
+                self.assertEqual(actual["status"], status)
+                self.assertEqual(actual["invalid_reason"], reason)
+                self.assertEqual(
+                    actual["next_action"],
+                    "run_quality_gate" if reason else "collect_real_sessions",
+                )
+                self.assertEqual(before, self.installation.database.read_bytes())
 
-        expired = self.runtime.quality_status(
-            self.connection, self.installation, expires_at
-        )
-
-        self.assertEqual(expired["status"], "INVALID")
-        self.assertEqual(
-            before, self.installation.database.read_bytes()
-        )
+    def test_collecting_status_distinguishes_provenance_drift_and_corruption(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        epoch = self.open_epoch(now)
         provenance = {
             name: epoch[name]
             for name in self.runtime.QUALITY_PROVENANCE_FIELDS
         }
         provenance["runtime_digest"] = "0" * 64
+        for effect, reason in (
+            (None, "quality_provenance_drift"),
+            (ValueError("invalid_quality_source"), "quality_source_corrupt"),
+        ):
+            with self.subTest(reason=reason), mock.patch.object(
+                self.runtime,
+                "current_quality_provenance",
+                return_value=provenance,
+                side_effect=effect,
+            ):
+                before = self.installation.database.read_bytes()
+                actual = self.runtime.quality_status(
+                    self.connection, self.installation, now + 1
+                )
+
+                self.assertEqual(actual.get("invalid_reason"), reason)
+                self.assertEqual(actual["status"], "INVALID")
+                self.assertEqual(actual["next_action"], "run_quality_gate")
+                self.assertEqual(
+                    actual["remaining_seconds"],
+                    self.runtime.QUALITY_COLLECTION_TTL_SECONDS - 1,
+                )
+                self.assertEqual(before, self.installation.database.read_bytes())
+
+    def test_collecting_expiry_precedes_unreadable_provenance(self) -> None:
+        now = 2_000_000_000.0
+        epoch = self.open_epoch(now)
         with mock.patch.object(
             self.runtime,
             "current_quality_provenance",
-            return_value=provenance,
+            side_effect=AssertionError("expired source reread"),
         ):
-            drifted = self.runtime.quality_status(
+            actual = self.runtime.quality_status(
+                self.connection,
+                self.installation,
+                self.runtime.parse_iso_utc(epoch["collection_expires_at"]),
+            )
+
+        self.assertEqual(actual.get("invalid_reason"), "quality_collection_expired")
+
+    def test_collecting_status_seal_action_is_only_a_sample_count_hint(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        self.open_epoch(now)
+        self.collect_batch(5, now + 1, candidates=False)
+        for checked_at, sessions, candidates, action in (
+            (now + 3, 5, 0, "collect_real_sessions"),
+            (now + 5, 10, 0, "collect_real_sessions"),
+            (now + 7, 11, 1, "request_quality_seal"),
+        ):
+            if sessions == 10:
+                self.collect_batch(5, now + 3, candidates=False)
+            elif sessions == 11:
+                self.collect_batch(1, now + 5)
+                self.claim(1, now + 7)
+            with self.subTest(sessions=sessions):
+                before = self.installation.database.read_bytes()
+                actual = self.runtime.quality_status(
+                    self.connection, self.installation, checked_at
+                )
+                self.assertEqual(actual.get("next_action"), action)
+                self.assertEqual(actual["distinct_session_count"], sessions)
+                self.assertEqual(actual["candidate_count"], candidates)
+                self.assertEqual(actual["status"], "COLLECTING")
+                self.assertIsNone(actual["invalid_reason"])
+                self.assertEqual(before, self.installation.database.read_bytes())
+
+        with self.assertRaisesRegex(ValueError, "quality_review_batch_live"):
+            self.runtime.seal_quality_epoch(
+                self.connection, self.installation, now + 8
+            )
+
+    def test_collecting_status_advises_seal_at_ten_sessions_with_a_candidate(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        self.collect_ten(now)
+        actual = self.runtime.quality_status(
+            self.connection, self.installation, now + 5
+        )
+        self.assertEqual(
+            actual.get("next_action"), "request_quality_seal"
+        )
+        self.assertEqual(actual["distinct_session_count"], 10)
+        self.assertEqual(actual["candidate_count"], 1)
+
+    def test_collecting_status_rejects_malformed_observation_inventory(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        self.open_epoch(now)
+        self.connection.execute(
+            "INSERT INTO metadata(key,value) VALUES(?,?)",
+            ("quality.epoch.Q-001.batch.B-001.extra", "{}"),
+        )
+        with self.assertRaisesRegex(ValueError, "invalid_quality_observation"):
+            self.runtime.quality_status(
                 self.connection, self.installation, now + 1
             )
 
-        self.assertEqual(drifted["status"], "INVALID")
-        self.assertEqual(
-            before, self.installation.database.read_bytes()
+    def test_stored_invalid_status_preserves_reason_without_terminal(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        epoch = self.open_epoch(now)
+        provenance = {
+            name: epoch[name]
+            for name in self.runtime.QUALITY_PROVENANCE_FIELDS
+        }
+        with mock.patch.object(
+            self.runtime,
+            "current_quality_provenance",
+            return_value={**provenance, "runtime_digest": "0" * 64},
+        ):
+            invalid = self.runtime.seal_quality_epoch(
+                self.connection, self.installation, now + 1
+            )
+        self.assertEqual(invalid["state"], "invalid")
+        self.assertIsNone(invalid["terminal"])
+        before = self.installation.database.read_bytes()
+
+        with mock.patch.object(
+            self.runtime,
+            "current_quality_provenance",
+            side_effect=AssertionError("stored invalid source reread"),
+        ):
+            actual = self.runtime.quality_status(
+                self.connection,
+                self.installation,
+                self.runtime.parse_iso_utc(epoch["collection_expires_at"]),
+            )
+
+        self.assertEqual(actual.get("invalid_reason"), "quality_provenance_drift")
+        self.assertEqual(actual["collection_expires_at"], epoch["collection_expires_at"])
+        self.assertIsNone(actual["remaining_seconds"])
+        self.assertEqual(actual["next_action"], "run_quality_gate")
+        self.assertEqual(before, self.installation.database.read_bytes())
+
+    def test_expired_partial_sample_still_requires_changed_predecessor(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        epoch = self.open_epoch(now)
+        self.collect_batch(1, now + 1)
+        observations = self.runtime.quality_observation_inventory(
+            self.connection, "Q-001"
         )
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(len(observations[0]["decisions"]), 1)
+        deadline = self.runtime.parse_iso_utc(epoch["collection_expires_at"])
+        terminal = self.runtime.gate_quality_epoch(
+            self.connection, self.installation, "Q-001", deadline
+        )
+        self.assertEqual(terminal["body"]["decision"], "INVALID")
+        self.assertEqual(
+            terminal["body"]["invalid_reason"], "quality_collection_expired"
+        )
+        before = self.installation.database.read_bytes()
+
+        with self.assertRaisesRegex(
+            ValueError, "quality_predecessor_provenance_unchanged"
+        ):
+            self.runtime.open_quality_epoch(
+                self.connection,
+                self.installation,
+                deadline + 1,
+                predecessor=f"Q-001@{terminal['report_digest']}",
+            )
+        self.assertEqual(before, self.installation.database.read_bytes())
 
     def test_seal_rejects_batch_session_or_exclusion_mismatch(
         self,
@@ -2437,6 +2674,9 @@ class QualityLabelTests(CandidateBatchFixture):
             )
 
         self.assertEqual(drifted["status"], "INVALID")
+        self.assertEqual(drifted.get("invalid_reason"), "quality_provenance_drift")
+        self.assertIsNone(drifted["remaining_seconds"])
+        self.assertEqual(drifted["next_action"], "run_quality_gate")
         self.assertEqual(
             before, self.installation.database.read_bytes()
         )
@@ -2456,6 +2696,9 @@ class QualityLabelTests(CandidateBatchFixture):
         )
 
         self.assertEqual(subject_changed["status"], "INVALID")
+        self.assertEqual(
+            subject_changed.get("invalid_reason"), "quality_candidate_subject_changed"
+        )
         self.assertEqual(
             before_subject_status,
             self.installation.database.read_bytes(),
@@ -2495,9 +2738,108 @@ class QualityLabelTests(CandidateBatchFixture):
         )
 
         self.assertEqual(status["status"], "INVALID")
+        self.assertEqual(status.get("invalid_reason"), "quality_source_corrupt")
         self.assertEqual(
             before, self.installation.database.read_bytes()
         )
+
+    def test_sealed_status_label_expiry_precedes_source_checks(self) -> None:
+        now = 2_000_000_000.0
+        epoch = self.seal_sample(now)
+        deadline = self.runtime.parse_iso_utc(epoch["sealed"]["label_expires_at"])
+        for checked_at, status, reason, action in (
+            (deadline - 1, "AWAITING_LABELS", None, "request_user_labels"),
+            (deadline, "INVALID", "quality_label_expired", "run_quality_gate"),
+        ):
+            with self.subTest(checked_at=checked_at):
+                before = self.installation.database.read_bytes()
+                actual = self.runtime.quality_status(
+                    self.connection, self.installation, checked_at
+                )
+                self.assertEqual(
+                    actual.get("collection_expires_at"), epoch["collection_expires_at"]
+                )
+                self.assertIsNone(actual["remaining_seconds"])
+                self.assertEqual(actual["status"], status)
+                self.assertEqual(actual["invalid_reason"], reason)
+                self.assertEqual(actual["next_action"], action)
+                self.assertEqual(before, self.installation.database.read_bytes())
+
+        with mock.patch.object(
+            self.runtime,
+            "current_quality_provenance",
+            side_effect=AssertionError("expired source reread"),
+        ):
+            actual = self.runtime.quality_status(
+                self.connection, self.installation, deadline
+            )
+        self.assertEqual(actual["invalid_reason"], "quality_label_expired")
+
+    def test_sealed_status_unreadable_provenance_precedes_witness(self) -> None:
+        now = 2_000_000_000.0
+        self.seal_sample(now)
+        self.installation.identity_key.write_bytes(b"invalid fixture key")
+        before = self.installation.database.read_bytes()
+
+        with mock.patch.object(
+            self.runtime,
+            "quality_sealed_witness_current",
+            side_effect=AssertionError("corrupt provenance witness read"),
+        ):
+            actual = self.runtime.quality_status(
+                self.connection, self.installation, now + 6
+            )
+
+        self.assertEqual(actual.get("invalid_reason"), "quality_source_corrupt")
+        self.assertEqual(actual["status"], "INVALID")
+        self.assertEqual(before, self.installation.database.read_bytes())
+
+    def test_sealed_status_witness_validation_failure_precedes_subject(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        self.seal_sample(now)
+        self.connection.execute(
+            "UPDATE review_batches SET exclusion_counts_json=? WHERE id=1",
+            ("[]",),
+        )
+        self.connection.execute(
+            "UPDATE candidates SET proposal_summary=? WHERE id=1",
+            ("A changed proposal after sealing.",),
+        )
+        before = self.installation.database.read_bytes()
+
+        with mock.patch.object(
+            self.runtime,
+            "quality_candidate_subject_digest",
+            side_effect=AssertionError("corrupt witness subject read"),
+        ):
+            actual = self.runtime.quality_status(
+                self.connection, self.installation, now + 6
+            )
+
+        self.assertEqual(actual.get("invalid_reason"), "quality_source_corrupt")
+        self.assertEqual(actual["status"], "INVALID")
+        self.assertEqual(before, self.installation.database.read_bytes())
+
+    def test_sealed_status_subject_validation_failure_reports_corruption(
+        self,
+    ) -> None:
+        now = 2_000_000_000.0
+        self.seal_sample(now)
+        self.connection.execute(
+            "UPDATE candidates SET proposal_summary=? WHERE id=1",
+            ("redacted:fixture",),
+        )
+        before = self.installation.database.read_bytes()
+
+        actual = self.runtime.quality_status(
+            self.connection, self.installation, now + 6
+        )
+
+        self.assertEqual(actual.get("invalid_reason"), "quality_source_corrupt")
+        self.assertEqual(actual["status"], "INVALID")
+        self.assertEqual(before, self.installation.database.read_bytes())
 
     def test_status_rejects_malformed_or_extra_label_namespace(
         self,
@@ -2535,7 +2877,7 @@ class QualityLabelTests(CandidateBatchFixture):
         self,
     ) -> None:
         now = 2_000_000_000.0
-        self.seal_sample(now)
+        epoch = self.seal_sample(now)
         before = self.installation.database.read_bytes()
         with mock.patch.object(
             self.runtime,
@@ -2548,6 +2890,10 @@ class QualityLabelTests(CandidateBatchFixture):
         after = self.installation.database.read_bytes()
 
         self.assertEqual(status["status"], "AWAITING_LABELS")
+        self.assertEqual(status.get("next_action"), "request_user_labels")
+        self.assertEqual(status["collection_expires_at"], epoch["collection_expires_at"])
+        self.assertIsNone(status["remaining_seconds"])
+        self.assertIsNone(status["invalid_reason"])
         self.assertEqual(status["missing_labels"], ["C-001"])
         self.assertNotIn("subject_digest", status)
         self.assertEqual(before, after)
@@ -2573,6 +2919,9 @@ class QualityLabelTests(CandidateBatchFixture):
             self.connection, self.installation, now + 8
         )
         self.assertEqual(ready["status"], "READY_TO_GATE")
+        self.assertEqual(ready["next_action"], "run_quality_gate")
+        self.assertIsNone(ready["remaining_seconds"])
+        self.assertIsNone(ready["invalid_reason"])
         self.assertEqual(ready["missing_labels"], [])
         self.assertEqual(
             before, self.installation.database.read_bytes()
@@ -2582,7 +2931,7 @@ class QualityLabelTests(CandidateBatchFixture):
         self,
     ) -> None:
         now = 2_000_000_000.0
-        self.seal_sample(now)
+        epoch = self.seal_sample(now)
         parser = self.runtime.build_parser()
         args = parser.parse_args(
             [
@@ -2630,8 +2979,20 @@ class QualityLabelTests(CandidateBatchFixture):
 
         self.assertTrue(opened.call_args.kwargs["read_only"])
         self.assertEqual(
-            json.loads(output.getvalue())["status"],
-            "AWAITING_LABELS",
+            json.loads(output.getvalue()),
+            {
+                "schema_version": 1,
+                "epoch_id": "Q-001",
+                "status": "AWAITING_LABELS",
+                "distinct_session_count": 10,
+                "candidate_count": 1,
+                "attested_label_count": 0,
+                "missing_labels": ["C-001"],
+                "collection_expires_at": epoch["collection_expires_at"],
+                "remaining_seconds": None,
+                "invalid_reason": None,
+                "next_action": "request_user_labels",
+            },
         )
         self.assertEqual(
             before, self.installation.database.read_bytes()
@@ -2934,6 +3295,62 @@ class QualityLabelTests(CandidateBatchFixture):
 
 
 class QualityTerminalGateTests(CandidateBatchFixture):
+    def assert_retained_status_matches_terminal(
+        self, terminal: dict[str, object], checked_at: float
+    ) -> None:
+        epoch = self.runtime.load_quality_epoch(self.connection, "Q-001")
+        before = self.installation.database.read_bytes()
+        with mock.patch.object(
+            self.runtime,
+            "current_quality_provenance",
+            side_effect=AssertionError("terminal source reread"),
+        ), mock.patch.object(
+            self.runtime,
+            "read_frozen_transcript",
+            side_effect=AssertionError("transcript opened"),
+        ):
+            actual = self.runtime.quality_status(
+                self.connection, self.installation, checked_at
+            )
+        body = terminal["body"]
+        self.assertEqual(actual.get("next_action"), body["next_action"])
+        self.assertEqual(actual["status"], body["decision"])
+        self.assertEqual(actual["invalid_reason"], body["invalid_reason"])
+        self.assertEqual(actual["collection_expires_at"], epoch["collection_expires_at"])
+        self.assertIsNone(actual["remaining_seconds"])
+        for name in ("distinct_session_count", "candidate_count", "attested_label_count"):
+            self.assertEqual(actual[name], body["sample"][name])
+        self.assertEqual(before, self.installation.database.read_bytes())
+
+    def test_terminal_pass_status_retains_report_action_after_expiry(self) -> None:
+        now = 2_000_000_000.0
+        self.label_sample(now)
+        terminal = self.runtime.gate_quality_epoch(
+            self.connection, self.installation, "Q-001", now + 30
+        )
+        self.assertEqual(terminal["body"]["decision"], "PASS")
+        self.assert_retained_status_matches_terminal(
+            terminal, now + self.runtime.QUALITY_COLLECTION_TTL_SECONDS
+        )
+
+    def test_terminal_fail_status_retains_report_action_after_expiry(self) -> None:
+        now = 2_000_000_000.0
+        terminal = self.fail_one_candidate_sample(now)
+        self.assert_retained_status_matches_terminal(
+            terminal, now + self.runtime.QUALITY_COLLECTION_TTL_SECONDS
+        )
+
+    def test_terminal_invalid_status_retains_report_reason_and_action(self) -> None:
+        now = 2_000_000_000.0
+        self.runtime.open_quality_epoch(
+            self.connection, self.installation, now, predecessor=None
+        )
+        deadline = now + self.runtime.QUALITY_COLLECTION_TTL_SECONDS
+        terminal = self.runtime.gate_quality_epoch(
+            self.connection, self.installation, "Q-001", deadline
+        )
+        self.assert_retained_status_matches_terminal(terminal, deadline + 1)
+
     def seal_distinct_sample(
         self, now: float = 2_000_000_000.0
     ) -> tuple[dict[str, object], int]:
@@ -3860,6 +4277,32 @@ class QualityTerminalGateTests(CandidateBatchFixture):
         self.assertEqual(tombstone["schema_version"], 1)
         self.assertEqual(tombstone["epoch_id"], "Q-001")
         self.assertEqual(tombstone["terminal_state"], "passed")
+        before_status = self.installation.database.read_bytes()
+        with mock.patch.object(
+            self.runtime,
+            "current_quality_provenance",
+            side_effect=AssertionError("tombstone source reread"),
+        ):
+            status = self.runtime.quality_status(
+                self.connection, self.installation, boundary
+            )
+        self.assertEqual(
+            status,
+            {
+                "schema_version": 1,
+                "epoch_id": "Q-001",
+                "status": "PASS",
+                "distinct_session_count": None,
+                "candidate_count": None,
+                "attested_label_count": 0,
+                "missing_labels": [],
+                "collection_expires_at": None,
+                "remaining_seconds": None,
+                "invalid_reason": None,
+                "next_action": "inspect_quality_history",
+            },
+        )
+        self.assertEqual(before_status, self.installation.database.read_bytes())
         self.assertEqual(
             tombstone["terminal_report_digest"],
             terminal["report_digest"],
@@ -3990,6 +4433,15 @@ class QualityTerminalGateTests(CandidateBatchFixture):
 
         self.assertEqual(result["quality_epochs_tombstoned"], 1)
         self.assertEqual(tombstone["terminal_state"], "invalid")
+        status = self.runtime.quality_status(
+            self.connection,
+            self.installation,
+            expired_at + self.runtime.QUALITY_PRIVATE_TTL_SECONDS,
+        )
+        self.assertEqual(status.get("next_action"), "inspect_quality_history")
+        self.assertEqual(status["status"], "INVALID")
+        for name in ("collection_expires_at", "remaining_seconds", "invalid_reason"):
+            self.assertIsNone(status[name])
         self.assertIsNone(
             self.connection.execute(
                 "SELECT value FROM metadata WHERE key=?",

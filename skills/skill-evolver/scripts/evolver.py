@@ -8,6 +8,7 @@ import fcntl
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
@@ -25,7 +26,7 @@ from types import MappingProxyType
 from typing import Mapping, Optional, Sequence, TypedDict
 from urllib.parse import quote
 
-VERSION = "skill-evolver 0.1.6"
+VERSION = "skill-evolver 0.1.7"
 SCHEMA_VERSION = 1
 MAX_HOOK_BYTES = 65_536
 SQLITE_INTEGER_MAX = 9_223_372_036_854_775_807
@@ -5827,7 +5828,7 @@ def phase4_release_report_digest() -> str:
 def quality_contract_payload() -> dict[str, object]:
     return {
         "schema_version": 1,
-        "version": 2,
+        "version": 3,
         "states": [
             "collecting",
             "sealed",
@@ -5864,6 +5865,40 @@ def quality_contract_payload() -> dict[str, object]:
             "pre_cutoff_disposition": (
                 "pending-unclaimable-while-epoch-collecting"
             ),
+        },
+        "status_output": {
+            "collection_expires_at": (
+                "retained-epoch-deadline-or-null-for-idle-or-tombstone"
+            ),
+            "remaining_seconds": {
+                "collecting": "max(0,ceil(collection-expires-at-minus-now))",
+                "otherwise": None,
+            },
+            "invalid_reason": {
+                "retained": "stored-reason-without-provenance-reinterpretation",
+                "active_precedence": [
+                    "collection-expired",
+                    "label-expired",
+                    "provenance-unreadable-or-invalid",
+                    "provenance-drift",
+                    "sealed-witness-mismatch-or-invalid",
+                    "candidate-subject-mismatch-or-invalid",
+                ],
+                "otherwise": None,
+            },
+            "next_action": {
+                "advisory_only": True,
+                "IDLE": "open_quality_epoch",
+                "COLLECTING": {
+                    "ten-distinct-sessions-and-candidate": "request_quality_seal",
+                    "otherwise": "collect_real_sessions",
+                },
+                "AWAITING_LABELS": "request_user_labels",
+                "READY_TO_GATE": "run_quality_gate",
+                "INVALID-without-terminal": "run_quality_gate",
+                "retained-terminal": "immutable-report-next-action",
+                "SUPERSEDED-or-tombstone": "inspect_quality_history",
+            },
         },
         "retention_seconds": {
             "collection": QUALITY_COLLECTION_TTL_SECONDS,
@@ -7456,27 +7491,41 @@ def _quality_epoch_provenance_current(
     )
 
 
-def _quality_sealed_source_current(
+def _quality_status_invalid_reason(
     connection: sqlite3.Connection,
     installation: Installation,
     epoch: dict[str, object],
-) -> bool:
-    sealed = epoch.get("sealed")
-    return (
-        epoch.get("state") == "sealed"
-        and type(sealed) is dict
-        and _quality_epoch_provenance_current(
-            installation, epoch
-        )
-        and quality_sealed_witness_current(connection, epoch)
-        and all(
-            quality_candidate_subject_digest(
-                connection, int(item["candidate_id"])
-            )
-            == item["subject_digest"]
-            for item in sealed["candidates"]
-        )
-    )
+    now: float,
+) -> Optional[str]:
+    state = epoch["state"]
+    if state not in {"collecting", "sealed"}:
+        return epoch["invalid_reason"]
+    if state == "collecting" and now >= parse_iso_utc(
+        epoch["collection_expires_at"]
+    ):
+        return "quality_collection_expired"
+    sealed = epoch["sealed"]
+    if state == "sealed" and now >= parse_iso_utc(
+        sealed["label_expires_at"]
+    ):
+        return "quality_label_expired"
+    try:
+        if not _quality_epoch_provenance_current(installation, epoch):
+            return "quality_provenance_drift"
+        if state == "sealed":
+            if not quality_sealed_witness_current(connection, epoch):
+                return "quality_source_corrupt"
+            if not all(
+                quality_candidate_subject_digest(
+                    connection, int(item["candidate_id"])
+                )
+                == item["subject_digest"]
+                for item in sealed["candidates"]
+            ):
+                return "quality_candidate_subject_changed"
+    except ValueError:
+        return "quality_source_corrupt"
+    return None
 
 
 def quality_status(
@@ -7499,6 +7548,10 @@ def quality_status(
             "candidate_count": None,
             "attested_label_count": 0,
             "missing_labels": [],
+            "collection_expires_at": None,
+            "remaining_seconds": None,
+            "invalid_reason": None,
+            "next_action": "open_quality_epoch",
         }
     if set(epoch) == QUALITY_TOMBSTONE_KEYS:
         return {
@@ -7513,20 +7566,18 @@ def quality_status(
             "candidate_count": None,
             "attested_label_count": 0,
             "missing_labels": [],
+            "collection_expires_at": None,
+            "remaining_seconds": None,
+            "invalid_reason": None,
+            "next_action": "inspect_quality_history",
         }
     state = str(epoch["state"])
+    invalid_reason = _quality_status_invalid_reason(
+        connection, installation, epoch, now
+    )
     terminal_sample: Optional[dict[str, object]] = None
     if state == "collecting":
-        try:
-            source_current = _quality_epoch_provenance_current(
-                installation, epoch
-            )
-        except ValueError:
-            source_current = False
-        if (
-            now >= parse_iso_utc(epoch["collection_expires_at"])
-            or not source_current
-        ):
+        if invalid_reason is not None:
             session_refs = set()
             candidate_ids = set()
             status = "INVALID"
@@ -7555,16 +7606,7 @@ def quality_status(
             for item in sealed["candidates"]
         }
         session_refs = set()
-        try:
-            source_current = _quality_sealed_source_current(
-                connection, installation, epoch
-            )
-        except ValueError:
-            source_current = False
-        if (
-            now >= parse_iso_utc(sealed["label_expires_at"])
-            or not source_current
-        ):
+        if invalid_reason is not None:
             label_count = 0
             missing = []
             status = "INVALID"
@@ -7623,6 +7665,23 @@ def quality_status(
         }.get(state)
         if status is None:
             raise ValueError("invalid_quality_epoch")
+    terminal = epoch.get("terminal")
+    if type(terminal) is dict:
+        next_action = terminal["body"]["next_action"]
+    elif status == "COLLECTING":
+        # ponytail: counts are advisory; quality-seal checks the full witness.
+        next_action = (
+            "request_quality_seal"
+            if len(session_refs) >= 10 and candidate_ids
+            else "collect_real_sessions"
+        )
+    else:
+        next_action = {
+            "AWAITING_LABELS": "request_user_labels",
+            "READY_TO_GATE": "run_quality_gate",
+            "INVALID": "run_quality_gate",
+            "SUPERSEDED": "inspect_quality_history",
+        }[status]
     sealed = epoch.get("sealed")
     return {
         "schema_version": 1,
@@ -7644,6 +7703,14 @@ def quality_status(
         ),
         "attested_label_count": label_count,
         "missing_labels": missing,
+        "collection_expires_at": epoch["collection_expires_at"],
+        "remaining_seconds": (
+            max(0, math.ceil(parse_iso_utc(epoch["collection_expires_at"]) - now))
+            if state == "collecting"
+            else None
+        ),
+        "invalid_reason": invalid_reason,
+        "next_action": next_action,
     }
 
 
@@ -9493,7 +9560,7 @@ def load_review_runtime() -> ReviewRuntime:
         type(payload["schema_version"]) is not int
         or payload["schema_version"] != 1
         or type(payload["version"]) is not str
-        or payload["version"] != "0.1.6"
+        or payload["version"] != "0.1.7"
         or type(payload["installation"]) is not str
         or payload["installation"]
         != "/Users/igyeongseob/.codex/skill-evolver/installation.json"
