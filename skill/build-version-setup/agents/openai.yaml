@@ -1,0 +1,4 @@
+interface:
+  display_name: "빌드 버전 설정"
+  short_description: "기존 도구를 활용해 빌드 버전과 GitHub Actions 릴리스 자동화 설정"
+  default_prompt: "$build-version-setup 현재 프로젝트의 버전 규칙과 빌드 도구를 확인하고 CI 산출물 및 릴리스 워크플로우를 설정해줘."

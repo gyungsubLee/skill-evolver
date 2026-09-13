@@ -1,0 +1,4 @@
+interface:
+  display_name: "빌드·릴리스 관리"
+  short_description: "기존 빌드 상태와 산출물을 확인하고 실패 복구·버전 PR·릴리스를 관리합니다"
+  default_prompt: "$build-release-manage로 현재 프로젝트의 빌드와 릴리스 상태를 확인하고 요청한 관리 작업을 진행해줘."
