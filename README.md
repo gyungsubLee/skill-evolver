@@ -41,6 +41,25 @@ Local release-tool checks use Python's standard library:
 /usr/bin/python3 -I -m unittest discover -s scripts -p 'test_*.py'
 ```
 
+Release automation uses the `skill-evolver` GitHub App so new version commits,
+PRs and releases are attributed to `skill-evolver[bot]`. Before enabling this
+workflow revision, register the app under the repository owner's account and
+install it on this repository only. Grant repository **Contents: read and write**
+and **Pull requests: read and write**; no webhook or user authorization callback
+is needed. Store its client ID as the Actions variable `RELEASE_APP_CLIENT_ID`
+and its private key as the Actions secret `RELEASE_APP_PRIVATE_KEY`.
+Never commit the key. The workflow requests only the permissions needed by each
+job and the token action revokes its temporary token after the job completes.
+Previously published releases retain their original author.
+
+To check the credentials without changing the version or creating a PR/release,
+run the Release workflow on `main` with `verify_only` enabled, or use
+`gh workflow run release.yml --ref main -f verify_only=true`.
+This checks app identity, a token scoped to this repository, and successful
+token issuance with Contents/PR write permissions. It does not prove the app
+has no other installations; check the app's installation settings separately.
+Leave `verify_only` disabled when preparing a real version PR.
+
 ## Gate
 
 `docs/feasibility-report-v2.json` must contain:

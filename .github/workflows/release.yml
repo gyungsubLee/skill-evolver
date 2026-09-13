@@ -3,6 +3,10 @@ name: Release
 on:
   workflow_dispatch:
     inputs:
+      verify_only:
+        description: Verify app authentication without preparing or publishing a release
+        type: boolean
+        default: false
       bump:
         description: Version increment
         required: true
@@ -25,14 +29,41 @@ defaults:
     shell: bash
 
 jobs:
+  verify-app:
+    if: github.event_name == 'workflow_dispatch' && inputs.verify_only
+    name: Verify release app
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require main
+        run: test "$GITHUB_REF" = refs/heads/main
+      - name: Create release app token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Verify identity and repository access
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          test "$APP_SLUG" = skill-evolver
+          bot_id=$(gh api "users/$APP_SLUG[bot]" --jq .id)
+          [[ "$bot_id" =~ ^[1-9][0-9]*$ ]]
+          gh api installation/repositories > "$RUNNER_TEMP/app-repositories.json"
+          jq -e --arg repo "$GITHUB_REPOSITORY" \
+            '.total_count == 1 and (.repositories | length == 1) and .repositories[0].full_name == $repo' \
+            "$RUNNER_TEMP/app-repositories.json"
+          echo "Verified $APP_SLUG[bot] ($bot_id), repository $GITHUB_REPOSITORY, and token issuance with Contents/PR write permissions." >> "$GITHUB_STEP_SUMMARY"
+
   prepare:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && !inputs.verify_only
     name: Prepare version PR
     runs-on: macos-15
     timeout-minutes: 15
-    permissions:
-      contents: write
-      pull-requests: write
     steps:
       - name: Require main
         run: test "$GITHUB_REF" = refs/heads/main
@@ -53,12 +84,28 @@ jobs:
         run: /usr/bin/python3 -I -m unittest discover -s scripts -p 'test_*.py'
       - name: Test runtime
         run: /usr/bin/python3 -I -m unittest discover -s skills/skill-evolver/tests -p 'test_*.py'
+      - name: Create release app token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Configure release author
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          test "$APP_SLUG" = skill-evolver
+          bot_id=$(gh api "users/$APP_SLUG[bot]" --jq .id)
+          [[ "$bot_id" =~ ^[1-9][0-9]*$ ]]
+          git config user.name "$APP_SLUG[bot]"
+          git config user.email "$bot_id+$APP_SLUG[bot]@users.noreply.github.com"
       - name: Commit and validate archive
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -- .codex-plugin/plugin.json README.md \
             skills/skill-evolver/references/runtime.json \
             skills/skill-evolver/scripts/evolver.py \
@@ -68,7 +115,7 @@ jobs:
           /usr/bin/python3 -I scripts/release.py archive --output "$RUNNER_TEMP/release"
       - name: Open release PR
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -94,8 +141,6 @@ jobs:
     name: Publish changed version
     runs-on: macos-15
     timeout-minutes: 15
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -143,13 +188,23 @@ jobs:
       - name: Validate committed source archive
         if: steps.change.outputs.release == 'true'
         run: /usr/bin/python3 -I scripts/release.py archive --output "$RUNNER_TEMP/release"
+      - name: Create release app token
+        if: steps.change.outputs.release == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
       - name: Publish verified release
         if: steps.change.outputs.release == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ steps.change.outputs.version }}
         run: |
+          test "$APP_SLUG" = skill-evolver
           gh auth setup-git
           bash scripts/publish-release.sh "$VERSION" "$GITHUB_SHA" "$RUNNER_TEMP/release"
           echo "Published v$VERSION from $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
