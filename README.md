@@ -5,7 +5,7 @@ explicit Review/Inbox surface. The Hook does not run a model, analyze
 transcript bytes, create a candidate automatically, or change an installed
 skill.
 
-Version `0.1.8` exposes collection deadlines, remaining time, invalid reasons
+Version `0.1.9` exposes collection deadlines, remaining time, invalid reasons
 and advisory next actions through read-only `quality-status`, while retaining
 the unchanged-provenance retry guard. It recognizes the text and control
 response items emitted by
